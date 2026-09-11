@@ -11,8 +11,9 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phase 0 complete** — foundation only. No exchange connection,
-no strategy, no trading. See [docs/development-phases.md](docs/development-phases.md).
+Current state: **Phase 1 complete** — foundation and data model. No exchange
+connection, no strategy, no trading yet. See
+[docs/development-phases.md](docs/development-phases.md).
 
 ---
 
@@ -39,6 +40,7 @@ docker compose up -d
 cd backend
 uv venv --python 3.12
 uv pip install -e '.[dev]'
+uv run alembic upgrade head    # create the schema
 uv run trading-bot-api
 
 # 4. Frontend (http://localhost:5173) - in a second terminal
@@ -50,8 +52,8 @@ pnpm dev
 Then open <http://localhost:5173>. The shell reports live backend status;
 subsystems that later phases build are shown as `OFFLINE`, never faked.
 
-A `Makefile` wraps these commands: `make up`, `make api`, `make web`,
-`make test`, `make check`.
+A `Makefile` wraps these commands: `make up`, `make migrate`, `make api`,
+`make web`, `make test`, `make check`.
 
 > The database password in `.env` must match the one PostgreSQL was first
 > initialised with. If you change it later, reset the volume:
@@ -70,10 +72,13 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 70 tests
+cd backend  && uv run pytest                # 197 tests
 cd frontend && pnpm test                    # 9 tests
 make check                                  # lint + types + tests
 ```
+
+Database tests need PostgreSQL running (`docker compose up -d`). Without it
+they skip with a reason rather than failing, so the suite stays usable.
 
 ## Project layout
 
@@ -82,7 +87,7 @@ backend/                  FastAPI service, strategy engine, data pipeline
   src/trading_bot/
     api/                  HTTP layer (routes, schemas, dependencies)
     core/                 configuration and logging
-    db/                   engine, session handling, declarative base
+    db/                   engine, sessions, ORM models, retention
   alembic/                database migrations
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)

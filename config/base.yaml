@@ -76,6 +76,16 @@ risk:
   max_latency_ms: 500
   max_stale_data_ms: 2000
 
+retention:
+  # Raw market data is high volume and low long-term value: keep a working
+  # window, not everything forever. Opportunities, orders, fills, positions,
+  # P&L and events are never purged - they are the research record.
+  enabled: true
+  market_data_days: 7
+  order_books_days: 3
+  trades_market_days: 7
+  purge_batch_size: 10000
+
 execution:
   # "paper" or "live". Live requires the explicit opt-in below AND a production profile.
   mode: "paper"

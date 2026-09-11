@@ -95,6 +95,9 @@ class TestConventions:
     def test_naming_convention_is_applied(self) -> None:
         assert Base.metadata.naming_convention == NAMING_CONVENTION
 
-    def test_no_tables_defined_yet(self) -> None:
-        """Phase 1 adds tables; Phase 0 must ship an empty schema."""
-        assert Base.metadata.tables == {}
+    def test_models_are_registered(self) -> None:
+        """Importing the models package must populate the metadata."""
+        import trading_bot.db.models  # noqa: F401
+
+        assert "opportunities" in Base.metadata.tables
+        assert len(Base.metadata.tables) == 13

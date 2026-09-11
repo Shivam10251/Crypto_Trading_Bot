@@ -194,6 +194,22 @@ class RiskConfig(ConfigSection):
         return self
 
 
+class RetentionConfig(ConfigSection):
+    """How long high-frequency raw data is kept.
+
+    Opportunities, orders, fills, positions, P&L and event rows are never
+    purged - they are the research dataset and the audit trail. Only the
+    high-volume raw feeds below have a finite life.
+    """
+
+    enabled: bool = True
+    market_data_days: int = Field(default=7, ge=1)
+    order_books_days: int = Field(default=3, ge=1)
+    trades_market_days: int = Field(default=7, ge=1)
+    # Rows deleted per statement, so a purge cannot lock a table for long.
+    purge_batch_size: int = Field(default=10_000, ge=100)
+
+
 class ExecutionConfig(ConfigSection):
     mode: ExecutionMode = ExecutionMode.PAPER
     live_enabled: bool = False
@@ -221,6 +237,7 @@ class Settings(BaseSettings):
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
     @classmethod

@@ -6,7 +6,7 @@ stops for review before the next begins.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Architecture and project foundation | **Complete** |
-| 1 | Database and data model | Not started |
+| 1 | Database and data model | **Complete** |
 | 2 | Exchange abstraction (market data only) | Not started |
 | 3 | Real-time market data engine | Not started |
 | 4 | Market monitoring | Not started |
@@ -73,9 +73,31 @@ stops for review before the next begins.
 cost model, execution, risk engine, portfolio, dashboard. Phase 0 is foundation
 only.
 
-## Phase 1 — next
+## Phase 1 — delivered
 
-Design the schema for the traceability chain (market data → opportunity →
-signal → risk decision → order → fill → position → P&L), create the first
-migration, decide retention, and write database tests. See
-[data-model.md](data-model.md).
+- **13 tables** covering the full traceability chain, in `db/models/`
+  (market, research, execution, portfolio, events) - one module per concern,
+  none over 220 lines
+- **One migration** (`create core data model`): 13 tables, 37 indexes, applied
+  and verified to downgrade cleanly
+- **NUMERIC for all money**; floats only for derived statistics, enforced by a
+  test that scans every table
+- **Constraints do the validating**: non-positive prices, crossed books,
+  over-fills, incomplete closed positions and out-of-range win rates are all
+  refused by the database
+- **Duplicate protection** as unique constraints on `(mode, client_order_id)`,
+  `(market_id, exchange_trade_id)` and `(order_id, exchange_fill_id)`
+- **Retention policies** for the three high-volume raw tables, batched, with a
+  `trading-bot-purge` command; research and audit tables are never purged
+- **Tests**: 197 backend (up from 75) - schema invariants without a database,
+  plus PostgreSQL tests for constraints, cascades, the full traceability walk,
+  retention, and migration/model parity
+
+Design decisions and rationale: [data-model.md](data-model.md).
+
+## Phase 2 — next
+
+Define the `ExchangeAdapter` interface and implement `BinanceExchangeAdapter`
+for **market data only** - no order execution. Must cover binance.com spot and
+USDⓈ-M futures endpoints, since the first strategy compares the two. See
+[architecture.md](architecture.md).

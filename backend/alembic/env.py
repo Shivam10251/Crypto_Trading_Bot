@@ -14,10 +14,11 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# Importing the models package registers every table on Base.metadata, which is
+# what autogenerate compares the live database against.
+import trading_bot.db.models  # noqa: F401
 from trading_bot.core.config import get_settings
 from trading_bot.db.base import Base
-
-# Phase 1 imports the model modules here so autogenerate can see them.
 
 config = context.config
 if config.config_file_name is not None:

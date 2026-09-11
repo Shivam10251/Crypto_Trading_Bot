@@ -60,7 +60,7 @@ can never reach an execution adapter without a risk decision.
 | --- | --- | --- |
 | `trading_bot.core.config` | Layered settings, live-trading guards | nothing |
 | `trading_bot.core.logging` | Structured logs, credential redaction | config |
-| `trading_bot.db` | Engine, sessions, declarative base | config, logging |
+| `trading_bot.db` | Engine, sessions, ORM models, retention | config, logging |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -93,8 +93,11 @@ database.
 
 ## Status
 
-Built: configuration, logging, database layer, API skeleton, health and
-system-status endpoints, frontend shell, test and migration tooling.
+Built: configuration, logging, database layer with the full 13-table data
+model and migrations, retention, API skeleton, health and system-status
+endpoints, frontend shell, test tooling.
 
-Not built: everything from Phase 1 onward. The system-status endpoint reports
-those subsystems as `OFFLINE` with the phase that will implement them.
+Not built: everything from Phase 2 onward - exchange connection, market data,
+strategy, cost model, execution, risk engine, portfolio, dashboard. The
+system-status endpoint reports those subsystems as `OFFLINE` with the phase that
+will implement them.

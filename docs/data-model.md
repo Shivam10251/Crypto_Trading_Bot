@@ -1,71 +1,134 @@
 # Data Model
 
-Status: **designed in Phase 1.** Phase 0 ships the conventions and migration
-tooling only — `Base.metadata` is deliberately empty, and a test asserts that.
+Status: **implemented (Phase 1).** 13 tables, one migration, 197 backend tests.
 
 ## Traceability requirement
 
-Every trade must be explainable from raw data to profit:
+Every trade is explainable from raw data to profit. Each stage stores the id of
+the row that caused it:
 
 ```
-market_data → opportunity → signal → risk decision → order → fill → position → P&L
+market_data ──┐
+              ├─▶ opportunities ──▶ signals ──▶ risk_events ──▶ orders ──▶ fills ──▶ positions ──▶ pnl_snapshots
+market_data ──┘   (both legs)                   (decision)     (intent)   (reality)
 ```
 
-Each row therefore carries the id of the row that caused it. Given a fill, it
-must be possible to recover the exact quotes and cost assumptions behind it.
+Given any fill, the exact quotes and cost assumptions behind it can be
+recovered. `tests/integration/test_data_model.py::TestTraceabilityChain`
+inserts the full chain and walks it backwards from a fill to the originating
+bid/ask, so the guarantee is tested, not asserted in prose.
 
-## Planned tables
+A signal that never became an order is equally traceable: the `risk_events` row
+records the limit, the observed value and the reason.
 
-| Table | Purpose |
-| --- | --- |
-| `markets` | Instrument reference: symbol, venue, type (spot/perp), tick size, fees |
-| `market_data` | Normalized top-of-book snapshots with exchange and local timestamps |
-| `order_books` | Depth snapshots, sampled rather than continuous |
-| `trades_market` | Public trade prints, used for slippage calibration |
-| `opportunities` | Every detected opportunity with gross edge, costs, net edge, status |
-| `signals` | Strategy output derived from a validated opportunity |
-| `orders` | Intended and submitted orders, paper or live, with idempotency keys |
-| `fills` | Executions against orders, including partials |
-| `positions` | Open and closed positions with entry/exit and fees |
-| `portfolio_snapshots` | Periodic cash, exposure and equity |
-| `pnl_snapshots` | Realized and unrealized P&L, separated by mode |
-| `risk_events` | Every risk rejection, pause and kill-switch trigger |
-| `system_events` | Connection loss, reconnects, stale data, restarts |
+## Tables
 
-## Conventions (in place)
+| Table | Purpose | Key columns |
+| --- | --- | --- |
+| `markets` | Instrument reference, one row per venue+symbol+type | exchange filters, fees |
+| `market_data` | Normalized top-of-book snapshots | both clocks, `latency_ms`, `sequence` |
+| `order_books` | Sampled depth snapshots (JSONB) | `depth_levels` |
+| `trades_market` | Public trade prints, for slippage calibration | unique `exchange_trade_id` |
+| `opportunities` | Every detected discrepancy, with full cost breakdown | `net_edge_bps`, `status`, `uid` |
+| `signals` | Intent to trade a validated opportunity | `expires_at` |
+| `risk_events` | Every risk decision: approve, reject, pause | `limit_value` vs `observed_value` |
+| `orders` | Intended and submitted orders | `client_order_id` (idempotency) |
+| `fills` | Executions, including partials | `slippage_bps`, `is_maker` |
+| `positions` | Open and closed exposure | realized/unrealized P&L |
+| `portfolio_snapshots` | Cash, exposure, equity over time | `equity_usd` |
+| `pnl_snapshots` | Performance metrics per window | Sharpe, Sortino, drawdown |
+| `system_events` | Connects, gaps, errors, reconciliation | JSONB `context` |
 
-- Naming convention fixed in `db/base.py` so Alembic autogenerate produces
-  stable, reviewable diffs.
-- `TimestampMixin` gives every table `created_at` / `updated_at` in UTC,
-  maintained by the database.
-- Timestamps are `TIMESTAMPTZ`. Market data keeps both the exchange timestamp
-  and the local receipt timestamp so latency is measurable, not inferred.
-- Money and prices use `NUMERIC`, never floats. Floats are fine for derived
-  statistics, never for balances or fills.
-- P&L rows record their mode (`THEORETICAL` / `PAPER` / `LIVE`) so the three
-  can never be summed together by accident.
+Two legs are first-class on `opportunities` (`market_id` +
+`secondary_market_id`) because the first strategy trades spot against
+perpetual futures. Both legs' quote snapshots are recorded.
+
+## Design decisions
+
+**Money is `NUMERIC`, never float.** Prices use `NUMERIC(28,12)` — enough for
+BTC near 100,000 and for altcoins below 0.00000001. Fiat values use
+`NUMERIC(20,8)`, basis points `NUMERIC(14,6)`. Only derived statistics (Sharpe,
+win rate, profit factor) are `double precision`, where precision loss is
+harmless. A unit test walks every table and fails if money lands in a float
+column.
+
+**Enums are `VARCHAR` + `CHECK`, not native PostgreSQL enums.** The database
+still rejects invalid values, but later phases will add order states, risk event
+types and strategies. Extending a native enum needs `ALTER TYPE`, which cannot
+run inside a transaction and makes migrations fragile.
+
+**Both clocks are stored.** `exchange_timestamp` and `local_timestamp` on every
+market-data row, so latency is measured rather than inferred and staleness is
+judged against the clock that matters.
+
+**Invalid data is refused by the database.** Check constraints reject
+non-positive prices, negative sizes and crossed books (`ask < bid`) — a crossed
+top-of-book on a single venue means bad data, and admitting it would corrupt the
+research dataset. A locked book (`bid == ask`) is unusual but real, so it is
+allowed.
+
+**Duplicate protection is a constraint, not a code path.** `orders` is unique
+on `(mode, client_order_id)`, so a retry after a timeout cannot create a second
+order. `trades_market` is unique on `(market_id, exchange_trade_id)` and
+`fills` on `(order_id, exchange_fill_id)`, so a replayed WebSocket message
+cannot double-count.
+
+**`mode` is on every result row.** `THEORETICAL`, `PAPER` and `LIVE` are stored
+separately in orders, fills, positions and both snapshot tables. Aggregates must
+filter on it; mixing the three produces a number that describes nothing.
+
+**Realized P&L is stored, not derived on read.** It depends on the fee and
+slippage assumptions in force at the time; recomputing it later against changed
+assumptions would rewrite history.
+
+**Deletes protect the audit trail.** Raw market data cascades with its market,
+but `positions`, `orders` and `signals` use `RESTRICT` or `SET NULL` — a market
+with trading history cannot be deleted out from under it.
 
 ## Retention
 
-High-frequency data is not kept forever:
+Raw feeds have a finite life; the research record does not.
 
-| Data | Retention intent |
-| --- | --- |
-| Top-of-book snapshots | Full fidelity for a short window, then downsampled |
-| Order-book depth | Sampled snapshots only |
-| Opportunities | Kept indefinitely — this is the research dataset |
-| Orders, fills, positions, P&L | Kept indefinitely — audit trail |
-| System and risk events | Kept indefinitely |
+| Data | Retention | Why |
+| --- | --- | --- |
+| `market_data` | 7 days | Several updates/second/market; decisions already preserved in `opportunities` |
+| `order_books` | 3 days | Largest rows |
+| `trades_market` | 7 days | Kept long enough to calibrate slippage |
+| Everything else | Forever | Research dataset and audit trail |
 
-Phase 1 decides the concrete windows and whether partitioning is warranted,
-measured against real data volume rather than guessed up front.
+Windows are configurable per profile (`retention` in `config/base.yaml`).
+Purges delete in batches of 10,000 so a long purge never holds a table-wide
+lock, filter on `local_timestamp` (a bad feed can misreport the exchange clock),
+and run via:
+
+```bash
+cd backend && uv run trading-bot-purge
+```
+
+Partitioning is deliberately *not* used yet. It is the right answer at volume,
+but the correct partition key and interval should be chosen against measured
+row counts rather than guessed now.
+
+## Indexes
+
+37 indexes, added for known access patterns rather than speculatively:
+`(market_id, exchange_timestamp)` for latest quotes, `local_timestamp` for
+retention scans, and on `opportunities` by `detected_at`, `status`, `strategy`
+and `net_edge_bps` — the last one serves the central research question, "how
+many opportunities survived costs?"
 
 ## Migrations
 
 Alembic reads the database URL from application settings, so migrations and the
-application can never disagree about the target:
+application can never disagree about the target.
 
 ```bash
 make migrate                        # alembic upgrade head
-make revision m="add markets"       # autogenerate
+make revision m="add funding rates" # autogenerate
 ```
+
+`tests/integration/test_migrations.py` applies the migration to a scratch
+database and compares the result against the model metadata, so a model change
+without a matching migration fails the suite instead of a deployment. The
+downgrade path is tested too — a migration that cannot be undone is a one-way
+door.
