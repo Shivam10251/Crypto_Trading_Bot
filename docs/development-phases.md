@@ -10,8 +10,8 @@ stops for review before the next begins.
 | 2 | Exchange abstraction (market data only) | **Complete** |
 | 3 | Real-time market data engine | **Complete** |
 | 4 | Market monitoring | **Complete** |
-| 5 | Strategy framework + spot/perp basis strategy | Not started |
-| 6 | Transaction cost model | Not started |
+| 5 | Strategy framework + spot/perp basis strategy | **Complete** |
+| 6 | Transaction cost model | Next |
 | 7 | Opportunity engine | Not started |
 | 8 | Paper execution engine | Not started |
 | 9 | Risk engine | Not started |
@@ -304,8 +304,115 @@ CPU 22-35% of one core
   batching and local load are all candidates; Phase 16 measures before
   guessing.
 
-## Phase 5 — next
+## Phase 5 — delivered
 
-Strategy framework and the first spot/perpetual basis strategy. Strategies
-consume `MarketSnapshot` and `MarketMetrics` only - never the WebSocket layer,
-the database or the dashboard. See [strategy.md](strategy.md).
+`make market-data` now evaluates the strategy against every monitored pair and
+adds a panel showing what it concluded, ranked by the edge that survives costs.
+
+- **Strategy contract** (`strategy/base.py`): five steps - detect, price,
+  generate, validate - declared and implemented by none of them. Shared maths
+  lives in helpers rather than a base class that accumulates behaviour, and the
+  walk itself is in `StrategyRunner`, which is infrastructure. A strategy is
+  handed a `MarketView` per market (snapshot, metrics, spec, funding) and can
+  reach nothing else: no adapter, no session, no settings
+- **Domain types** (`strategy/models.py`): `Leg`, `Opportunity`,
+  `CostBreakdown`, `Edge`, `Signal`, `ValidationResult`, `RejectionReason`.
+  Frozen, `Decimal` throughout, no imports outside the normalized vocabulary
+- **Spot/perp basis strategy** (`strategy/basis.py`): pairs the monitored
+  markets by symbol, requires both legs LIVE, fresh and backed by a
+  synchronised book at the same instant, sizes against the thinner leg's real
+  depth, and tracks how long each direction has persisted
+- **Cost model** (`strategy/costs.py`): the `CostModel` interface plus a
+  provisional implementation - fees from configuration, **slippage from walking
+  the real book**, **funding from the venue's live rate and its actual
+  interval**, entry and exit both charged. Phase 6 replaces the implementation,
+  not the interface
+- **Bulk funding** (`get_funding_rates`, `get_funding_intervals`): one request
+  covers the whole venue at weight 10, so fifty pairs cost one call, not fifty.
+  `FundingTracker` polls on a slow cadence and survives a failed poll by
+  keeping the last known rates
+- **Rejections are the dataset**: every opportunity is priced and kept with the
+  reason it was not traded. Zero opportunities and a broken feed never look
+  alike - the panel states how many pairs were usable and why the rest were not
+- **Tests**: 491 backend (from 474), 14 of them opt-in live; 10 frontend
+
+### What checking reality changed
+
+The venue was probed before any pricing code was written, and the first live
+run changed the design again:
+
+1. **Funding is not settled every eight hours.** Measured on binance.com: 467
+   USD-M perpetuals settle every 4 hours, 313 every 8, and 2 every hour. Of the
+   50 monitored pairs, 26 were 8h, 23 were 4h and one (IOST) was hourly.
+   Scaling a rate by an assumed 8h would have **halved** the funding cost on
+   nearly half the universe. `FundingInfo` now carries the interval.
+2. **The venue does not publish an interval for every symbol, and the missing
+   ones are not 8h either.** 101 symbols are absent from `fundingInfo`; by
+   their next settlement times, 63 are on the 4h grid, 28 on the 8h and 9 on
+   the 1h. There is no safe default, so the interval is `None` and the cost
+   model **refuses to price** that market rather than guessing. All 50
+   monitored pairs publish one, so nothing is lost in practice.
+3. **The first live run reported two tradeable opportunities, and both were
+   unreachable.** IOST and VTHO perpetuals traded 90-100 bps *below* spot, and
+   capturing that means **selling spot** - which needs inventory or a margin
+   borrow a cash account does not have. The strategy was claiming trades it
+   could not place. Direction reachability is now a validation gate
+   (`allow_spot_short`, default false): the opportunity is still detected and
+   priced, because it is research data, but it is never signalled.
+4. **On sub-cent markets the tick is a large fraction of the basis.** One spot
+   tick is 10.7 bps of the mid on IOST and 17.2 bps on VTHO, against 0.00 bps
+   on BTC. A basis measured on those markets carries several bps of
+   quantization noise before anything else is considered.
+
+### First live observation
+
+2026-09-11, 50 pairs, 75 seconds:
+
+```
+STRATEGY spot_perp_basis   49 priced   tradeable 0   best net +31.86 bps (IOSTUSDT)
+costs: taker 10/5 bps spot/perp x2 legs x2 sides, slippage from book x2,
+       funding over 1h, buffer 2 bps
+49/50 pairs usable   1 stale data
+
+PAIR        DIR         BASIS bps   FEES    SLIP    FUND   BUF   NET bps  HELD s  VERDICT
+IOSTUSDT    sell spot       99.95  29.86   44.13   -7.91  2.00     31.86    32.9  spot short unavailable
+VTHOUSDT    sell spot       62.34  29.89   56.16  -10.46  2.00    -15.25    63.5  below min edge
+TRXUSDT     sell spot       12.66  29.98    3.28   -0.62  2.00    -21.98    65.6  below min edge
+BTCUSDT     sell spot        5.80  29.99    0.01    0.04  2.00    -26.25    65.6  below min edge
+ETHUSDT     sell spot        5.33  29.99    0.08    0.06  2.00    -26.80    65.6  below min edge
+```
+
+Across the 48 pairs priced in that frame: median gross basis **7.6 bps**,
+median net edge **-30 bps**, best net +31.9 bps and unreachable. Only 2 pairs
+had a gross basis exceeding fees at all, and both needed spot sold short. 47 of
+48 had the perpetual at a discount to spot - a market-wide state, not a
+per-pair signal.
+
+**The basis is not too fast to catch; it is too small to pay for.** A direction
+persisted for a median of 26 s (capped by the 75 s run) against a 75 ms median
+quote latency - three orders of magnitude of headroom. What stops the trade is
+30 bps of round-trip taker fees against 7.6 bps of basis.
+
+### Limits
+
+- Nothing is stored. Opportunities and rejections live for one evaluation cycle
+  and are drawn; Phase 7 persists them, which is what makes the "how many
+  opportunities existed?" question answerable over time rather than per frame.
+- The cost model is provisional by design. One flat taker fee per instrument
+  class stands in for the account's real fee tier, and the exit is charged the
+  same slippage as the entry. Phase 6 replaces both.
+- Funding assumes the current rate persists across the assumed holding period
+  and accrues linearly. Over an hour on majors this is negligible either way;
+  on the high-funding tail it is the dominant term and the weakest assumption.
+- Leg risk is not modelled. The strategy prices both legs filling at the
+  observed depth; one leg filling and the other not is an execution concern
+  that Phase 8 measures and Phase 9 limits.
+- The API still reports the Strategy Engine as OFFLINE. It genuinely cannot see
+  it: the strategy runs inside the market-data process and writes nothing, so
+  there is no output to judge it by until Phase 7.
+
+## Phase 6 — next
+
+The transaction cost model: real fee tiers, maker/taker, depth-aware slippage
+and funding accrual, replacing the provisional implementation behind the
+`CostModel` interface Phase 5 defined. See [execution.md](execution.md).

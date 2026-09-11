@@ -198,9 +198,17 @@ def parse_trade(payload: dict[str, Any], ref: MarketRef, local_timestamp: dateti
 
 
 def parse_funding(
-    payload: dict[str, Any], ref: MarketRef, local_timestamp: datetime
+    payload: dict[str, Any],
+    ref: MarketRef,
+    local_timestamp: datetime,
+    interval_hours: int | None = None,
 ) -> FundingInfo:
-    """``premiumIndex`` - mark price, index price and the funding rate."""
+    """``premiumIndex`` - mark price, index price and the funding rate.
+
+    ``premiumIndex`` does not say how often the rate settles; that comes from
+    ``fundingInfo`` and is passed in. Left ``None``, the consumer knows the
+    rate's period is unknown instead of assuming the historical eight hours.
+    """
     context = f"premiumIndex {ref}"
     return FundingInfo(
         ref=ref,
@@ -211,7 +219,28 @@ def parse_funding(
         ),
         next_funding_time=to_datetime(_require(payload, "nextFundingTime", context), context),
         local_timestamp=local_timestamp,
+        funding_interval_hours=interval_hours,
     )
+
+
+def parse_funding_intervals(payload: object) -> dict[str, int]:
+    """``fundingInfo`` - settlement interval per symbol, in hours.
+
+    Symbols the venue omits are simply absent from the result; they are not
+    defaulted to eight hours, because measured against the live venue their
+    intervals are mixed (most are on the four-hour grid).
+    """
+    if not isinstance(payload, list):
+        raise ExchangeDataError("fundingInfo response is not a list")
+    intervals: dict[str, int] = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        symbol = entry.get("symbol")
+        hours = entry.get("fundingIntervalHours")
+        if isinstance(symbol, str) and isinstance(hours, int) and hours > 0:
+            intervals[symbol] = hours
+    return intervals
 
 
 def parse_daily_stats(

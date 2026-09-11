@@ -65,12 +65,16 @@ can never reach an execution adapter without a risk decision.
 | `trading_bot.exchange.streaming` | Streaming boundary: stream endpoints + parser contract | exchange |
 | `trading_bot.exchange.binance` | binance.com spot + USDⓈ-M market data and streams | exchange, config |
 | `trading_bot.marketdata` | Live engine: connections, local books, staleness, snapshots, recorder | exchange, config, db |
-| `trading_bot.monitoring` | Market selection, per-market statistics, terminal view | marketdata, exchange, config |
+| `trading_bot.monitoring` | Market selection, per-market statistics, terminal view | marketdata, exchange, config, strategy |
+| `trading_bot.strategy` | Strategy contract, domain types, cost model, basis strategy, runner | exchange + marketdata models only |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
-Dependencies point inward. `core` imports nothing from the project, which is
-what keeps strategy code (Phase 5) testable without infrastructure.
+Dependencies point inward. `core` imports nothing from the project, and
+`strategy` imports only normalized domain types - no database, no adapter, no
+FastAPI - which is what keeps it testable without infrastructure and runnable
+unchanged in backtest, paper and live modes. `monitoring` depends on `strategy`
+only to draw it, never the other way round.
 
 ## Communication
 
@@ -104,12 +108,16 @@ runner joins them in a later phase.
 Built: configuration, logging, database layer with the full 13-table data
 model and migrations, retention, the exchange abstraction with a Binance
 market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
-service, configurable market selection and per-market monitoring, API
-skeleton, health and system-status endpoints, frontend shell, test tooling.
+service, configurable market selection and per-market monitoring, the strategy
+framework with the spot/perpetual basis strategy and a provisional cost model,
+API skeleton, health and system-status endpoints, frontend shell, test tooling.
 
-Not built: everything from Phase 5 onward - strategy, cost model, execution,
-risk engine, portfolio, dashboard. The system-status endpoint
-reports those subsystems as `OFFLINE` with the phase that will implement them.
+Not built: everything from Phase 6 onward - the real cost model, opportunity
+persistence, execution, risk engine, portfolio, dashboard. The system-status
+endpoint reports those subsystems as `OFFLINE` with the phase that will
+implement them, including the Strategy Engine: it runs inside the market-data
+process and stores nothing, so the API has no output to judge it by until
+Phase 7.
 
 ### The exchange boundary
 
@@ -159,3 +167,31 @@ Staleness has two scopes. A connection silent for `stale_after_ms` (2 s)
 makes every market on it stale; a single market is stale on its own only after
 `market_silence_ms` (30 s), because the venue pushes only changes and a quiet
 market is unchanged rather than stale.
+
+### The strategy boundary
+
+`trading_bot.strategy` sits on the monitor's output and reaches nothing else.
+A strategy is handed a `MarketView` per market - snapshot, metrics, spec and,
+for perpetuals, funding - and returns opportunities, edges and signals. It has
+no adapter, no session and no settings object, so the same instance runs under
+backtest, paper and live execution without change.
+
+```
+MarketSnapshot + MarketMetrics + FundingInfo
+        │
+        ▼
+StrategyRunner ── per strategy ──▶ on_market_data
+        │                            detect_opportunities
+        │                            calculate_edge      (CostModel)
+        │                            generate_signal
+        │                            validate_signal
+        ▼
+EvaluatedOpportunity  - the signal, or the reason there is none
+```
+
+Every opportunity is priced and kept, including the rejected ones: they are the
+research dataset, and a list of zero opportunities must be distinguishable from
+a broken feed. `CostModel` is an interface; Phase 5 ships a provisional
+implementation that measures slippage from the real book and funding from the
+venue's live rate and interval, and refuses to price what it cannot estimate.
+Phase 6 replaces the implementation, not the interface.

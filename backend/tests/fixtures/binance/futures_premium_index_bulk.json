@@ -1,0 +1,52 @@
+[
+  {
+    "symbol": "MYROUSDT",
+    "markPrice": "0.00361188",
+    "indexPrice": "0.00361188",
+    "estimatedSettlePrice": "0.00000000",
+    "lastFundingRate": "0.00000000",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1789156800000,
+    "time": 1789143223001
+  },
+  {
+    "symbol": "ETHUSDT",
+    "markPrice": "2565.48000000",
+    "indexPrice": "2566.28976744",
+    "estimatedSettlePrice": "2579.56486564",
+    "lastFundingRate": "0.00004823",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1789171200000,
+    "time": 1789143223001
+  },
+  {
+    "symbol": "ENAUSDT",
+    "markPrice": "0.14900000",
+    "indexPrice": "0.14901271",
+    "estimatedSettlePrice": "0.15047821",
+    "lastFundingRate": "-0.00001585",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1789156800000,
+    "time": 1789143223001
+  },
+  {
+    "symbol": "IOSTUSDT",
+    "markPrice": "0.00091976",
+    "indexPrice": "0.00092789",
+    "estimatedSettlePrice": "0.00092566",
+    "lastFundingRate": "-0.00074747",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1789146000000,
+    "time": 1789143223001
+  },
+  {
+    "symbol": "BTCUSDT",
+    "markPrice": "77840.00000000",
+    "indexPrice": "77867.27717391",
+    "estimatedSettlePrice": "78054.67956957",
+    "lastFundingRate": "0.00003501",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1789171200000,
+    "time": 1789143223001
+  }
+]

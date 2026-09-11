@@ -14,7 +14,8 @@ import shutil
 import signal
 import sys
 from collections import deque
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from trading_bot.core.config import Settings
@@ -26,11 +27,17 @@ from trading_bot.exchange.binance import BinanceExchangeAdapter
 from trading_bot.exchange.errors import ExchangeError
 from trading_bot.exchange.models import MarketDataSubscription, MarketSpec
 from trading_bot.marketdata.engine import MarketDataEngine
+from trading_bot.marketdata.funding import FundingTracker
 from trading_bot.marketdata.models import MarketDataEvent
 from trading_bot.marketdata.recorder import MarketDataRecorder, register_markets
 from trading_bot.monitoring.display import CLEAR_SCREEN, FRAME_OVERHEAD, FrameContext, render
 from trading_bot.monitoring.monitor import MarketMonitor
+from trading_bot.monitoring.strategy_view import render_evaluation
 from trading_bot.monitoring.universe import select_universe
+from trading_bot.strategy.base import StrategyContext
+from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.registry import build_strategies
+from trading_bot.strategy.runner import StrategyRunner
 
 logger = get_logger(__name__)
 
@@ -66,6 +73,19 @@ async def run_service(
         recent: deque[MarketDataEvent] = deque(maxlen=6)
         engine.add_listener(recent.append)
 
+        strategies = _build_strategy_layer(settings, universe.specs)
+        funding = (
+            FundingTracker(
+                venue,
+                universe.refs,
+                interval_seconds=settings.strategy.spot_perp_basis.funding_refresh_seconds,
+            )
+            if strategies is not None
+            else None
+        )
+        if funding is not None:
+            await _prime_funding(funding)
+
         recorder = await _open_recorder(settings, list(universe.specs)) if config.persist else None
         if recorder is not None:
             engine.add_listener(recorder.record_event)
@@ -90,6 +110,23 @@ async def run_service(
                 tasks.append(asyncio.create_task(monitor.run(), name="market-monitor"))
                 if recorder is not None:
                     tasks.append(asyncio.create_task(recorder.run(engine.snapshots)))
+                if strategies is not None and funding is not None:
+                    runner, cost_summary = strategies
+                    tasks.append(asyncio.create_task(funding.run(), name="funding-tracker"))
+                    tasks.append(
+                        asyncio.create_task(
+                            _strategy_loop(
+                                runner,
+                                monitor,
+                                engine,
+                                funding,
+                                interval_seconds=(settings.strategy.evaluate_interval_ms / 1000),
+                            ),
+                            name="strategy-runner",
+                        )
+                    )
+                else:
+                    runner, cost_summary = None, ""
                 if config.display:
                     tasks.append(
                         asyncio.create_task(
@@ -99,6 +136,9 @@ async def run_service(
                                 recent,
                                 context,
                                 interval_seconds=config.display_interval_ms / 1000,
+                                runner=runner if settings.strategy.display else None,
+                                cost_summary=cost_summary,
+                                funding=funding,
                             )
                         )
                     )
@@ -150,6 +190,57 @@ async def _open_recorder(settings: Settings, specs: list[MarketSpec]) -> MarketD
     )
 
 
+def _build_strategy_layer(
+    settings: Settings, specs: Sequence[MarketSpec]
+) -> tuple[StrategyRunner, str] | None:
+    """The strategy runner and the one-line summary of its cost assumptions.
+
+    ``None`` when evaluation is switched off or no strategy is enabled - the
+    market view still runs, it simply has nothing to say about opportunities.
+    """
+    if not settings.strategy.evaluate or not settings.strategy.enabled:
+        return None
+    basis = settings.strategy.spot_perp_basis
+    cost_model = ConfiguredCostModel(
+        settings.costs,
+        funding_horizon=timedelta(minutes=basis.funding_horizon_minutes),
+    )
+    by_ref = {spec.ref: spec for spec in specs}
+    runner = StrategyRunner(
+        build_strategies(settings.strategy),
+        StrategyContext(cost_model=cost_model, specs=by_ref),
+        specs=by_ref,
+    )
+    return runner, cost_model.describe()
+
+
+async def _prime_funding(tracker: FundingTracker) -> None:
+    """One funding poll before the first evaluation.
+
+    Without it the first cycles price nothing at all, which would read as "no
+    opportunities" when it actually means "no funding data yet".
+    """
+    try:
+        await tracker.refresh()
+    except ExchangeError as exc:
+        logger.warning("funding.initial_refresh_failed", error=str(exc))
+
+
+async def _strategy_loop(
+    runner: StrategyRunner,
+    monitor: MarketMonitor,
+    engine: MarketDataEngine,
+    funding: FundingTracker,
+    *,
+    interval_seconds: float,
+) -> None:
+    """Evaluate every strategy against the latest snapshots, on a fixed cadence."""
+    while True:
+        runner.set_funding(funding.rates)
+        runner.evaluate(engine.snapshots(), monitor.metrics())
+        await asyncio.sleep(interval_seconds)
+
+
 async def _clock_skew(adapter: ExchangeAdapter) -> int | None:
     try:
         return (await adapter.get_server_time()).skew_ms
@@ -165,11 +256,19 @@ async def _display_loop(
     context: FrameContext,
     *,
     interval_seconds: float,
+    runner: StrategyRunner | None = None,
+    cost_summary: str = "",
+    funding: FundingTracker | None = None,
 ) -> None:
     tty = sys.stdout.isatty()
     interval = interval_seconds if tty else max(interval_seconds, _UNATTENDED_INTERVAL_SECONDS)
     while True:
         rows = max(5, shutil.get_terminal_size().lines - FRAME_OVERHEAD) if tty else None
+        panels = _strategy_panels(runner, cost_summary, funding, max_rows=rows)
+        if panels and rows is not None:
+            # The strategy panel and the market table share one screen; give
+            # the markets what is left rather than scrolling either away.
+            rows = max(3, rows - sum(panel.count("\n") + 2 for panel in panels))
         frame = render(
             monitor.metrics(),
             monitor.summary(),
@@ -179,9 +278,34 @@ async def _display_loop(
             context=context,
             max_rows=rows,
         )
-        sys.stdout.write((CLEAR_SCREEN if tty else "") + frame + "\n\n")
+        body = "\n\n".join([frame, *panels]) if panels else frame
+        sys.stdout.write((CLEAR_SCREEN if tty else "") + body + "\n\n")
         sys.stdout.flush()
         await asyncio.sleep(interval)
+
+
+def _strategy_panels(
+    runner: StrategyRunner | None,
+    cost_summary: str,
+    funding: FundingTracker | None,
+    *,
+    max_rows: int | None,
+) -> list[str]:
+    """One panel per strategy; empty until the first evaluation has run."""
+    if runner is None:
+        return []
+    unknown = funding.markets_without_interval if funding is not None else set()
+    # A panel gets at most a third of the screen, so the market table survives.
+    panel_rows = None if max_rows is None else max(3, max_rows // 3)
+    return [
+        render_evaluation(
+            evaluation,
+            cost_summary=cost_summary,
+            max_rows=panel_rows,
+            funding_unknown=sorted(unknown),
+        )
+        for evaluation in runner.evaluations()
+    ]
 
 
 def _stop_on_signals() -> asyncio.Event:

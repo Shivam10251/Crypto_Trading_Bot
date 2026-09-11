@@ -302,6 +302,13 @@ class FundingInfo:
 
     Funding is a real cost of holding a perpetual leg, so the spot/perp strategy
     cannot be evaluated without it.
+
+    ``last_funding_rate`` is the rate for ONE interval, and the interval is not
+    a constant: measured on binance.com, 467 USD-M perpetuals settle every 4
+    hours, 313 every 8 and 2 every hour. It is ``None`` for the symbols the
+    venue omits from its ``fundingInfo`` endpoint - whose intervals are also
+    mixed - so a consumer can refuse to estimate rather than assume eight hours
+    and be wrong by a factor of two.
     """
 
     ref: MarketRef
@@ -310,10 +317,18 @@ class FundingInfo:
     last_funding_rate: Decimal
     next_funding_time: datetime
     local_timestamp: datetime
+    funding_interval_hours: int | None = None
 
     @property
     def last_funding_rate_bps(self) -> Decimal:
+        """Rate for one funding interval, not a normalized daily figure."""
         return self.last_funding_rate * BPS_SCALE
+
+    def rate_bps_per(self, hours: Decimal) -> Decimal | None:
+        """Funding over ``hours``, or ``None`` when the interval is unknown."""
+        if self.funding_interval_hours is None or self.funding_interval_hours <= 0:
+            return None
+        return self.last_funding_rate_bps * hours / Decimal(self.funding_interval_hours)
 
 
 @dataclass(frozen=True, slots=True)

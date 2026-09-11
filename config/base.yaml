@@ -110,6 +110,31 @@ strategy:
   # First strategy (Phase 5): spot vs perpetual futures basis / relative value.
   enabled:
     - "spot_perp_basis"
+  # Run the enabled strategies inside the market-data service and show what
+  # they see. Detection only - nothing is executed before Phase 8.
+  evaluate: true
+  display: true
+  evaluate_interval_ms: 1000
+  spot_perp_basis:
+    # Required edge AFTER every cost. Gross spread is never traded on.
+    min_net_edge_bps: 1.0
+    # Size each opportunity is evaluated at, capped again by what the thinner
+    # leg's book can absorb. The risk engine re-checks this in Phase 9.
+    max_notional_usd: 1000
+    # Selling the spot leg needs inventory or a margin borrow. On a plain spot
+    # account only "buy spot, sell perp" is reachable; the other direction is
+    # still detected and priced as research data, but never signalled.
+    allow_spot_short: false
+    # Both legs must be this fresh and this fast, or the basis describes a
+    # market that has already moved on.
+    max_data_age_ms: 2000
+    max_latency_ms: 500
+    signal_ttl_ms: 500
+    # Assumed holding period for the perpetual leg, used to charge funding.
+    # Over minutes funding is negligible beside fees; over days it dominates.
+    funding_horizon_minutes: 60
+    # Bulk funding poll: weight 10 however many markets are monitored.
+    funding_refresh_seconds: 60
 
 costs:
   # Binance spot taker fee and USDⓈ-M perp taker fee, in basis points.

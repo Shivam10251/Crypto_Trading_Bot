@@ -274,8 +274,41 @@ class MonitoringConfig(ConfigSection):
     window_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class SpotPerpBasisConfig(ConfigSection):
+    """The spot/perpetual basis strategy (Phase 5)."""
+
+    # Net edge, after every cost, required before a signal is generated. The
+    # threshold is on NET: gross spread is never traded on.
+    min_net_edge_bps: float = Field(default=1.0, ge=0)
+    # Size one opportunity is evaluated at, capped again by what the thinner
+    # leg's book can absorb. The risk engine re-checks this in Phase 9.
+    max_notional_usd: float = Field(default=1000.0, gt=0)
+    # Selling the spot leg needs inventory or a margin borrow. On a plain spot
+    # account only "buy spot, sell perp" is reachable, so the other direction
+    # is detected and priced - it is research data - but never signalled.
+    allow_spot_short: bool = False
+    # Both legs must be this fresh, and no slower than this, or the basis
+    # describes a market that has moved on.
+    max_data_age_ms: int = Field(default=2000, gt=0)
+    max_latency_ms: int = Field(default=500, gt=0)
+    # A signal acted on after this point is stale by definition.
+    signal_ttl_ms: int = Field(default=500, gt=0)
+    # How long the perpetual leg is assumed to be held, for charging funding.
+    # Over minutes funding is negligible beside fees; over days it dominates.
+    funding_horizon_minutes: float = Field(default=60.0, gt=0)
+    # Funding rates move on the venue's schedule, not ours; polling the bulk
+    # endpoint costs weight 10 however many markets are monitored.
+    funding_refresh_seconds: float = Field(default=60.0, gt=0)
+
+
 class StrategyConfig(ConfigSection):
     enabled: list[str] = Field(default_factory=lambda: ["spot_perp_basis"])
+    spot_perp_basis: SpotPerpBasisConfig = Field(default_factory=SpotPerpBasisConfig)
+    # Evaluate the enabled strategies inside the market-data service and show
+    # what they see. Detection only - nothing is executed before Phase 8.
+    evaluate: bool = True
+    display: bool = True
+    evaluate_interval_ms: int = Field(default=1000, ge=100)
 
 
 class CostsConfig(ConfigSection):

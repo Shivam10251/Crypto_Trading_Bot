@@ -30,6 +30,9 @@ class VenueRoutes:
     ticker_24hr: str
     # Futures only; spot has no funding.
     premium_index: str | None = None
+    # Funding interval per symbol. Separate from premiumIndex, and it does not
+    # list every symbol - the ones it omits have no publishable interval.
+    funding_info: str | None = None
 
     def url(self, path: str) -> str:
         return f"{self.rest_base.rstrip('/')}{path}"
@@ -54,6 +57,7 @@ FUTURES_ROUTES = VenueRoutes(
     server_time="/fapi/v1/time",
     ticker_24hr="/fapi/v1/ticker/24hr",
     premium_index="/fapi/v1/premiumIndex",
+    funding_info="/fapi/v1/fundingInfo",
 )
 
 # The venue rejects any other depth limit with -4021.

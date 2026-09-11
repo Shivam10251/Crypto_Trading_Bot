@@ -28,7 +28,13 @@ router = APIRouter(tags=["system"])
 # Subsystems not yet built. Kept here so exactly one place needs editing as
 # each phase lands, and so nothing reports a status it cannot substantiate.
 _PENDING_COMPONENTS: tuple[tuple[str, str], ...] = (
-    ("Strategy Engine", "not implemented until Phase 5"),
+    # Built in Phase 5 and evaluating inside the market-data service, but it
+    # stores nothing until Phase 7 - so the API has no output to judge it by
+    # and says so, rather than reporting a health it cannot substantiate.
+    (
+        "Strategy Engine",
+        "detection runs in the market-data service; not observable here until Phase 7",
+    ),
     ("Risk Engine", "not implemented until Phase 9"),
     ("Paper Execution", "not implemented until Phase 8"),
 )

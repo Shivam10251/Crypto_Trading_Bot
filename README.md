@@ -11,10 +11,18 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phase 4 complete** — foundation, data model, the exchange
-abstraction, a real-time market-data engine, and market monitoring: the 50
-most liquid spot/perpetual pairs, chosen by configuration, streamed and
-measured live (`make market-data`). No strategy, no trading yet. See
+Current state: **Phase 5 complete** — foundation, data model, the exchange
+abstraction, a real-time market-data engine, market monitoring of the 50 most
+liquid spot/perpetual pairs, and the strategy framework with the first
+spot/perpetual basis strategy. `make market-data` streams those markets and
+shows what the strategy concludes about each one, with every cost itemised.
+Detection only: nothing is executed, and nothing is stored until Phase 7.
+
+Measured live on 2026-09-11: across 48 priced pairs the median gross basis was
+7.6 bps against a 30 bps round-trip taker-fee floor — a median **net edge of
+-30 bps**, and **zero tradeable opportunities**. The basis persists for tens of
+seconds, far longer than the 75 ms quote latency; it is not too fast to catch,
+it is too small to pay for. See
 [docs/development-phases.md](docs/development-phases.md).
 
 ---
@@ -78,7 +86,7 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 474 tests (9 live, opt-in)
+cd backend  && uv run pytest                # 491 tests (14 live, opt-in)
 cd frontend && pnpm test                    # 10 tests
 make check                                  # lint + types + tests
 ```
@@ -92,6 +100,7 @@ real API (public endpoints, no credentials):
 
 ```bash
 cd backend && TB_TEST_LIVE=1 uv run pytest tests/integration/test_binance_live.py -v
+cd backend && TB_TEST_LIVE=1 uv run pytest tests/integration/test_strategy_live.py -v
 ```
 
 ## Project layout
@@ -106,6 +115,7 @@ backend/                  FastAPI service, strategy engine, data pipeline
       binance/            binance.com spot + USDⓈ-M market data and streams
     marketdata/           real-time engine: connections, order books, staleness
     monitoring/           market selection, per-market statistics, terminal view
+    strategy/             strategy contract, domain types, cost model, basis strategy
   alembic/                database migrations
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)

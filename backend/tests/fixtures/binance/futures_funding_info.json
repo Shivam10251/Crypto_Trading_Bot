@@ -1,0 +1,34 @@
+[
+  {
+    "symbol": "IOSTUSDT",
+    "adjustedFundingRateCap": "0.02000000",
+    "adjustedFundingRateFloor": "-0.02000000",
+    "fundingIntervalHours": 1,
+    "disclaimer": false,
+    "updateTime": 1788998461055
+  },
+  {
+    "symbol": "ENAUSDT",
+    "adjustedFundingRateCap": "0.02000000",
+    "adjustedFundingRateFloor": "-0.02000000",
+    "fundingIntervalHours": 4,
+    "disclaimer": false,
+    "updateTime": 1712061164617
+  },
+  {
+    "symbol": "ETHUSDT",
+    "adjustedFundingRateCap": "0.00300",
+    "adjustedFundingRateFloor": "-0.00300",
+    "fundingIntervalHours": 8,
+    "disclaimer": true,
+    "updateTime": null
+  },
+  {
+    "symbol": "BTCUSDT",
+    "adjustedFundingRateCap": "0.00300",
+    "adjustedFundingRateFloor": "-0.00300",
+    "fundingIntervalHours": 8,
+    "disclaimer": true,
+    "updateTime": null
+  }
+]

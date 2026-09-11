@@ -17,7 +17,7 @@ only, and the order path is built in Phase 17 behind an explicit opt-in.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from types import TracebackType
 from typing import Self
@@ -89,6 +89,24 @@ class ExchangeAdapter(ABC):
         Default raises: venues without perpetuals should not pretend to answer.
         """
         raise NotSupportedError(f"{self.venue} does not expose funding for {ref}")
+
+    async def get_funding_rates(self, market_type: MarketType) -> list[FundingInfo]:
+        """Funding state for every perpetual of one instrument class, in one request.
+
+        A strategy following fifty pairs should not make fifty requests.
+        Default raises: a venue without a bulk endpoint should not quietly do
+        exactly that behind the caller's back.
+        """
+        raise NotSupportedError(f"{self.venue} does not expose bulk funding rates")
+
+    async def get_funding_intervals(self, market_type: MarketType) -> Mapping[str, int]:
+        """How often each perpetual settles funding, in hours.
+
+        A funding rate without its interval cannot be turned into a cost, and
+        the interval is not a constant across symbols. Symbols the venue does
+        not publish one for are absent from the mapping rather than defaulted.
+        """
+        raise NotSupportedError(f"{self.venue} does not expose funding intervals")
 
     async def get_daily_stats(self, market_type: MarketType) -> list[TickerStats]:
         """Rolling 24h statistics for every listed symbol of one instrument class.
