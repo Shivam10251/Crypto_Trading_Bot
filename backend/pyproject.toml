@@ -49,6 +49,7 @@ asyncio_mode = "auto"
 addopts = "-q --strict-markers"
 markers = [
     "requires_postgres: test needs a live PostgreSQL instance (skipped when absent)",
+    "requires_network: test calls a live exchange API (opt in with TB_TEST_LIVE=1)",
 ]
 filterwarnings = ["error::DeprecationWarning:trading_bot.*"]
 

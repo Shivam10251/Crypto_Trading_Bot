@@ -1,6 +1,8 @@
 # Data Model
 
-Status: **implemented (Phase 1).** 13 tables, one migration, 197 backend tests.
+Status: **implemented.** 13 tables, two migrations, 309 backend tests.
+Phase 1 built the schema; Phase 2 corrected the exchange-timestamp
+assumption after checking the live Binance API.
 
 ## Traceability requirement
 
@@ -26,7 +28,7 @@ records the limit, the observed value and the reason.
 | Table | Purpose | Key columns |
 | --- | --- | --- |
 | `markets` | Instrument reference, one row per venue+symbol+type | exchange filters, fees |
-| `market_data` | Normalized top-of-book snapshots | both clocks, `latency_ms`, `sequence` |
+| `market_data` | Normalized top-of-book snapshots | `local_timestamp`, optional exchange clock, `latency_ms` |
 | `order_books` | Sampled depth snapshots (JSONB) | `depth_levels` |
 | `trades_market` | Public trade prints, for slippage calibration | unique `exchange_trade_id` |
 | `opportunities` | Every detected discrepancy, with full cost breakdown | `net_edge_bps`, `status`, `uid` |
@@ -57,9 +59,13 @@ still rejects invalid values, but later phases will add order states, risk event
 types and strategies. Extending a native enum needs `ALTER TYPE`, which cannot
 run inside a transaction and makes migrations fragile.
 
-**Both clocks are stored.** `exchange_timestamp` and `local_timestamp` on every
-market-data row, so latency is measured rather than inferred and staleness is
-judged against the clock that matters.
+**Both clocks are stored, when the venue provides one.**
+`local_timestamp` is always present; `exchange_timestamp` is nullable because
+Binance spot `bookTicker` and `depth` send no event time, while USDⓈ-M futures
+do (verified against the live API in Phase 2). Putting local time in that
+column would fabricate a latency measurement, so a check constraint enforces
+that `latency_ms` can only exist alongside an exchange clock. Staleness is
+judged on `local_timestamp` - the one clock the venue cannot control.
 
 **Invalid data is refused by the database.** Check constraints reject
 non-positive prices, negative sizes and crossed books (`ask < bid`) — a crossed

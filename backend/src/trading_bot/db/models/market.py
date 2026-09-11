@@ -100,9 +100,12 @@ class MarketData(Base, RecordMixin):
 
     volume_24h: Mapped[Decimal | None] = mapped_column(QUANTITY)
 
-    exchange_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # NULL when the venue does not report its own clock: Binance spot
+    # bookTicker and depth carry no event time, while USD-M futures do. Storing
+    # the local time here instead would fabricate a measurement.
+    exchange_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     local_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    # exchange -> local delta; the honest measure of how old this quote is.
+    # exchange -> local delta; NULL whenever exchange_timestamp is.
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     # Venue update id, used to detect gaps and duplicate messages.
     sequence: Mapped[int | None] = mapped_column(BigInteger)
@@ -120,6 +123,11 @@ class MarketData(Base, RecordMixin):
         # A crossed top-of-book on a single venue means bad data. Refusing it
         # here keeps the research dataset trustworthy.
         CheckConstraint("ask >= bid", name="book_not_crossed"),
+        # Latency is exchange -> local; it cannot exist without both clocks.
+        CheckConstraint(
+            "latency_ms IS NULL OR exchange_timestamp IS NOT NULL",
+            name="latency_requires_exchange_clock",
+        ),
     )
 
 
@@ -142,7 +150,8 @@ class OrderBookSnapshot(Base, RecordMixin):
     asks: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     depth_levels: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    exchange_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # NULL for venues that omit an event time (Binance spot depth).
+    exchange_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     local_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sequence: Mapped[int | None] = mapped_column(BigInteger)
 

@@ -7,7 +7,7 @@ stops for review before the next begins.
 | --- | --- | --- |
 | 0 | Architecture and project foundation | **Complete** |
 | 1 | Database and data model | **Complete** |
-| 2 | Exchange abstraction (market data only) | Not started |
+| 2 | Exchange abstraction (market data only) | **Complete** |
 | 3 | Real-time market data engine | Not started |
 | 4 | Market monitoring | Not started |
 | 5 | Strategy framework + spot/perp basis strategy | Not started |
@@ -95,9 +95,62 @@ only.
 
 Design decisions and rationale: [data-model.md](data-model.md).
 
-## Phase 2 — next
+## Phase 2 — delivered
 
-Define the `ExchangeAdapter` interface and implement `BinanceExchangeAdapter`
-for **market data only** - no order execution. Must cover binance.com spot and
-USDⓈ-M futures endpoints, since the first strategy compares the two. See
+- **`ExchangeAdapter`** ABC: six abstract market-data methods every venue must
+  provide; optional capabilities (perpetual funding) and all execution methods
+  raise by default, so a missing capability fails loudly instead of returning
+  something invented
+- **`BinanceExchangeAdapter`** for binance.com **spot and USDⓈ-M perpetuals**,
+  routing by market type across two hosts with different payload shapes
+- **Normalized models** (`Quote`, `OrderBook`, `TradePrint`, `MarketSpec`,
+  `FundingInfo`): frozen slotted dataclasses, `Decimal` throughout, invariants
+  enforced in `__post_init__` so a malformed quote cannot be constructed
+- **`OrderBook.fill_price()`** walks real depth and reports partial fills -
+  the foundation for honest slippage in Phases 6 and 8
+- **REST client** with retries, exponential backoff, `Retry-After` handling and
+  request-weight tracking (Binance bans IPs that ignore 429s)
+- **Execution stays disabled**: `place_order`, `cancel_order`,
+  `get_order_status` and `get_balances` raise `ExecutionNotEnabledError`;
+  streaming raises pointing at Phase 3
+- **Schema correction**: `market_data.exchange_timestamp` is now nullable,
+  because Binance spot sends no event time (see below)
+- **Tests**: 309 backend (from 197). 112 new tests over recorded live payloads
+  plus 6 opt-in tests against the real API
+
+### What checking reality changed
+
+Before writing the mapping layer I probed the live API rather than trusting
+documentation from memory. Two findings changed the design:
+
+1. **Binance spot `bookTicker` and `depth` carry no exchange timestamp**, while
+   USDⓈ-M futures do. Phase 1 had assumed every venue reports its own clock and
+   made the column `NOT NULL`. Storing local time there would have fabricated a
+   latency measurement, so the column is now nullable, with a check constraint
+   ensuring `latency_ms` cannot exist without the clock it derives from.
+2. **Futures reject arbitrary depth limits** (`-4021`); only 5/10/20/50/100/
+   500/1000 are valid. The adapter snaps the request up and trims the result.
+
+### First live observation
+
+Measured through the adapter on 2026-09-11:
+
+```
+SPOT   bid=76997.45  ask=76997.46   spread 0.001 bps
+PERP   bid=76964.80  ask=76964.90   spread 0.013 bps   latency 74 ms
+BASIS  -32.60 USD = -4.235 bps (perp at a discount)
+FUNDING 0.80 bps per 8h
+GROSS 4.235 bps - fees 15 bps - buffer 2 bps = NET -12.765 bps
+```
+
+A 4 bps basis against 15 bps of round-trip taker fees is **not** an
+opportunity. This is the concrete case for building the cost model before
+trusting any signal, and for storing rejected opportunities as research data.
+
+## Phase 3 — next
+
+Build the real-time market-data engine: WebSocket connection management,
+reconnection with backoff, heartbeats, stale-data detection, message
+validation, order-book synchronisation and sequence-gap detection. Starts with
+BTC/USDT, then expands to configurable markets. See
 [architecture.md](architecture.md).

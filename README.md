@@ -11,8 +11,9 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phase 1 complete** — foundation and data model. No exchange
-connection, no strategy, no trading yet. See
+Current state: **Phase 2 complete** — foundation, data model, and the exchange
+abstraction with Binance market data (spot + USDⓈ-M perpetuals). No live
+streaming, no strategy, no trading yet. See
 [docs/development-phases.md](docs/development-phases.md).
 
 ---
@@ -72,13 +73,21 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 197 tests
+cd backend  && uv run pytest                # 309 tests
 cd frontend && pnpm test                    # 9 tests
 make check                                  # lint + types + tests
 ```
 
 Database tests need PostgreSQL running (`docker compose up -d`). Without it
 they skip with a reason rather than failing, so the suite stays usable.
+
+Tests never touch the network: Binance behaviour is tested against recorded
+live payloads in `tests/fixtures/binance/`. To additionally verify against the
+real API (public endpoints, no credentials):
+
+```bash
+cd backend && TB_TEST_LIVE=1 uv run pytest tests/integration/test_binance_live.py -v
+```
 
 ## Project layout
 
@@ -88,6 +97,8 @@ backend/                  FastAPI service, strategy engine, data pipeline
     api/                  HTTP layer (routes, schemas, dependencies)
     core/                 configuration and logging
     db/                   engine, sessions, ORM models, retention
+    exchange/             venue boundary: adapter interface, normalized models
+      binance/            binance.com spot + USDⓈ-M market data
   alembic/                database migrations
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)

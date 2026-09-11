@@ -61,6 +61,8 @@ can never reach an execution adapter without a risk decision.
 | `trading_bot.core.config` | Layered settings, live-trading guards | nothing |
 | `trading_bot.core.logging` | Structured logs, credential redaction | config |
 | `trading_bot.db` | Engine, sessions, ORM models, retention | config, logging |
+| `trading_bot.exchange` | Venue boundary: adapter interface + normalized models | config, logging |
+| `trading_bot.exchange.binance` | binance.com spot + USDⓈ-M market data | exchange, config |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -94,10 +96,22 @@ database.
 ## Status
 
 Built: configuration, logging, database layer with the full 13-table data
-model and migrations, retention, API skeleton, health and system-status
+model and migrations, retention, the exchange abstraction with a Binance
+market-data adapter (spot + USDⓈ-M), API skeleton, health and system-status
 endpoints, frontend shell, test tooling.
 
-Not built: everything from Phase 2 onward - exchange connection, market data,
+Not built: everything from Phase 3 onward - live streaming, market monitoring,
 strategy, cost model, execution, risk engine, portfolio, dashboard. The
 system-status endpoint reports those subsystems as `OFFLINE` with the phase that
 will implement them.
+
+### The exchange boundary
+
+Strategies depend on `ExchangeAdapter` and the normalized models, never on
+Binance specifics, so a second venue means writing one adapter. Market-data
+methods are abstract because every venue must provide them; optional
+capabilities and execution methods raise by default rather than returning an
+invented answer. Payload validation happens once, in the venue's mapping layer:
+past that point the data is trusted, and anything malformed - crossed book,
+zero price, missing field - raises `ExchangeDataError` instead of reaching a
+strategy.
