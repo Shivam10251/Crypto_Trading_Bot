@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from trading_bot import __version__
 from trading_bot.api.router import api_router
+from trading_bot.api.routes import root
 from trading_bot.core.config import Settings, get_settings
 from trading_bot.core.logging import configure_logging, get_logger
 from trading_bot.db.session import dispose_engine, init_engine
@@ -75,6 +76,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_headers=["*"],
         )
 
+    # Root index is unversioned on purpose; the data contract stays under /api/v1.
+    app.include_router(root.router)
     app.include_router(api_router)
     app.state.settings = resolved
     return app

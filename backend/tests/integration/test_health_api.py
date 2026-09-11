@@ -92,3 +92,41 @@ class TestAppWiring:
         assert all(path.startswith(API_PREFIX) for path in paths), paths
         assert f"{API_PREFIX}/health" in paths
         assert f"{API_PREFIX}/system-status" in paths
+
+
+class TestServiceIndex:
+    """Opening the bare host must explain the service, not return a bare 404."""
+
+    async def test_root_returns_an_index(self, client: AsyncClient) -> None:
+        response = await client.get("/")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["version"] == __version__
+        assert body["profile"] == "development"
+
+    async def test_root_points_at_the_real_endpoints(self, client: AsyncClient) -> None:
+        body = (await client.get("/")).json()
+        assert body["endpoints"] == {
+            "health": f"{API_PREFIX}/health",
+            "readiness": f"{API_PREFIX}/health/ready",
+            "system_status": f"{API_PREFIX}/system-status",
+        }
+        assert body["docs"] == "/docs"
+
+    async def test_advertised_links_actually_resolve(self, client: AsyncClient) -> None:
+        """A broken link here is worse than no link."""
+        body = (await client.get("/")).json()
+        for path in body["endpoints"].values():
+            assert (await client.get(path)).status_code == 200, path
+
+    def test_docs_link_is_null_when_docs_disabled(self) -> None:
+        from trading_bot.core.config import ApiConfig
+
+        app = create_app(Settings(api=ApiConfig(docs_enabled=False)))
+        assert app.docs_url is None
+
+    def test_root_stays_out_of_the_versioned_contract(self) -> None:
+        paths = create_app(Settings()).openapi()["paths"]
+        assert "/" not in paths
+        assert all(path.startswith(API_PREFIX) for path in paths)

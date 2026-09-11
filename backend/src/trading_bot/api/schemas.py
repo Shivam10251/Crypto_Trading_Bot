@@ -62,3 +62,16 @@ class SystemStatusResponse(BaseModel):
     monitored_perpetual_markets: int
     components: list[ComponentHealth]
     server_time: datetime
+
+
+class ServiceIndexResponse(BaseModel):
+    """What the root path returns: what this service is and where to go next."""
+
+    service: str
+    version: str
+    profile: str
+    status: str
+    # None when API docs are disabled (production).
+    docs: str | None
+    dashboard: str
+    endpoints: dict[str, str]
