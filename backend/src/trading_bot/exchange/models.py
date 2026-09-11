@@ -28,6 +28,13 @@ from trading_bot.exchange.errors import ExchangeDataError
 BPS_SCALE = Decimal(10_000)
 
 
+def _latency_ms(local: datetime, exchange: datetime | None) -> int | None:
+    """Exchange-to-local delay, or ``None`` when the venue sent no clock."""
+    if exchange is None:
+        return None
+    return int((local - exchange).total_seconds() * 1000)
+
+
 @dataclass(frozen=True, slots=True)
 class MarketRef:
     """Identity of an instrument: enough to route a request or key a cache."""
@@ -209,6 +216,70 @@ class OrderBook:
 
 
 @dataclass(frozen=True, slots=True)
+class DepthDiff:
+    """One incremental order-book update from a venue's depth stream.
+
+    Sizes are absolute, not deltas: a level's size replaces what the local book
+    holds, and size zero deletes the level. That is what makes re-applying an
+    update the snapshot already reflects harmless.
+
+    The update ids let a consumer prove it missed nothing: this message covers
+    ``first_update_id..final_update_id``, and ``previous_final_update_id`` -
+    when the venue sends it - names the message that must have come before.
+    """
+
+    ref: MarketRef
+    first_update_id: int
+    final_update_id: int
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    local_timestamp: datetime
+    exchange_timestamp: datetime | None = None
+    previous_final_update_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.first_update_id > self.final_update_id:
+            raise ExchangeDataError(
+                f"depth update ids reversed for {self.ref}: "
+                f"{self.first_update_id} > {self.final_update_id}"
+            )
+        for level in (*self.bids, *self.asks):
+            if level.price <= 0 or level.size < 0:
+                raise ExchangeDataError(f"invalid depth level for {self.ref}: {level}")
+        if self.local_timestamp.tzinfo is None:
+            raise ExchangeDataError("local_timestamp must be timezone-aware")
+
+    @property
+    def latency_ms(self) -> int | None:
+        return _latency_ms(self.local_timestamp, self.exchange_timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class TickerStats:
+    """Rolling 24-hour statistics - where traded volume comes from."""
+
+    ref: MarketRef
+    last_price: Decimal
+    # Base-asset and quote-asset volume over the rolling window.
+    volume: Decimal
+    quote_volume: Decimal
+    exchange_timestamp: datetime
+    local_timestamp: datetime
+
+    def __post_init__(self) -> None:
+        if self.last_price <= 0:
+            raise ExchangeDataError(f"non-positive last price for {self.ref}")
+        if self.volume < 0 or self.quote_volume < 0:
+            raise ExchangeDataError(f"negative volume for {self.ref}")
+        if self.local_timestamp.tzinfo is None:
+            raise ExchangeDataError("local_timestamp must be timezone-aware")
+
+    @property
+    def latency_ms(self) -> int | None:
+        return _latency_ms(self.local_timestamp, self.exchange_timestamp)
+
+
+@dataclass(frozen=True, slots=True)
 class TradePrint:
     """A public trade, used to calibrate slippage against reality."""
 
@@ -275,12 +346,14 @@ class ServerTime:
 
 @dataclass(frozen=True, slots=True)
 class MarketDataSubscription:
-    """What a caller wants streamed. Consumed by the Phase 3 engine."""
+    """What a caller wants streamed; a venue's stream source turns it into connections."""
 
     refs: tuple[MarketRef, ...]
     include_depth: bool = False
     depth_levels: int = 10
     include_trades: bool = False
+    # Rolling 24h statistics, which is where traded volume comes from.
+    include_ticker: bool = False
     _created_at: datetime = field(default_factory=lambda: datetime.now(UTC), repr=False)
 
     @classmethod

@@ -50,9 +50,14 @@ def to_decimal(raw: Any, context: str) -> Decimal:
     to float parsing; going straight to Decimal preserves that.
     """
     try:
-        return Decimal(str(raw))
+        value = Decimal(str(raw))
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise ExchangeDataError(f"{context}: cannot parse {raw!r} as a number") from exc
+    # "NaN" and "Infinity" parse, but comparing them raises later - far from
+    # the payload that caused it.
+    if not value.is_finite():
+        raise ExchangeDataError(f"{context}: {raw!r} is not a finite number")
+    return value
 
 
 def to_datetime(raw: Any, context: str) -> datetime:

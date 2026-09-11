@@ -13,14 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from trading_bot.db.models.enums import MarketType
+from trading_bot.exchange.streaming import StreamKind
 
 
 @dataclass(frozen=True, slots=True)
 class VenueRoutes:
-    """REST and WebSocket routes for one instrument class."""
+    """REST routes for one instrument class."""
 
     rest_base: str
-    ws_base: str
     exchange_info: str
     book_ticker: str
     depth: str
@@ -35,7 +35,6 @@ class VenueRoutes:
 
 SPOT_ROUTES = VenueRoutes(
     rest_base="https://api.binance.com",
-    ws_base="wss://stream.binance.com:9443/ws",
     exchange_info="/api/v3/exchangeInfo",
     book_ticker="/api/v3/ticker/bookTicker",
     depth="/api/v3/depth",
@@ -45,7 +44,6 @@ SPOT_ROUTES = VenueRoutes(
 
 FUTURES_ROUTES = VenueRoutes(
     rest_base="https://fapi.binance.com",
-    ws_base="wss://fstream.binance.com/ws",
     exchange_info="/fapi/v1/exchangeInfo",
     book_ticker="/fapi/v1/ticker/bookTicker",
     depth="/fapi/v1/depth",
@@ -70,3 +68,29 @@ def normalize_depth_limit(levels: int) -> int:
         if levels <= allowed:
             return allowed
     return VALID_DEPTH_LIMITS[-1]
+
+
+# --- WebSocket ---------------------------------------------------------------
+#
+# Combined streams (``/stream?streams=a/b/c``) wrap every message as
+# ``{"stream": name, "data": payload}``, which lets one connection carry many
+# markets.
+#
+# USD-M futures split their streams by route. Verified live on 2026-09-11:
+# bookTicker and depth are served under /public, the 24h ticker under /market.
+# The legacy /stream route still carries bookTicker and depth, but accepts a
+# @ticker subscription and then sends nothing at all - a silent failure, which
+# is why routing is explicit here and why idle connections are treated as dead.
+SPOT_WS_BASE = "wss://stream.binance.com:9443"
+FUTURES_WS_BASE = "wss://fstream.binance.com"
+
+# Futures allow 200 streams per connection and spot 1024; the lower figure is
+# used for both so one setting cannot exceed either venue's limit.
+MAX_STREAMS_PER_CONNECTION = 200
+
+
+def ws_path(market_type: MarketType, kind: StreamKind) -> str:
+    """Combined-stream path for one kind of stream on one instrument class."""
+    if market_type is MarketType.SPOT:
+        return "/stream"
+    return "/market/stream" if kind is StreamKind.TICKER else "/public/stream"

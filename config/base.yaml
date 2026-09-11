@@ -40,10 +40,11 @@ exchange:
   # binance.com global endpoints (user is trading from India)
   venue: "binance"
   spot_rest_url: "https://api.binance.com"
-  spot_ws_url: "wss://stream.binance.com:9443/ws"
+  # WebSocket hosts. The adapter picks the path per stream kind: USD-M futures
+  # serve bookTicker/depth under /public and the 24h ticker under /market.
+  spot_ws_url: "wss://stream.binance.com:9443"
   futures_rest_url: "https://fapi.binance.com"
-  futures_ws_url: "wss://fstream.binance.com/ws"
-  # Phase 3+ uses this; Phase 0 only records it.
+  futures_ws_url: "wss://fstream.binance.com"
   request_timeout_seconds: 10
   max_reconnect_backoff_seconds: 30
 
@@ -53,6 +54,25 @@ markets:
     - "BTCUSDT"
   perpetual_symbols:
     - "BTCUSDT"
+
+market_data:
+  # Phase 3 engine: top of book, diff-depth order books, rolling 24h volume.
+  include_depth: true
+  include_ticker: true
+  # Levels published per side, and the REST snapshot depth that seeds each
+  # local book. The book is only trusted inside the snapshot's price range,
+  # and 100 spot BTC levels span roughly 12 USD - hence 1000.
+  depth_levels: 20
+  snapshot_depth: 1000
+  # No update of any kind for this long marks a market STALE.
+  stale_after_ms: 2000
+  # An open connection that delivers nothing for this long is treated as dead.
+  idle_timeout_seconds: 10
+  # Sampled quotes go to market_data once per interval, only when changed.
+  persist: true
+  persist_interval_ms: 1000
+  # The API calls a market live when its newest stored quote is this recent.
+  status_fresh_within_ms: 5000
 
 strategy:
   # First strategy (Phase 5): spot vs perpetual futures basis / relative value.

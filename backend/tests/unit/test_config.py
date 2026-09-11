@@ -11,6 +11,7 @@ from trading_bot.core.config import (
     CONFIG_DIR,
     DatabaseConfig,
     ExecutionMode,
+    MarketDataConfig,
     Profile,
     RiskConfig,
     Settings,
@@ -192,6 +193,29 @@ class TestMarketsConfig:
         symbols = [f"SYM{i}USDT" for i in range(60)]
         monkeypatch.setenv("TB_MARKETS__SPOT_SYMBOLS", repr(symbols).replace("'", '"'))
         assert len(Settings().markets.spot_symbols) == 60
+
+
+class TestMarketDataConfig:
+    def test_snapshot_covers_more_than_is_published(self) -> None:
+        config = Settings().market_data
+        assert config.snapshot_depth > config.depth_levels
+        assert config.include_depth
+        assert config.include_ticker
+
+    def test_snapshot_shallower_than_published_depth_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="snapshot_depth"):
+            MarketDataConfig(depth_levels=50, snapshot_depth=20)
+
+    def test_overridable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TB_MARKET_DATA__STALE_AFTER_MS", "750")
+        assert Settings().market_data.stale_after_ms == 750
+
+    def test_websocket_urls_are_hosts_without_a_path(self) -> None:
+        """Paths are chosen per stream kind; a baked-in /ws would break routing."""
+        exchange = Settings().exchange
+        for url in (exchange.spot_ws_url, exchange.futures_ws_url):
+            assert url.startswith("wss://")
+            assert url.count("/") == 2
 
 
 class TestCachedSettings:

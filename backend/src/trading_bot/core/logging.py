@@ -75,6 +75,10 @@ def configure_logging(config: LoggingConfig, *, force: bool = False) -> None:
     logging.basicConfig(format="%(message)s", stream=sys.stderr, level=level, force=True)
     for noisy in ("uvicorn.access", "uvicorn.error"):
         logging.getLogger(noisy).setLevel(max(level, logging.INFO))
+    # Transport libraries log every frame and request at DEBUG, which would bury
+    # the application's own events under dozens of lines per second.
+    for chatty in ("websockets", "httpcore", "httpx"):
+        logging.getLogger(chatty).setLevel(max(level, logging.WARNING))
 
     # SQLAlchemy emits every statement at INFO, which drowns the log at DEBUG
     # level. Setting echo_sql=True raises this logger itself when SQL is wanted.

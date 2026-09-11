@@ -13,6 +13,8 @@ from trading_bot.core.config import get_settings
 from trading_bot.core.logging import configure_logging, get_logger
 from trading_bot.db.retention import purge_expired
 from trading_bot.db.session import dispose_engine, init_engine, session_scope
+from trading_bot.exchange.errors import ExchangeError
+from trading_bot.marketdata.service import run_service
 
 
 def run_api() -> None:
@@ -26,6 +28,18 @@ def run_api() -> None:
         reload=settings.profile.value == "development",
         log_config=None,  # structlog owns log formatting
     )
+
+
+def run_market_data() -> None:
+    """Stream live market data (``uv run trading-bot-market-data``)."""
+    settings = get_settings()
+    configure_logging(settings.logging)
+    try:
+        asyncio.run(run_service(settings))
+    except ExchangeError as exc:
+        # A mistyped symbol or an unreachable venue at startup: say so plainly.
+        get_logger(__name__).error("market_data.startup_failed", error=str(exc))
+        raise SystemExit(1) from exc
 
 
 def run_retention_purge() -> None:

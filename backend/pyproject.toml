@@ -33,6 +33,7 @@ dev = [
 
 [project.scripts]
 trading-bot-api = "trading_bot.cli:run_api"
+trading-bot-market-data = "trading_bot.cli:run_market_data"
 trading-bot-purge = "trading_bot.cli:run_retention_purge"
 
 [build-system]

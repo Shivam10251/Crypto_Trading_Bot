@@ -13,6 +13,7 @@ from fastapi import APIRouter, Response, status
 
 from trading_bot import __version__
 from trading_bot.api.deps import SettingsDep
+from trading_bot.api.market_status import market_data_components
 from trading_bot.api.schemas import (
     ComponentHealth,
     ComponentStatus,
@@ -27,7 +28,6 @@ router = APIRouter(tags=["system"])
 # Subsystems not yet built. Kept here so exactly one place needs editing as
 # each phase lands, and so nothing reports a status it cannot substantiate.
 _PENDING_COMPONENTS: tuple[tuple[str, str], ...] = (
-    ("Market Data", "not implemented until Phase 3"),
     ("Strategy Engine", "not implemented until Phase 5"),
     ("Risk Engine", "not implemented until Phase 9"),
     ("Paper Execution", "not implemented until Phase 8"),
@@ -88,15 +88,12 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
     api_component = ComponentHealth(
         name="API", status=ComponentStatus.HEALTHY, detail="serving requests"
     )
-    exchange_component = ComponentHealth(
-        name="Exchange",
-        status=ComponentStatus.OFFLINE,
-        detail="no connection attempted until Phase 2/3",
-    )
+    exchange_component, market_data_component = await market_data_components(settings, _now())
     components = [
         api_component,
         await _database_health(),
         exchange_component,
+        market_data_component,
         *_pending_components(),
     ]
     return SystemStatusResponse(

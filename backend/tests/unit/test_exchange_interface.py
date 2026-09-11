@@ -7,7 +7,6 @@ something that is not Binance, and that the capability guards behave.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -26,6 +25,42 @@ from trading_bot.exchange.models import (
     ServerTime,
     TradePrint,
 )
+from trading_bot.exchange.streaming import (
+    MarketStreamSource,
+    StreamEndpoint,
+    StreamEvent,
+    StreamKind,
+)
+
+
+class FakeStreamSource(MarketStreamSource):
+    """Streaming for the fake venue: one URL and a one-line message format."""
+
+    venue = "fake_exchange"
+
+    def endpoints(self, subscription: MarketDataSubscription) -> list[StreamEndpoint]:
+        return [
+            StreamEndpoint(
+                name="fake-0",
+                url="wss://fake.test/stream",
+                market_type=MarketType.SPOT,
+                streams=tuple((ref, StreamKind.QUOTE) for ref in subscription.refs),
+            )
+        ]
+
+    def parse(
+        self, endpoint: StreamEndpoint, raw: str | bytes, received_at: datetime
+    ) -> StreamEvent | None:
+        text = raw.decode() if isinstance(raw, bytes) else raw
+        symbol, bid, ask = text.split()
+        return Quote(
+            ref=MarketRef(self.venue, symbol, endpoint.market_type),
+            bid=Decimal(bid),
+            ask=Decimal(ask),
+            bid_size=Decimal(1),
+            ask_size=Decimal(1),
+            local_timestamp=received_at,
+        )
 
 
 class FakeExchangeAdapter(ExchangeAdapter):
@@ -78,11 +113,8 @@ class FakeExchangeAdapter(ExchangeAdapter):
         now = datetime.now(UTC)
         return ServerTime(exchange_time=now, local_time=now, round_trip_ms=1)
 
-    async def subscribe_market_data(
-        self, subscription: MarketDataSubscription
-    ) -> AsyncIterator[Quote]:
-        for ref in subscription.refs:
-            yield await self.get_ticker(ref)
+    def stream_source(self) -> MarketStreamSource:
+        return FakeStreamSource()
 
 
 class TestReplaceability:
@@ -102,16 +134,16 @@ class TestReplaceability:
 
         assert await best_mid(FakeExchangeAdapter("100", "102"), "XYZUSD") == Decimal("101")
 
-    async def test_streaming_can_be_implemented_by_an_adapter(self) -> None:
+    def test_streaming_can_be_implemented_by_an_adapter(self) -> None:
+        """A venue supplies routing and parsing; nothing Binance-shaped is required."""
         adapter = FakeExchangeAdapter()
         ref = adapter.market_ref("XYZUSD", MarketType.SPOT)
-        received = [
-            quote
-            async for quote in adapter.subscribe_market_data(
-                MarketDataSubscription.top_of_book(ref)
-            )
-        ]
-        assert len(received) == 1
+        source = adapter.stream_source()
+        [endpoint] = source.endpoints(MarketDataSubscription.top_of_book(ref))
+        event = source.parse(endpoint, "XYZUSD 500 501", datetime.now(UTC))
+        assert isinstance(event, Quote)
+        assert event.ref == ref
+        assert event.mid_price == Decimal("500.5")
 
 
 class TestCapabilityGuards:
@@ -143,6 +175,6 @@ class TestAbstractEnforcement:
                 "get_order_book",
                 "get_recent_trades",
                 "get_server_time",
-                "subscribe_market_data",
+                "stream_source",
             }
         )

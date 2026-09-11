@@ -141,9 +141,10 @@ class DatabaseConfig(ConfigSection):
 class ExchangeConfig(ConfigSection):
     venue: str = "binance"
     spot_rest_url: str = "https://api.binance.com"
-    spot_ws_url: str = "wss://stream.binance.com:9443/ws"
+    # WebSocket hosts only; the adapter chooses the path per stream kind.
+    spot_ws_url: str = "wss://stream.binance.com:9443"
     futures_rest_url: str = "https://fapi.binance.com"
-    futures_ws_url: str = "wss://fstream.binance.com/ws"
+    futures_ws_url: str = "wss://fstream.binance.com"
     request_timeout_seconds: int = Field(default=10, ge=1)
     max_reconnect_backoff_seconds: int = Field(default=30, ge=1)
     api_key: SecretStr = SecretStr("")
@@ -162,6 +163,44 @@ class MarketsConfig(ConfigSection):
     def _normalize(self) -> MarketsConfig:
         object.__setattr__(self, "spot_symbols", [s.upper() for s in self.spot_symbols])
         object.__setattr__(self, "perpetual_symbols", [s.upper() for s in self.perpetual_symbols])
+        return self
+
+
+class MarketDataConfig(ConfigSection):
+    """Live market-data engine and service (Phase 3)."""
+
+    include_depth: bool = True
+    include_ticker: bool = True
+    # Levels published per side, and the depth of the REST snapshot that seeds
+    # each local book. The book is only trusted inside the price range the
+    # snapshot covered - 100 spot BTC levels span roughly 12 USD - so the
+    # snapshot must be far deeper than what is published.
+    depth_levels: int = Field(default=20, ge=1, le=100)
+    snapshot_depth: int = Field(default=1000, ge=5, le=1000)
+    # No update of any kind for this long marks a market STALE.
+    stale_after_ms: int = Field(default=2000, gt=0)
+    stale_check_interval_ms: int = Field(default=250, gt=0)
+    # An open connection that delivers nothing for this long is treated as dead.
+    idle_timeout_seconds: float = Field(default=10.0, gt=0)
+    ping_interval_seconds: float = Field(default=20.0, gt=0)
+    ping_timeout_seconds: float = Field(default=20.0, gt=0)
+    reconnect_initial_backoff_seconds: float = Field(default=0.5, gt=0)
+    # Floor between order-book rebuilds per market; each one costs REST weight.
+    resync_min_interval_seconds: float = Field(default=1.0, ge=0)
+    max_buffered_updates: int = Field(default=1000, ge=10)
+    # Sampled persistence into market_data: one row per market per interval,
+    # written only when the quote actually changed.
+    persist: bool = True
+    persist_interval_ms: int = Field(default=1000, ge=100)
+    # The API calls a market live when its newest stored quote is this recent.
+    status_fresh_within_ms: int = Field(default=5000, gt=0)
+    display: bool = True
+    display_interval_ms: int = Field(default=1000, ge=100)
+
+    @model_validator(mode="after")
+    def _check_depth(self) -> MarketDataConfig:
+        if self.snapshot_depth < self.depth_levels:
+            raise ValueError("snapshot_depth must be at least depth_levels")
         return self
 
 
@@ -234,6 +273,7 @@ class Settings(BaseSettings):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
     markets: MarketsConfig = Field(default_factory=MarketsConfig)
+    market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)

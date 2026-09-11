@@ -11,9 +11,9 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phase 2 complete** — foundation, data model, and the exchange
-abstraction with Binance market data (spot + USDⓈ-M perpetuals). No live
-streaming, no strategy, no trading yet. See
+Current state: **Phase 3 complete** — foundation, data model, the exchange
+abstraction, and a real-time market-data engine streaming Binance spot and
+USDⓈ-M perpetuals (`make market-data`). No strategy, no trading yet. See
 [docs/development-phases.md](docs/development-phases.md).
 
 ---
@@ -48,13 +48,17 @@ uv run trading-bot-api
 cd frontend
 pnpm install
 pnpm dev
+
+# 5. Live Binance market data - in a third terminal, from the repo root
+make market-data
 ```
 
 Then open <http://localhost:5173>. The shell reports live backend status;
 subsystems that later phases build are shown as `OFFLINE`, never faked.
+Exchange and Market Data turn `HEALTHY` while `make market-data` is running.
 
 A `Makefile` wraps these commands: `make up`, `make migrate`, `make api`,
-`make web`, `make test`, `make check`.
+`make web`, `make market-data`, `make test`, `make check`.
 
 > The database password in `.env` must match the one PostgreSQL was first
 > initialised with. If you change it later, reset the volume:
@@ -73,7 +77,7 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 309 tests
+cd backend  && uv run pytest                # 425 tests (7 live, opt-in)
 cd frontend && pnpm test                    # 9 tests
 make check                                  # lint + types + tests
 ```
@@ -82,7 +86,7 @@ Database tests need PostgreSQL running (`docker compose up -d`). Without it
 they skip with a reason rather than failing, so the suite stays usable.
 
 Tests never touch the network: Binance behaviour is tested against recorded
-live payloads in `tests/fixtures/binance/`. To additionally verify against the
+live REST and WebSocket payloads in `tests/fixtures/binance/`. To additionally verify against the
 real API (public endpoints, no credentials):
 
 ```bash
@@ -98,7 +102,8 @@ backend/                  FastAPI service, strategy engine, data pipeline
     core/                 configuration and logging
     db/                   engine, sessions, ORM models, retention
     exchange/             venue boundary: adapter interface, normalized models
-      binance/            binance.com spot + USDⓈ-M market data
+      binance/            binance.com spot + USDⓈ-M market data and streams
+    marketdata/           real-time engine: connections, order books, staleness
   alembic/                database migrations
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)

@@ -8,7 +8,7 @@ stops for review before the next begins.
 | 0 | Architecture and project foundation | **Complete** |
 | 1 | Database and data model | **Complete** |
 | 2 | Exchange abstraction (market data only) | **Complete** |
-| 3 | Real-time market data engine | Not started |
+| 3 | Real-time market data engine | **Complete** |
 | 4 | Market monitoring | Not started |
 | 5 | Strategy framework + spot/perp basis strategy | Not started |
 | 6 | Transaction cost model | Not started |
@@ -147,10 +147,85 @@ A 4 bps basis against 15 bps of round-trip taker fees is **not** an
 opportunity. This is the concrete case for building the cost model before
 trusting any signal, and for storing rejected opportunities as research data.
 
-## Phase 3 — next
+## Phase 3 — delivered
 
-Build the real-time market-data engine: WebSocket connection management,
-reconnection with backoff, heartbeats, stale-data detection, message
-validation, order-book synchronisation and sequence-gap detection. Starts with
-BTC/USDT, then expands to configurable markets. See
-[architecture.md](architecture.md).
+Run it with `make market-data` (or `uv run trading-bot-market-data`): a live
+terminal view of every configured market, redrawn every second.
+
+- **Streaming boundary** (`exchange/streaming.py`): a venue contributes only its
+  stream URLs and a message parser (`MarketStreamSource`). Connections,
+  reconnection, staleness and book sync are venue-independent, so strategies
+  never touch a WebSocket - one test drives the engine with a made-up venue
+- **Binance streams** (`exchange/binance/streams.py`): combined streams for
+  `bookTicker`, `depth@100ms` and the 24h `ticker`, split across connections at
+  the per-connection stream limit (200) and validated field by field
+- **Connection** (`marketdata/connection.py`): capped exponential backoff with
+  jitter, protocol ping/pong heartbeat, and an idle timeout - an open socket
+  that goes silent is treated as dead
+- **Local order books** (`marketdata/order_book.py`): REST snapshot plus
+  buffered diffs under Binance's sequencing rules for both venues, gap
+  detection, and a rebuild whenever continuity breaks, the book crosses or a
+  connection drops. Depth is published only inside the price range the snapshot
+  actually covered
+- **Engine** (`marketdata/engine.py`): a `MarketSnapshot` per market - best
+  bid/ask, sizes, mid, spread, 24h volume, exchange and local timestamps,
+  latency, age, book status - and a watchdog that marks markets `STALE` after
+  2 s without data. Consumers read `snapshot()` or a conflating `updates()`
+  stream, so a slow consumer gets the latest state, never a backlog
+- **Persistence** (`marketdata/recorder.py`): quotes sampled once a second into
+  `market_data`, written only when they changed; connects, disconnects, gaps,
+  staleness, startup and shutdown go to `system_events`
+- **Dashboard**: Exchange and Market Data now report real status, judged from
+  the newest stored quote - `HEALTHY`, `DEGRADED` naming the quiet market, or
+  `OFFLINE` with the command that starts the service
+- **Tests**: 425 backend (from 309), 7 of them opt-in live. Parsing and book
+  synchronisation are tested against recorded live WebSocket sequences; the
+  live suite runs the whole engine against Binance until both books sync
+
+### What checking reality changed
+
+The WebSocket feeds were probed before any parsing code was written:
+
+1. **USDⓈ-M futures split their streams across routes.** `bookTicker` and depth
+   are served under `/public`, the 24h ticker under `/market`. On the legacy
+   route a `@ticker` subscription is accepted and then nothing is ever sent -
+   no error, no close. Routing is explicit, and idle connections time out, so a
+   silent feed cannot pass for a quiet market.
+2. **Spot `bookTicker` has no event time on the stream either.** Spot quotes
+   keep a null exchange timestamp; spot latency is measured from depth and
+   ticker events, which carry one.
+3. **Futures update ids are not contiguous.** Spot diffs chain on
+   `U == previous u + 1`, futures on `pu == previous u`. One rule for both would
+   either miss every futures gap or report false ones constantly. Both recorded
+   sequences are test fixtures.
+4. **A 100-level spot snapshot spans about 12 USD of BTC.** Updates outside a
+   snapshot's range describe a book we never saw, so snapshots are 1000 levels
+   deep, updates outside the range are ignored, and the book is rebuilt once the
+   market moves past it.
+
+### First live observation
+
+The service on 2026-09-11, BTCUSDT:
+
+```
+BTCUSDT spot       LIVE  77246.22 / 77246.23  spread 0.001 bps  latency 41 ms  SYNCED 20
+BTCUSDT perpetual  LIVE  77208.8  / 77208.9   spread 0.013 bps  latency 57 ms  SYNCED 20
+3/3 connections, 0 invalid messages, 0 sequence gaps, clock skew +17 ms
+```
+
+Spot latency comes from depth events and the perpetual's from its own quotes;
+both include the measured clock skew.
+
+### Limits
+
+- Staleness is per market, from the last message of any kind. A very quiet
+  market on a healthy connection reads `STALE` - deliberately, since "no recent
+  confirmation" is not safe to trade on.
+- The API judges the service by its stored quotes, so it lags reality by up to
+  the persistence interval (1 s) and needs the database.
+- Trade prints are not streamed yet; 24h volume comes from the ticker.
+
+## Phase 4 — next
+
+Market monitoring, built on the engine's `MarketSnapshot` stream rather than on
+raw WebSocket data. See [architecture.md](architecture.md).

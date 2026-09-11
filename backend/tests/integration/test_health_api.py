@@ -61,14 +61,16 @@ class TestSystemStatus:
         statuses = {c["name"]: c for c in body["components"]}
         assert statuses["API"]["status"] == "HEALTHY"
         assert statuses["Database"]["status"] == "HEALTHY"
-        for pending in ("Market Data", "Strategy Engine", "Risk Engine", "Paper Execution"):
+        for pending in ("Strategy Engine", "Risk Engine", "Paper Execution"):
             assert statuses[pending]["status"] == "OFFLINE"
             assert "Phase" in statuses[pending]["detail"]
 
-    async def test_exchange_is_offline_before_phase_2(self, client: AsyncClient) -> None:
+    async def test_market_data_is_offline_without_live_quotes(self, client: AsyncClient) -> None:
+        """Nothing streams in this test, so nothing may claim to."""
         body = (await client.get(f"{API_PREFIX}/system-status")).json()
-        exchange = next(c for c in body["components"] if c["name"] == "Exchange")
-        assert exchange["status"] == "OFFLINE"
+        statuses = {c["name"]: c for c in body["components"]}
+        for name in ("Exchange", "Market Data"):
+            assert statuses[name]["status"] == "OFFLINE"
 
 
 class TestAppWiring:

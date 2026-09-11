@@ -62,7 +62,9 @@ can never reach an execution adapter without a risk decision.
 | `trading_bot.core.logging` | Structured logs, credential redaction | config |
 | `trading_bot.db` | Engine, sessions, ORM models, retention | config, logging |
 | `trading_bot.exchange` | Venue boundary: adapter interface + normalized models | config, logging |
-| `trading_bot.exchange.binance` | binance.com spot + USDⓈ-M market data | exchange, config |
+| `trading_bot.exchange.streaming` | Streaming boundary: stream endpoints + parser contract | exchange |
+| `trading_bot.exchange.binance` | binance.com spot + USDⓈ-M market data and streams | exchange, config |
+| `trading_bot.marketdata` | Live engine: connections, local books, staleness, snapshots, recorder | exchange, config, db |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -89,21 +91,23 @@ Settings resolve from `config/base.yaml`, then `config/<profile>.yaml`, then
 `TB_*` environment variables. The resolved object is frozen: risk limits and
 execution flags cannot change under a running process.
 
-Phase 0 runs one process (the API). Later phases add a market-data service and
-a strategy runner as separate processes sharing the same configuration and
-database.
+Two processes run today, sharing configuration and the database: the API and
+the market-data service (`make market-data`). The API cannot ask the service
+how it is doing, so it judges it by its output - a monitored market is live
+when its newest stored quote is recent - rather than by assumption. A strategy
+runner joins them in a later phase.
 
 ## Status
 
 Built: configuration, logging, database layer with the full 13-table data
 model and migrations, retention, the exchange abstraction with a Binance
-market-data adapter (spot + USDⓈ-M), API skeleton, health and system-status
-endpoints, frontend shell, test tooling.
+market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
+service, API skeleton, health and system-status endpoints, frontend shell,
+test tooling.
 
-Not built: everything from Phase 3 onward - live streaming, market monitoring,
-strategy, cost model, execution, risk engine, portfolio, dashboard. The
-system-status endpoint reports those subsystems as `OFFLINE` with the phase that
-will implement them.
+Not built: everything from Phase 4 onward - market monitoring, strategy, cost
+model, execution, risk engine, portfolio, dashboard. The system-status endpoint
+reports those subsystems as `OFFLINE` with the phase that will implement them.
 
 ### The exchange boundary
 
@@ -115,3 +119,27 @@ invented answer. Payload validation happens once, in the venue's mapping layer:
 past that point the data is trusted, and anything malformed - crossed book,
 zero price, missing field - raises `ExchangeDataError` instead of reaching a
 strategy.
+
+### The streaming boundary
+
+Live data splits the same way. A venue implements `MarketStreamSource`: which
+WebSocket URLs carry which markets, and how to parse one message into a
+normalized `Quote`, `DepthDiff` or `TickerStats`. Everything else lives once, in
+`trading_bot.marketdata`, for every venue:
+
+```
+StreamConnection (reconnect, heartbeat, idle timeout)
+        │ raw message + local receipt time
+        ▼
+MarketStreamSource.parse  (venue-specific, validating)
+        │ Quote / DepthDiff / TickerStats
+        ▼
+MarketDataEngine  ── LocalOrderBook per market (snapshot + diffs, gap → rebuild)
+        │           watchdog (STALE after stale_after_ms)
+        ▼
+MarketSnapshot  ──▶ snapshot() / updates()   (strategies, monitor, risk)
+                ──▶ MarketDataRecorder       (market_data, system_events)
+```
+
+A market's book is either `SYNCED` or not published at all; there is no state
+in which a consumer receives depth the engine cannot vouch for.

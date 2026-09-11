@@ -210,12 +210,12 @@ class TestExecutionIsDisabled:
         with pytest.raises(ExecutionNotEnabledError, match="authenticated"):
             await adapter.get_balances()
 
-    async def test_streaming_is_deferred_to_phase_3(self) -> None:
-        """A half-built stream would be worse than an explicit refusal."""
+    def test_adapter_supplies_stream_routing(self) -> None:
+        """The adapter's half of streaming; the engine owns the connections."""
         adapter = make_adapter()
         ref = adapter.market_ref("BTCUSDT", MarketType.SPOT)
-        with pytest.raises(NotSupportedError, match="Phase 3"):
-            adapter.subscribe_market_data(MarketDataSubscription.top_of_book(ref))
+        [endpoint] = adapter.stream_source().endpoints(MarketDataSubscription.top_of_book(ref))
+        assert endpoint.url == "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker"
 
 
 class TestLifecycle:

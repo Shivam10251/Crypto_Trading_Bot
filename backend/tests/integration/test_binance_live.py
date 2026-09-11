@@ -11,14 +11,17 @@ shape, or an endpoint becoming unreachable from this network.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from decimal import Decimal
 
 import pytest
 
-from trading_bot.core.config import ExchangeConfig
+from trading_bot.core.config import ExchangeConfig, MarketDataConfig
 from trading_bot.db.models.enums import MarketType, Side
 from trading_bot.exchange.binance import BinanceExchangeAdapter
+from trading_bot.exchange.models import MarketDataSubscription
+from trading_bot.marketdata import BookStatus, MarketDataEngine
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TB_TEST_LIVE") != "1",
@@ -76,3 +79,51 @@ class TestLiveMarketData:
         pairs = {(spec.symbol, spec.ref.market_type) for spec in specs}
         assert ("BTCUSDT", MarketType.SPOT) in pairs
         assert ("BTCUSDT", MarketType.PERPETUAL) in pairs
+
+
+class TestLiveStreaming:
+    """The Phase 3 engine against the real WebSocket streams."""
+
+    async def test_both_legs_stream_with_synchronised_books(
+        self, adapter: BinanceExchangeAdapter
+    ) -> None:
+        refs = (
+            adapter.market_ref("BTCUSDT", MarketType.SPOT),
+            adapter.market_ref("BTCUSDT", MarketType.PERPETUAL),
+        )
+        subscription = MarketDataSubscription(
+            refs=refs, include_depth=True, depth_levels=20, include_ticker=True
+        )
+        engine = MarketDataEngine(
+            adapter.stream_source(),
+            subscription,
+            MarketDataConfig(),
+            snapshot_fetcher=adapter.get_order_book,
+        )
+
+        def ready() -> bool:
+            return all(
+                (snap := engine.snapshot(ref)).is_live
+                and snap.book_status is BookStatus.SYNCED
+                and snap.volume_24h is not None
+                for ref in refs
+            )
+
+        async with engine:
+            async with asyncio.timeout(30):
+                while True:
+                    if ready():
+                        break
+                    await asyncio.sleep(0.1)
+            spot, perp = (engine.snapshot(ref) for ref in refs)
+
+        # The documented asymmetry still holds on the stream...
+        assert spot.exchange_timestamp is None
+        assert perp.exchange_timestamp is not None
+        # ...and spot latency is still measured, from depth and ticker events.
+        assert spot.latency_ms is not None
+        for snap in (spot, perp):
+            assert snap.book is not None
+            assert len(snap.book.bids) == 20
+            assert snap.book.best_bid < snap.book.best_ask
+            assert snap.gaps == 0

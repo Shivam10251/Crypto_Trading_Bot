@@ -11,7 +11,6 @@ immediately and loudly rather than silently doing nothing.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
@@ -29,6 +28,7 @@ from trading_bot.exchange.binance.mapping import (
     parse_trade,
 )
 from trading_bot.exchange.binance.rest import BinanceRestClient
+from trading_bot.exchange.binance.streams import BinanceStreamSource
 from trading_bot.exchange.errors import (
     ExchangeDataError,
     NotSupportedError,
@@ -36,7 +36,6 @@ from trading_bot.exchange.errors import (
 )
 from trading_bot.exchange.models import (
     FundingInfo,
-    MarketDataSubscription,
     MarketRef,
     MarketSpec,
     OrderBook,
@@ -179,16 +178,18 @@ class BinanceExchangeAdapter(ExchangeAdapter):
         )
         return parse_funding(payload, ref, local_timestamp=datetime.now(UTC))
 
-    def subscribe_market_data(self, subscription: MarketDataSubscription) -> AsyncIterator[Quote]:
-        """Not implemented in Phase 2.
+    def stream_source(self) -> BinanceStreamSource:
+        """Stream routing and parsing for the market-data engine.
 
-        The streaming engine - connection management, reconnection, heartbeats,
-        staleness detection and order-book synchronisation - is Phase 3. Raising
-        here is better than a half-built stream that silently stops delivering.
+        WebSocket hosts come from configuration so a testnet or regional mirror
+        can be used without code changes; paths are chosen per stream kind.
         """
-        raise NotSupportedError(
-            "live market-data streaming is implemented in Phase 3; "
-            "use get_ticker/get_order_book for snapshots"
+        if self._config is None:
+            return BinanceStreamSource(venue=self.venue)
+        return BinanceStreamSource(
+            venue=self.venue,
+            spot_ws_base=self._config.spot_ws_url,
+            futures_ws_base=self._config.futures_ws_url,
         )
 
     # --- internals --------------------------------------------------------

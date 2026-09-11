@@ -17,7 +17,7 @@ only, and the order path is built in Phase 17 behind an explicit opt-in.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from decimal import Decimal
 from types import TracebackType
 from typing import Self
@@ -27,7 +27,6 @@ from trading_bot.exchange.errors import ExecutionNotEnabledError, NotSupportedEr
 from trading_bot.exchange.models import (
     Balance,
     FundingInfo,
-    MarketDataSubscription,
     MarketRef,
     MarketSpec,
     OrderBook,
@@ -35,6 +34,7 @@ from trading_bot.exchange.models import (
     ServerTime,
     TradePrint,
 )
+from trading_bot.exchange.streaming import MarketStreamSource
 
 DEFAULT_DEPTH_LEVELS = 10
 DEFAULT_TRADE_LIMIT = 50
@@ -71,11 +71,13 @@ class ExchangeAdapter(ABC):
         """Venue clock, for measuring skew against ours."""
 
     @abstractmethod
-    def subscribe_market_data(self, subscription: MarketDataSubscription) -> AsyncIterator[Quote]:
-        """Stream live market data.
+    def stream_source(self) -> MarketStreamSource:
+        """The venue's half of live streaming: stream URLs and message parsing.
 
-        Returns an async iterator rather than taking a callback so consumers
-        control backpressure. The streaming engine is built in Phase 3.
+        Connection management, reconnection, staleness and order-book
+        synchronisation are venue-independent and live in
+        ``trading_bot.marketdata``. Strategies consume that engine's normalized
+        snapshots, never a WebSocket.
         """
 
     # --- optional capabilities -------------------------------------------

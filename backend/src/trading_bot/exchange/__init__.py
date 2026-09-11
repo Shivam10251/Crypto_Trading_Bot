@@ -19,6 +19,7 @@ from trading_bot.exchange.errors import (
 from trading_bot.exchange.models import (
     Balance,
     BookLevel,
+    DepthDiff,
     FundingInfo,
     MarketDataSubscription,
     MarketRef,
@@ -26,18 +27,31 @@ from trading_bot.exchange.models import (
     OrderBook,
     Quote,
     ServerTime,
+    TickerStats,
     TradePrint,
+)
+from trading_bot.exchange.streaming import (
+    MarketStreamSource,
+    StreamEndpoint,
+    StreamEvent,
+    StreamKind,
 )
 
 __all__ = [  # noqa: RUF022 - grouped by kind, which reads better here
     # boundary
     "ExchangeAdapter",
+    "MarketStreamSource",
+    "StreamEndpoint",
+    "StreamEvent",
+    "StreamKind",
     # models
     "MarketRef",
     "MarketSpec",
     "Quote",
     "OrderBook",
     "BookLevel",
+    "DepthDiff",
+    "TickerStats",
     "TradePrint",
     "FundingInfo",
     "Balance",

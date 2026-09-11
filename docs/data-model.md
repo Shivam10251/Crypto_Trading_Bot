@@ -1,8 +1,9 @@
 # Data Model
 
-Status: **implemented.** 13 tables, two migrations, 309 backend tests.
-Phase 1 built the schema; Phase 2 corrected the exchange-timestamp
-assumption after checking the live Binance API.
+Status: **implemented.** 13 tables, two migrations. Phase 1 built the schema;
+Phase 2 corrected the exchange-timestamp assumption after checking the live
+Binance API; Phase 3's market-data service is the first writer of `markets`,
+`market_data` and `system_events`.
 
 ## Traceability requirement
 
