@@ -1,0 +1,83 @@
+# Base configuration shared by every profile.
+# Profile files (development.yaml / paper.yaml / production.yaml) override these.
+# Environment variables (TB_*) override both. Secrets belong ONLY in .env.
+
+app:
+  name: "Arbitrage Terminal"
+  # Bound at runtime from the TB_PROFILE env var; kept here for documentation.
+  profile: "development"
+
+api:
+  host: "127.0.0.1"
+  port: 8000
+  cors_origins:
+    - "http://localhost:5173"
+  docs_enabled: true
+
+logging:
+  level: "INFO"
+  # "console" = human-readable dev output, "json" = machine-parseable
+  format: "console"
+  # Events that must never be dropped, regardless of level.
+  audit_events:
+    - "risk.decision"
+    - "order.submitted"
+    - "order.filled"
+    - "kill_switch.engaged"
+
+database:
+  host: "127.0.0.1"
+  port: 5432
+  name: "trading_bot"
+  user: "trading_bot"
+  # password comes from TB_DATABASE__PASSWORD in .env - never stored here
+  pool_size: 10
+  max_overflow: 5
+  pool_timeout_seconds: 30
+  echo_sql: false
+
+exchange:
+  # binance.com global endpoints (user is trading from India)
+  venue: "binance"
+  spot_rest_url: "https://api.binance.com"
+  spot_ws_url: "wss://stream.binance.com:9443/ws"
+  futures_rest_url: "https://fapi.binance.com"
+  futures_ws_url: "wss://fstream.binance.com/ws"
+  # Phase 3+ uses this; Phase 0 only records it.
+  request_timeout_seconds: 10
+  max_reconnect_backoff_seconds: 30
+
+markets:
+  # Phase 3 starts with one market, then expands. Never hard-code 50 symbols.
+  spot_symbols:
+    - "BTCUSDT"
+  perpetual_symbols:
+    - "BTCUSDT"
+
+strategy:
+  # First strategy (Phase 5): spot vs perpetual futures basis / relative value.
+  enabled:
+    - "spot_perp_basis"
+
+costs:
+  # Binance spot taker fee and USDⓈ-M perp taker fee, in basis points.
+  spot_taker_fee_bps: 10.0
+  perp_taker_fee_bps: 5.0
+  # Extra margin subtracted from every edge so gross spread is never traded on.
+  safety_buffer_bps: 2.0
+
+risk:
+  max_order_notional_usd: 1000.0
+  max_position_notional_usd: 5000.0
+  max_total_exposure_usd: 10000.0
+  max_daily_loss_usd: 200.0
+  max_consecutive_losses: 5
+  max_slippage_bps: 15.0
+  max_latency_ms: 500
+  max_stale_data_ms: 2000
+
+execution:
+  # "paper" or "live". Live requires the explicit opt-in below AND a production profile.
+  mode: "paper"
+  live_enabled: false
+  live_confirmation_phrase: ""

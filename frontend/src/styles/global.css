@@ -1,0 +1,197 @@
+/* Dark terminal foundation. Phase 12 builds the full visual design on top of
+   these tokens; nothing here is final. */
+:root {
+  --bg: #07070b;
+  --panel: rgba(20, 20, 30, 0.72);
+  --border: rgba(140, 120, 200, 0.18);
+  --text: #e8e6f0;
+  --muted: #8a8699;
+  --accent: #b45cff;
+  --positive: #27d98a;
+  --negative: #ff4d6a;
+  --warn: #ffb84d;
+
+  color-scheme: dark;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(1100px 600px at 18% -10%, rgba(138, 60, 226, 0.16), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.app {
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(12, 12, 18, 0.9);
+}
+
+.topbar__brand {
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+}
+
+.topbar__tag {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+
+.topbar__spacer {
+  flex: 1;
+}
+
+.topbar__action {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+
+.topbar__action:hover {
+  border-color: var(--accent);
+}
+
+.content {
+  flex: 1;
+  padding: 20px;
+}
+
+.panel {
+  max-width: 620px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+}
+
+.panel__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.panel__header h2 {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.panel__meta,
+.components__detail {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.kv {
+  margin: 0 0 16px;
+  display: grid;
+  gap: 6px;
+}
+
+.kv__row {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px dashed rgba(140, 120, 200, 0.12);
+  padding-bottom: 4px;
+}
+
+.kv__row dt {
+  color: var(--muted);
+}
+
+.kv__row dd {
+  margin: 0;
+}
+
+.components {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.components__item {
+  display: grid;
+  grid-template-columns: 12px 140px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot--healthy {
+  background: var(--positive);
+  box-shadow: 0 0 8px var(--positive);
+}
+
+.status-dot--degraded {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+}
+
+.status-dot--offline {
+  background: #4a4658;
+}
+
+.notice {
+  color: var(--muted);
+}
+
+.notice--error {
+  max-width: 620px;
+  padding: 14px;
+  border: 1px solid rgba(255, 77, 106, 0.4);
+  border-radius: 8px;
+  background: rgba(255, 77, 106, 0.07);
+  color: var(--negative);
+}
+
+.notice__hint {
+  color: var(--muted);
+}
+
+code {
+  color: var(--text);
+}
+
+.footer {
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}

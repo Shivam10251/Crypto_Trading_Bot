@@ -1,0 +1,14 @@
+# Paper trading against real live market data. Realistic, but no real money.
+logging:
+  level: "INFO"
+  format: "json"
+
+api:
+  docs_enabled: true
+
+database:
+  name: "trading_bot_paper"
+
+execution:
+  mode: "paper"
+  live_enabled: false

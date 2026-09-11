@@ -1,0 +1,15 @@
+# Local development: verbose logs, API docs on, live trading structurally impossible.
+logging:
+  level: "DEBUG"
+  format: "console"
+
+api:
+  docs_enabled: true
+
+database:
+  name: "trading_bot_dev"
+  echo_sql: false
+
+execution:
+  mode: "paper"
+  live_enabled: false

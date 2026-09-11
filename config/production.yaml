@@ -1,0 +1,16 @@
+# Production profile. Live execution is still OFF unless explicitly enabled
+# via TB_EXECUTION__LIVE_ENABLED and a matching confirmation phrase (Phase 17).
+logging:
+  level: "INFO"
+  format: "json"
+
+api:
+  docs_enabled: false
+
+database:
+  name: "trading_bot"
+  pool_size: 20
+
+execution:
+  mode: "paper"
+  live_enabled: false

@@ -1,0 +1,27 @@
+# Local infrastructure for development and paper trading.
+# The application itself runs on the host (uv / pnpm) for fast iteration.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading_bot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TB_DATABASE__USER:-trading_bot}
+      POSTGRES_PASSWORD: ${TB_DATABASE__PASSWORD:-change_me_locally}
+      POSTGRES_DB: ${TB_DATABASE__NAME:-trading_bot_dev}
+    ports:
+      - "${TB_DATABASE__PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${TB_DATABASE__USER:-trading_bot} -d ${TB_DATABASE__NAME:-trading_bot_dev}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
