@@ -20,10 +20,12 @@ past the range the book asks to be rebuilt rather than publishing holes.
 from __future__ import annotations
 
 import heapq
+from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
 
-from trading_bot.exchange.models import BookLevel, DepthDiff, MarketRef, OrderBook
+from trading_bot.exchange.models import BPS_SCALE, BookLevel, DepthDiff, MarketRef, OrderBook
+from trading_bot.marketdata.models import BookLiquidity
 
 
 class BookSyncError(Exception):
@@ -169,3 +171,69 @@ class LocalOrderBook:
             exchange_timestamp=self.exchange_timestamp,
             sequence=self._last_update_id,
         )
+
+    def liquidity(self, band_bps: Decimal, reference_notional: Decimal) -> BookLiquidity:
+        """Resting value near the mid, and what a reference-size order would pay.
+
+        Measured over every known level, not only the published top, so a
+        deep band on a liquid market is measured rather than truncated.
+        ``*_complete`` says whether the band stayed inside the price range the
+        snapshot covered; beyond it the book is unknown, so the figure is a
+        lower bound.
+        """
+        if self._last_update_id is None or not self._bids or not self._asks:
+            raise BookSyncError(f"{self.ref}: no snapshot loaded")
+        best_bid, best_ask = max(self._bids), min(self._asks)
+        if best_bid >= best_ask:
+            raise BookSyncError(
+                f"{self.ref}: local book crossed (bid {best_bid} >= ask {best_ask})"
+            )
+        mid = (best_bid + best_ask) / 2
+        reach = mid * band_bps / BPS_SCALE
+        low, high = mid - reach, mid + reach
+        return BookLiquidity(
+            band_bps=band_bps,
+            bid_notional=sum((p * s for p, s in self._bids.items() if p >= low), Decimal(0)),
+            ask_notional=sum((p * s for p, s in self._asks.items() if p <= high), Decimal(0)),
+            bid_complete=self._bid_floor <= low,
+            ask_complete=self._ask_ceiling >= high,
+            reference_notional=reference_notional,
+            buy_slippage_bps=_slippage_bps(
+                _best_first(self._asks, ascending=True), mid, reference_notional, buy=True
+            ),
+            sell_slippage_bps=_slippage_bps(
+                _best_first(self._bids, ascending=False), mid, reference_notional, buy=False
+            ),
+        )
+
+
+def _best_first(
+    side: dict[Decimal, Decimal], *, ascending: bool
+) -> Iterator[tuple[Decimal, Decimal]]:
+    """Levels best price first, without sorting the side: most walks stop early."""
+    heap = [(price if ascending else -price, price, size) for price, size in side.items()]
+    heapq.heapify(heap)
+    while heap:
+        _, price, size = heapq.heappop(heap)
+        yield price, size
+
+
+def _slippage_bps(
+    levels: Iterator[tuple[Decimal, Decimal]], mid: Decimal, notional: Decimal, *, buy: bool
+) -> Decimal | None:
+    """Average fill distance from ``mid``, in bps, of spending ``notional``."""
+    remaining = notional
+    quantity = Decimal(0)
+    for price, size in levels:
+        value = price * size
+        if value >= remaining:
+            quantity += remaining / price
+            remaining = Decimal(0)
+            break
+        quantity += size
+        remaining -= value
+    if remaining > 0:
+        return None
+    average = notional / quantity
+    distance = average - mid if buy else mid - average
+    return distance / mid * BPS_SCALE

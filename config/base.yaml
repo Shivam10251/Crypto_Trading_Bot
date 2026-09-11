@@ -49,7 +49,20 @@ exchange:
   max_reconnect_backoff_seconds: 30
 
 markets:
-  # Phase 3 starts with one market, then expands. Never hard-code 50 symbols.
+  # How markets are chosen. Never hard-code 50 symbols.
+  #   top_volume - USDT pairs listed on both spot and perpetual, ranked by the
+  #                weaker leg's 24h quote volume; the top `count` are monitored
+  #   explicit   - exactly the symbol lists below
+  # The symbol lists are monitored in either mode.
+  selection: "top_volume"
+  top_volume:
+    count: 50
+    quote_asset: "USDT"
+    # Both legs must trade at least this much quote volume per day.
+    min_quote_volume: 1000000
+    # Pegged assets have no basis worth trading.
+    exclude_base_assets: ["USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "PYUSD", "USD1", "EUR", "AEUR", "EURI"]
+    exclude_symbols: []
   spot_symbols:
     - "BTCUSDT"
   perpetual_symbols:
@@ -64,15 +77,34 @@ market_data:
   # and 100 spot BTC levels span roughly 12 USD - hence 1000.
   depth_levels: 20
   snapshot_depth: 1000
-  # No update of any kind for this long marks a market STALE.
+  # A connection silent for this long makes every market on it STALE.
   stale_after_ms: 2000
+  # A market with no message of its own for this long is STALE even on a busy
+  # connection. Binance only pushes changes, so a quiet market is unchanged,
+  # not stale - this catches a single stream dying. Measured live: mid-cap spot
+  # markets routinely go several seconds without a message.
+  market_silence_ms: 30000
   # An open connection that delivers nothing for this long is treated as dead.
   idle_timeout_seconds: 10
+  # Snapshots in flight at once; a 1000-level spot snapshot costs 50 of the
+  # 6000 request weight allowed per minute.
+  max_concurrent_snapshots: 4
+  # Liquidity = resting value within this band of the mid, from the full book.
+  liquidity_band_bps: 10
+  # Market-order size (quote currency) used to quote slippage.
+  reference_order_notional: 10000
   # Sampled quotes go to market_data once per interval, only when changed.
+  # ~290 bytes a row: 100 markets at 5 s is about 500 MB a day.
   persist: true
-  persist_interval_ms: 1000
+  persist_interval_ms: 5000
   # The API calls a market live when its newest stored quote is this recent.
-  status_fresh_within_ms: 5000
+  status_fresh_within_ms: 15000
+
+monitoring:
+  # Phase 4: every market sampled on this cadence...
+  sample_interval_ms: 1000
+  # ...with spread/imbalance means and latency percentiles over this window.
+  window_seconds: 60
 
 strategy:
   # First strategy (Phase 5): spot vs perpetual futures basis / relative value.

@@ -58,8 +58,10 @@ class SystemStatusResponse(BaseModel):
     execution_mode: str
     live_execution_armed: bool
     exchange: str
-    monitored_spot_markets: int
-    monitored_perpetual_markets: int
+    # The market-data service's latest selection; None when the database
+    # cannot say, rather than a number guessed from configuration.
+    monitored_spot_markets: int | None
+    monitored_perpetual_markets: int | None
     components: list[ComponentHealth]
     server_time: datetime
 

@@ -21,6 +21,7 @@ from trading_bot.db.models.enums import MarketType
 from trading_bot.exchange.base import DEFAULT_DEPTH_LEVELS, DEFAULT_TRADE_LIMIT, ExchangeAdapter
 from trading_bot.exchange.binance.endpoints import normalize_depth_limit, routes_for
 from trading_bot.exchange.binance.mapping import (
+    parse_daily_stats,
     parse_funding,
     parse_market_spec,
     parse_order_book,
@@ -41,6 +42,7 @@ from trading_bot.exchange.models import (
     OrderBook,
     Quote,
     ServerTime,
+    TickerStats,
     TradePrint,
 )
 
@@ -177,6 +179,40 @@ class BinanceExchangeAdapter(ExchangeAdapter):
             routes.url(routes.premium_index), ref, context="premiumIndex"
         )
         return parse_funding(payload, ref, local_timestamp=datetime.now(UTC))
+
+    async def get_daily_stats(self, market_type: MarketType) -> list[TickerStats]:
+        """Rolling 24h statistics for every symbol of one instrument class.
+
+        One request for the whole venue (weight 80 spot, 40 futures) instead of
+        one per symbol. Entries that cannot be normalized - halted pairs report
+        a zero last price - are skipped rather than failing the batch: they
+        cannot be monitored anyway.
+        """
+        routes = routes_for(market_type)
+        payload = await self._client.get(routes.url(routes.ticker_24hr))
+        if not isinstance(payload, list):
+            raise ExchangeDataError(f"ticker/24hr for {market_type.value} is not a list")
+        received_at = datetime.now(UTC)
+        stats: list[TickerStats] = []
+        skipped = 0
+        for entry in payload:
+            symbol = entry.get("symbol") if isinstance(entry, dict) else None
+            if not isinstance(symbol, str):
+                skipped += 1
+                continue
+            try:
+                ref = self.market_ref(symbol, market_type)
+                stats.append(parse_daily_stats(entry, ref, received_at))
+            except ExchangeDataError:
+                skipped += 1
+        logger.info(
+            "binance.daily_stats_loaded",
+            market_type=market_type.value,
+            count=len(stats),
+            skipped=skipped,
+            used_weight=self._client.used_weight,
+        )
+        return stats
 
     def stream_source(self) -> BinanceStreamSource:
         """Stream routing and parsing for the market-data engine.

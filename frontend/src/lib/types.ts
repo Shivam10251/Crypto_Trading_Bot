@@ -16,8 +16,9 @@ export interface SystemStatus {
   execution_mode: string;
   live_execution_armed: boolean;
   exchange: string;
-  monitored_spot_markets: number;
-  monitored_perpetual_markets: number;
+  // null when the backend cannot read which markets are monitored.
+  monitored_spot_markets: number | null;
+  monitored_perpetual_markets: number | null;
   components: ComponentHealth[];
   server_time: string;
 }

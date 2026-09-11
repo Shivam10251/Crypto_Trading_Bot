@@ -65,6 +65,7 @@ can never reach an execution adapter without a risk decision.
 | `trading_bot.exchange.streaming` | Streaming boundary: stream endpoints + parser contract | exchange |
 | `trading_bot.exchange.binance` | binance.com spot + USDⓈ-M market data and streams | exchange, config |
 | `trading_bot.marketdata` | Live engine: connections, local books, staleness, snapshots, recorder | exchange, config, db |
+| `trading_bot.monitoring` | Market selection, per-market statistics, terminal view | marketdata, exchange, config |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -93,8 +94,9 @@ execution flags cannot change under a running process.
 
 Two processes run today, sharing configuration and the database: the API and
 the market-data service (`make market-data`). The API cannot ask the service
-how it is doing, so it judges it by its output - a monitored market is live
-when its newest stored quote is recent - rather than by assumption. A strategy
+how it is doing, so it judges it by its output - which markets the service
+last selected (`markets.is_monitored`) and whether each one's newest stored
+quote is recent - rather than by assumption. A strategy
 runner joins them in a later phase.
 
 ## Status
@@ -102,11 +104,11 @@ runner joins them in a later phase.
 Built: configuration, logging, database layer with the full 13-table data
 model and migrations, retention, the exchange abstraction with a Binance
 market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
-service, API skeleton, health and system-status endpoints, frontend shell,
-test tooling.
+service, configurable market selection and per-market monitoring, API
+skeleton, health and system-status endpoints, frontend shell, test tooling.
 
-Not built: everything from Phase 4 onward - market monitoring, strategy, cost
-model, execution, risk engine, portfolio, dashboard. The system-status endpoint
+Not built: everything from Phase 5 onward - strategy, cost model, execution,
+risk engine, portfolio, dashboard. The system-status endpoint
 reports those subsystems as `OFFLINE` with the phase that will implement them.
 
 ### The exchange boundary
@@ -143,3 +145,17 @@ MarketSnapshot  ──▶ snapshot() / updates()   (strategies, monitor, risk)
 
 A market's book is either `SYNCED` or not published at all; there is no state
 in which a consumer receives depth the engine cannot vouch for.
+
+### Monitoring
+
+`trading_bot.monitoring` sits on the engine's read API. `select_universe`
+decides what the engine streams (configuration: top N pairs by weaker-leg 24h
+volume, or explicit lists); `MarketMonitor` samples every snapshot once a
+second into `MarketMetrics` with rolling means and latency percentiles.
+Sampling keeps the cost flat as markets are added: a hundred markets cost a
+hundred snapshot reads per interval however busy they are.
+
+Staleness has two scopes. A connection silent for `stale_after_ms` (2 s)
+makes every market on it stale; a single market is stale on its own only after
+`market_silence_ms` (30 s), because the venue pushes only changes and a quiet
+market is unchanged rather than stale.

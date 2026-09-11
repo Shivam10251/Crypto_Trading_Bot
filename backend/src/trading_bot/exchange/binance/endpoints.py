@@ -26,6 +26,8 @@ class VenueRoutes:
     depth: str
     trades: str
     server_time: str
+    # Rolling 24h statistics for every symbol, in one request.
+    ticker_24hr: str
     # Futures only; spot has no funding.
     premium_index: str | None = None
 
@@ -40,6 +42,7 @@ SPOT_ROUTES = VenueRoutes(
     depth="/api/v3/depth",
     trades="/api/v3/trades",
     server_time="/api/v3/time",
+    ticker_24hr="/api/v3/ticker/24hr",
 )
 
 FUTURES_ROUTES = VenueRoutes(
@@ -49,6 +52,7 @@ FUTURES_ROUTES = VenueRoutes(
     depth="/fapi/v1/depth",
     trades="/fapi/v1/trades",
     server_time="/fapi/v1/time",
+    ticker_24hr="/fapi/v1/ticker/24hr",
     premium_index="/fapi/v1/premiumIndex",
 )
 

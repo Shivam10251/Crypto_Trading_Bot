@@ -13,7 +13,7 @@ from fastapi import APIRouter, Response, status
 
 from trading_bot import __version__
 from trading_bot.api.deps import SettingsDep
-from trading_bot.api.market_status import market_data_components
+from trading_bot.api.market_status import market_data_status
 from trading_bot.api.schemas import (
     ComponentHealth,
     ComponentStatus,
@@ -88,12 +88,12 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
     api_component = ComponentHealth(
         name="API", status=ComponentStatus.HEALTHY, detail="serving requests"
     )
-    exchange_component, market_data_component = await market_data_components(settings, _now())
+    market = await market_data_status(settings, _now())
     components = [
         api_component,
         await _database_health(),
-        exchange_component,
-        market_data_component,
+        market.exchange,
+        market.market_data,
         *_pending_components(),
     ]
     return SystemStatusResponse(
@@ -102,8 +102,8 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
         execution_mode=settings.execution.mode.value,
         live_execution_armed=settings.is_live_execution_armed,
         exchange=settings.exchange.venue,
-        monitored_spot_markets=len(settings.markets.spot_symbols),
-        monitored_perpetual_markets=len(settings.markets.perpetual_symbols),
+        monitored_spot_markets=market.monitored_spot,
+        monitored_perpetual_markets=market.monitored_perpetual,
         components=components,
         server_time=_now(),
     )

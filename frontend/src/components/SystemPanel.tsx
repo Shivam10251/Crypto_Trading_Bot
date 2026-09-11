@@ -34,7 +34,9 @@ export function SystemPanel({ status }: { status: SystemStatus }) {
         <div className="kv__row">
           <dt>Markets</dt>
           <dd>
-            {status.monitored_spot_markets} spot / {status.monitored_perpetual_markets} perp
+            {status.monitored_spot_markets === null || status.monitored_perpetual_markets === null
+              ? "unknown"
+              : `${status.monitored_spot_markets} spot / ${status.monitored_perpetual_markets} perp`}
           </dd>
         </div>
       </dl>

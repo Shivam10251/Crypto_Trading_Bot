@@ -34,6 +34,33 @@ class BookStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class BookLiquidity:
+    """Resting liquidity near the mid, from every level the local book knows."""
+
+    band_bps: Decimal
+    # Quote-currency value resting within band_bps of the mid, per side.
+    bid_notional: Decimal
+    ask_notional: Decimal
+    # False when the band reaches past the price range the snapshot covered:
+    # the figure is then a lower bound, not a measurement.
+    bid_complete: bool
+    ask_complete: bool
+    reference_notional: Decimal
+    # Average fill distance from the mid, in bps, of a market order worth
+    # reference_notional; None when the known book cannot fill it.
+    buy_slippage_bps: Decimal | None
+    sell_slippage_bps: Decimal | None
+
+    @property
+    def imbalance(self) -> Decimal:
+        """Bid minus ask value within the band, in [-1, 1]; positive leans bid."""
+        total = self.bid_notional + self.ask_notional
+        if total == 0:
+            return Decimal(0)
+        return (self.bid_notional - self.ask_notional) / total
+
+
+@dataclass(frozen=True, slots=True)
 class MarketSnapshot:
     """One market, now. Immutable, so it can be handed to any consumer."""
 
@@ -57,6 +84,8 @@ class MarketSnapshot:
     # Order-book integrity failures (sequence gaps, crossed books) and rebuilds.
     gaps: int
     resyncs: int
+    # Measured from the full synchronised book; None unless SYNCED.
+    liquidity: BookLiquidity | None = None
 
     @property
     def is_live(self) -> bool:

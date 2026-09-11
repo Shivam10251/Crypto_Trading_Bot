@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
-from sqlalchemy import func, insert
+from sqlalchemy import func, insert, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,13 +44,21 @@ _KEEP_WHEN_NULL = ("maker_fee_bps", "taker_fee_bps")
 async def register_markets(
     session: AsyncSession, specs: Sequence[MarketSpec]
 ) -> dict[MarketRef, int]:
-    """Upsert the monitored instruments and return their row ids.
+    """Upsert the monitored instruments, mark them monitored, return their ids.
 
     Reference data is refreshed from the venue on every start, so ``markets``
-    never drifts from what the exchange currently reports.
+    never drifts from what the exchange currently reports. Every other market
+    of the venue is unmarked in the same transaction, so ``is_monitored``
+    always describes exactly one selection.
     """
     if not specs:
         return {}
+    venues = {spec.ref.venue for spec in specs}
+    await session.execute(
+        update(Market)
+        .where(Market.venue.in_(venues), Market.is_monitored.is_(True))
+        .values(is_monitored=False, updated_at=func.now())
+    )
     rows = [
         {
             "venue": spec.ref.venue,
@@ -66,6 +74,7 @@ async def register_markets(
             "contract_size": spec.contract_size,
             "settlement_asset": spec.settlement_asset,
             "is_active": spec.is_active,
+            "is_monitored": True,
         }
         for spec in specs
     ]

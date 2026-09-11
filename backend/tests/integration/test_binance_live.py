@@ -17,11 +17,17 @@ from decimal import Decimal
 
 import pytest
 
-from trading_bot.core.config import ExchangeConfig, MarketDataConfig
+from trading_bot.core.config import (
+    ExchangeConfig,
+    MarketDataConfig,
+    MarketsConfig,
+    UniverseConfig,
+)
 from trading_bot.db.models.enums import MarketType, Side
 from trading_bot.exchange.binance import BinanceExchangeAdapter
 from trading_bot.exchange.models import MarketDataSubscription
 from trading_bot.marketdata import BookStatus, MarketDataEngine
+from trading_bot.monitoring.universe import select_universe
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TB_TEST_LIVE") != "1",
@@ -127,3 +133,28 @@ class TestLiveStreaming:
             assert len(snap.book.bids) == 20
             assert snap.book.best_bid < snap.book.best_ask
             assert snap.gaps == 0
+            assert snap.liquidity is not None  # measured from the full local book
+
+
+class TestLiveUniverse:
+    """Phase 4 market selection against the real listings and 24h statistics."""
+
+    async def test_bulk_daily_stats_cover_the_venue(self, adapter: BinanceExchangeAdapter) -> None:
+        stats = await adapter.get_daily_stats(MarketType.SPOT)
+        volumes = {entry.ref.symbol: entry.quote_volume for entry in stats}
+        assert len(volumes) > 100
+        assert volumes["BTCUSDT"] > 0
+
+    async def test_the_top_pairs_by_weaker_leg_include_bitcoin(
+        self, adapter: BinanceExchangeAdapter
+    ) -> None:
+        config = MarketsConfig(
+            selection="top_volume",
+            top_volume=UniverseConfig(count=5),
+            spot_symbols=[],
+            perpetual_symbols=[],
+        )
+        universe = await select_universe(adapter, config)
+        assert len(universe.refs) == 10  # both legs of five pairs
+        assert ("BTCUSDT", MarketType.SPOT) in {(r.symbol, r.market_type) for r in universe.refs}
+        assert universe.candidates > 100

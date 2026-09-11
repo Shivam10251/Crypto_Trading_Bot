@@ -155,7 +155,49 @@ class ExchangeConfig(ConfigSection):
         return bool(self.api_key.get_secret_value() and self.api_secret.get_secret_value())
 
 
+_STABLECOINS = (
+    "USDC",
+    "FDUSD",
+    "TUSD",
+    "USDP",
+    "DAI",
+    "USDE",
+    "PYUSD",
+    "USD1",
+    "EUR",
+    "AEUR",
+    "EURI",
+)
+
+
+class UniverseConfig(ConfigSection):
+    """The rule behind ``markets.selection: top_volume``."""
+
+    count: int = Field(default=50, ge=1, le=500)
+    quote_asset: str = "USDT"
+    # Pairs rank by the weaker leg's 24h quote volume, and both legs must clear
+    # this floor: a basis trade is bounded by the thinner of its two markets.
+    min_quote_volume: float = Field(default=1_000_000, ge=0)
+    # Pegged assets have no basis worth trading.
+    exclude_base_assets: list[str] = Field(default_factory=lambda: list(_STABLECOINS))
+    exclude_symbols: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize(self) -> UniverseConfig:
+        object.__setattr__(self, "quote_asset", self.quote_asset.upper())
+        object.__setattr__(
+            self, "exclude_base_assets", [a.upper() for a in self.exclude_base_assets]
+        )
+        object.__setattr__(self, "exclude_symbols", [s.upper() for s in self.exclude_symbols])
+        return self
+
+
 class MarketsConfig(ConfigSection):
+    # "explicit" monitors exactly the symbol lists below. "top_volume" ranks
+    # pairs listed on both spot and perpetual and monitors the top N - plus
+    # the lists below, which are monitored in either mode.
+    selection: Literal["explicit", "top_volume"] = "explicit"
+    top_volume: UniverseConfig = Field(default_factory=UniverseConfig)
     spot_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT"])
     perpetual_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT"])
 
@@ -177,8 +219,13 @@ class MarketDataConfig(ConfigSection):
     # snapshot must be far deeper than what is published.
     depth_levels: int = Field(default=20, ge=1, le=100)
     snapshot_depth: int = Field(default=1000, ge=5, le=1000)
-    # No update of any kind for this long marks a market STALE.
+    # A connection silent for this long makes every market it carries STALE.
     stale_after_ms: int = Field(default=2000, gt=0)
+    # A market with no message of its own for this long is STALE even on a busy
+    # connection. Binance pushes only changes, so a quiet market is unchanged,
+    # not stale; this catches a single stream dying. Measured live: mid-cap
+    # spot markets routinely go several seconds without a message.
+    market_silence_ms: int = Field(default=30_000, gt=0)
     stale_check_interval_ms: int = Field(default=250, gt=0)
     # An open connection that delivers nothing for this long is treated as dead.
     idle_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -188,20 +235,43 @@ class MarketDataConfig(ConfigSection):
     # Floor between order-book rebuilds per market; each one costs REST weight.
     resync_min_interval_seconds: float = Field(default=1.0, ge=0)
     max_buffered_updates: int = Field(default=1000, ge=10)
+    # Snapshots in flight at once. A 1000-level spot snapshot costs 50 of the
+    # 6000 request weight Binance allows per minute; unthrottled, 50 markets
+    # would spend 2500 of it in a single burst.
+    max_concurrent_snapshots: int = Field(default=4, ge=1, le=20)
+    # Liquidity: resting value within this distance of the mid, measured from
+    # every level the local book knows rather than only the published ones.
+    liquidity_band_bps: float = Field(default=10.0, gt=0, le=1000)
+    # Order size, in quote currency, used to quote market-order slippage.
+    reference_order_notional: float = Field(default=10_000.0, gt=0)
     # Sampled persistence into market_data: one row per market per interval,
-    # written only when the quote actually changed.
+    # written only when the quote changed. A row costs about 290 bytes with its
+    # indexes, so 100 markets at 5 s is roughly 500 MB a day before retention.
     persist: bool = True
-    persist_interval_ms: int = Field(default=1000, ge=100)
+    persist_interval_ms: int = Field(default=5000, ge=100)
     # The API calls a market live when its newest stored quote is this recent.
-    status_fresh_within_ms: int = Field(default=5000, gt=0)
+    status_fresh_within_ms: int = Field(default=15000, gt=0)
     display: bool = True
     display_interval_ms: int = Field(default=1000, ge=100)
 
     @model_validator(mode="after")
-    def _check_depth(self) -> MarketDataConfig:
+    def _check_consistency(self) -> MarketDataConfig:
         if self.snapshot_depth < self.depth_levels:
             raise ValueError("snapshot_depth must be at least depth_levels")
+        if self.market_silence_ms < self.stale_after_ms:
+            raise ValueError("market_silence_ms must be at least stale_after_ms")
+        if self.status_fresh_within_ms <= self.persist_interval_ms:
+            # Otherwise every market would read stale between two samples.
+            raise ValueError("status_fresh_within_ms must exceed persist_interval_ms")
         return self
+
+
+class MonitoringConfig(ConfigSection):
+    """Market monitoring (Phase 4): statistics over the live snapshots."""
+
+    sample_interval_ms: int = Field(default=1000, ge=100)
+    # Rolling window for spread and imbalance means and latency percentiles.
+    window_seconds: int = Field(default=60, ge=5, le=3600)
 
 
 class StrategyConfig(ConfigSection):
@@ -274,6 +344,7 @@ class Settings(BaseSettings):
     exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
     markets: MarketsConfig = Field(default_factory=MarketsConfig)
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
+    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)

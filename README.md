@@ -11,9 +11,10 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phase 3 complete** — foundation, data model, the exchange
-abstraction, and a real-time market-data engine streaming Binance spot and
-USDⓈ-M perpetuals (`make market-data`). No strategy, no trading yet. See
+Current state: **Phase 4 complete** — foundation, data model, the exchange
+abstraction, a real-time market-data engine, and market monitoring: the 50
+most liquid spot/perpetual pairs, chosen by configuration, streamed and
+measured live (`make market-data`). No strategy, no trading yet. See
 [docs/development-phases.md](docs/development-phases.md).
 
 ---
@@ -49,7 +50,7 @@ cd frontend
 pnpm install
 pnpm dev
 
-# 5. Live Binance market data - in a third terminal, from the repo root
+# 5. Live market monitor (top 50 spot/perp pairs) - third terminal, repo root
 make market-data
 ```
 
@@ -77,8 +78,8 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 425 tests (7 live, opt-in)
-cd frontend && pnpm test                    # 9 tests
+cd backend  && uv run pytest                # 474 tests (9 live, opt-in)
+cd frontend && pnpm test                    # 10 tests
 make check                                  # lint + types + tests
 ```
 
@@ -104,6 +105,7 @@ backend/                  FastAPI service, strategy engine, data pipeline
     exchange/             venue boundary: adapter interface, normalized models
       binance/            binance.com spot + USDⓈ-M market data and streams
     marketdata/           real-time engine: connections, order books, staleness
+    monitoring/           market selection, per-market statistics, terminal view
   alembic/                database migrations
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)
@@ -124,6 +126,13 @@ Three layers, each overriding the one before:
 
 Nested keys use a double underscore: `TB_DATABASE__PASSWORD` sets
 `database.password`. Select a profile with `TB_PROFILE`.
+
+Markets are configuration, never code. By default `markets.selection:
+top_volume` monitors the 50 USDT pairs listed on both spot and perpetual with
+the most 24h volume on their weaker leg. Change the count with
+`markets.top_volume.count` (or `TB_MARKETS__TOP_VOLUME__COUNT=100`), or set
+`selection: explicit` to monitor exactly `markets.spot_symbols` and
+`markets.perpetual_symbols`.
 
 Secrets never appear in YAML, source code, or logs — credential-shaped fields
 are redacted centrally by the logging pipeline.

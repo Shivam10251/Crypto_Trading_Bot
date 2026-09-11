@@ -8,8 +8,9 @@ module owns everything in between:
   venue's sequencing rules)
 - invalidating a book on a sequence gap, a crossed book or a disconnect, so
   consumers see ``SYNCING`` rather than a wrong book
-- rate-limiting rebuilds: each snapshot costs REST weight, and a flapping feed
-  must not turn into a request storm
+- rate-limiting rebuilds: each snapshot costs REST weight, so rebuilds are
+  spaced per market and capped in flight across all of them - a reconnect that
+  invalidates fifty books must not fire fifty snapshot requests at once
 """
 
 from __future__ import annotations
@@ -17,12 +18,14 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
+from decimal import Decimal
 
 from trading_bot.core.config import MarketDataConfig
 from trading_bot.core.logging import get_logger
 from trading_bot.exchange.errors import ExchangeError
 from trading_bot.exchange.models import DepthDiff, MarketRef, OrderBook
-from trading_bot.marketdata.models import BookStatus
+from trading_bot.marketdata.models import BookLiquidity, BookStatus
 from trading_bot.marketdata.order_book import BookSyncError, DepthExhaustedError, LocalOrderBook
 
 logger = get_logger(__name__)
@@ -38,12 +41,25 @@ _BUFFER_WAIT_SECONDS = 1.0
 _MAX_REBUILD_BACKOFF_SECONDS = 30.0
 
 
+@dataclass(frozen=True, slots=True)
+class BookView:
+    """What the engine may publish for one market's book."""
+
+    book: OrderBook | None
+    status: BookStatus
+    liquidity: BookLiquidity | None = None
+
+
+DISABLED_VIEW = BookView(book=None, status=BookStatus.DISABLED)
+
+
 class _Book:
     """One market's local book plus what it takes to rebuild it."""
 
     __slots__ = (
         "buffer",
         "buffered",
+        "cached_liquidity",
         "cached_top",
         "failures",
         "last_attempt",
@@ -59,7 +75,9 @@ class _Book:
         self.status = BookStatus.SYNCING
         self.buffer: deque[DepthDiff] = deque(maxlen=max_buffered)
         self.buffered = asyncio.Event()
+        # Derived views, computed when first read after an update.
         self.cached_top: OrderBook | None = None
+        self.cached_liquidity: BookLiquidity | None = None
         self.task: asyncio.Task[None] | None = None
         # Event-loop time of the last snapshot request, for the rate floor.
         self.last_attempt: float | None = None
@@ -69,12 +87,16 @@ class _Book:
         self.buffer.append(diff)
         self.buffered.set()
 
+    def forget_views(self) -> None:
+        self.cached_top = None
+        self.cached_liquidity = None
+
     def discard(self) -> None:
         self.status = BookStatus.SYNCING
         self.local.reset()
         self.buffer.clear()
         self.buffered.clear()
-        self.cached_top = None
+        self.forget_views()
 
 
 class BookSynchronizer:
@@ -93,10 +115,13 @@ class BookSynchronizer:
     ) -> None:
         self._depth_levels = depth_levels
         self._config = config
+        self._band_bps = Decimal(str(config.liquidity_band_bps))
+        self._reference_notional = Decimal(str(config.reference_order_notional))
         self._fetch = fetch_snapshot
         self._on_invalidated = on_invalidated
         self._on_synced = on_synced
         self._on_snapshot_failed = on_snapshot_failed
+        self._snapshot_slots = asyncio.Semaphore(config.max_concurrent_snapshots)
         self._books = {
             ref: _Book(ref, min_levels=depth_levels, max_buffered=config.max_buffered_updates)
             for ref in refs
@@ -143,25 +168,30 @@ class BookSynchronizer:
             book.push(diff)
             self._ensure_rebuild(book)
         else:
-            book.cached_top = None
+            book.forget_views()
 
-    def view(self, ref: MarketRef) -> tuple[OrderBook | None, BookStatus]:
-        """The book to publish, or ``None`` with the reason it cannot be."""
+    def view(self, ref: MarketRef) -> BookView:
+        """The book to publish, or the reason there is none."""
         book = self._books.get(ref)
         if book is None:
-            return None, BookStatus.DISABLED
+            return DISABLED_VIEW
         if book.status is not BookStatus.SYNCED:
-            return None, book.status
+            return BookView(book=None, status=book.status)
         if book.cached_top is None:
             try:
                 book.cached_top = book.local.top(self._depth_levels)
+                book.cached_liquidity = book.local.liquidity(
+                    self._band_bps, self._reference_notional
+                )
             except BookSyncError as exc:
                 # Validated lazily, when someone reads, so the hot path does not
                 # pay for a sort on every update.
                 self._invalidate(book, exc)
                 self._ensure_rebuild(book)
-                return None, BookStatus.SYNCING
-        return book.cached_top, BookStatus.SYNCED
+                return BookView(book=None, status=BookStatus.SYNCING)
+        return BookView(
+            book=book.cached_top, status=BookStatus.SYNCED, liquidity=book.cached_liquidity
+        )
 
     def invalidate(self, ref: MarketRef, reason: str) -> None:
         """Routine invalidation, such as the depth stream disconnecting."""
@@ -203,13 +233,14 @@ class BookSynchronizer:
                     await asyncio.wait_for(book.buffered.wait(), timeout=_BUFFER_WAIT_SECONDS)
                 except TimeoutError:
                     continue
-            book.last_attempt = loop.time()
-            try:
-                snapshot = await self._fetch(book.ref, self._config.snapshot_depth)
-            except ExchangeError as exc:
-                book.failures += 1
-                self._on_snapshot_failed(book.ref, exc)
-                continue
+            async with self._snapshot_slots:
+                book.last_attempt = loop.time()
+                try:
+                    snapshot = await self._fetch(book.ref, self._config.snapshot_depth)
+                except ExchangeError as exc:
+                    book.failures += 1
+                    self._on_snapshot_failed(book.ref, exc)
+                    continue
             if self._bridge(book, snapshot):
                 return
 
@@ -244,7 +275,7 @@ class BookSynchronizer:
             return False
         book.buffer.clear()
         book.status = BookStatus.SYNCED
-        book.cached_top = None
+        book.forget_views()
         book.failures = 0
         logger.info(
             "market_data.book_synced", market=str(book.ref), update_id=book.local.last_update_id

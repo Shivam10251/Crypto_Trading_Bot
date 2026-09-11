@@ -21,6 +21,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -61,6 +62,12 @@ class Market(Base, RecordMixin):
     settlement_asset: Mapped[str | None] = mapped_column(String(16))
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Chosen by the market-data service's latest start, and cleared for every
+    # other market then - so the API knows which markets should be live
+    # without re-running the selection itself.
+    is_monitored: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     __table_args__ = (
         # One row per instrument per venue.

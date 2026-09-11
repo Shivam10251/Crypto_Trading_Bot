@@ -32,6 +32,7 @@ from trading_bot.exchange.models import (
     OrderBook,
     Quote,
     ServerTime,
+    TickerStats,
     TradePrint,
 )
 from trading_bot.exchange.streaming import MarketStreamSource
@@ -88,6 +89,14 @@ class ExchangeAdapter(ABC):
         Default raises: venues without perpetuals should not pretend to answer.
         """
         raise NotSupportedError(f"{self.venue} does not expose funding for {ref}")
+
+    async def get_daily_stats(self, market_type: MarketType) -> list[TickerStats]:
+        """Rolling 24h statistics for every listed symbol of one instrument class.
+
+        Used to rank markets by liquidity. Default raises: a venue without a
+        bulk endpoint should not quietly make one request per symbol.
+        """
+        raise NotSupportedError(f"{self.venue} does not expose bulk 24h statistics")
 
     # --- execution (disabled until Phase 17) ------------------------------
 

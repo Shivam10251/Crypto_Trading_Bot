@@ -1,9 +1,11 @@
 # Data Model
 
-Status: **implemented.** 13 tables, two migrations. Phase 1 built the schema;
-Phase 2 corrected the exchange-timestamp assumption after checking the live
-Binance API; Phase 3's market-data service is the first writer of `markets`,
-`market_data` and `system_events`.
+Status: **implemented.** 13 tables, three migrations. Phase 1 built the
+schema; Phase 2 corrected the exchange-timestamp assumption after checking the
+live Binance API; Phase 3's market-data service is the first writer of
+`markets`, `market_data` and `system_events`; Phase 4 added
+`markets.is_monitored` - the service's latest market selection, which is how
+the API knows which markets should be live.
 
 ## Traceability requirement
 
@@ -98,7 +100,7 @@ Raw feeds have a finite life; the research record does not.
 
 | Data | Retention | Why |
 | --- | --- | --- |
-| `market_data` | 7 days | Several updates/second/market; decisions already preserved in `opportunities` |
+| `market_data` | 7 days | One sampled row per market every 5 s (~500 MB/day at 100 markets); decisions already preserved in `opportunities` |
 | `order_books` | 3 days | Largest rows |
 | `trades_market` | 7 days | Kept long enough to calibrate slippage |
 | Everything else | Forever | Research dataset and audit trail |

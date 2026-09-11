@@ -28,6 +28,7 @@ from trading_bot.exchange.models import (
     MarketSpec,
     OrderBook,
     Quote,
+    TickerStats,
     TradePrint,
 )
 
@@ -209,5 +210,25 @@ def parse_funding(
             _require(payload, "lastFundingRate", context), f"{context} lastFundingRate"
         ),
         next_funding_time=to_datetime(_require(payload, "nextFundingTime", context), context),
+        local_timestamp=local_timestamp,
+    )
+
+
+def parse_daily_stats(
+    payload: dict[str, Any], ref: MarketRef, local_timestamp: datetime
+) -> TickerStats:
+    """One entry of the REST ``ticker/24hr`` list (spot and futures alike).
+
+    ``closeTime`` ends the rolling window and serves as the exchange clock.
+    """
+    context = f"ticker/24hr {ref}"
+    return TickerStats(
+        ref=ref,
+        last_price=to_decimal(_require(payload, "lastPrice", context), f"{context} lastPrice"),
+        volume=to_decimal(_require(payload, "volume", context), f"{context} volume"),
+        quote_volume=to_decimal(
+            _require(payload, "quoteVolume", context), f"{context} quoteVolume"
+        ),
+        exchange_timestamp=to_datetime(_require(payload, "closeTime", context), context),
         local_timestamp=local_timestamp,
     )

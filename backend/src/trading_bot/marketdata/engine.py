@@ -28,7 +28,7 @@ from trading_bot.db.models.enums import Severity, SystemEventType
 from trading_bot.exchange.errors import ExchangeDataError, ExchangeError, UnknownMarketError
 from trading_bot.exchange.models import MarketDataSubscription, MarketRef, Quote, TickerStats
 from trading_bot.exchange.streaming import MarketStreamSource, StreamEndpoint, StreamKind
-from trading_bot.marketdata.book_sync import BookSynchronizer, SnapshotFetcher
+from trading_bot.marketdata.book_sync import DISABLED_VIEW, BookSynchronizer, SnapshotFetcher
 from trading_bot.marketdata.connection import (
     Backoff,
     ConnectionEvent,
@@ -39,7 +39,6 @@ from trading_bot.marketdata.connection import (
     websocket_connector,
 )
 from trading_bot.marketdata.models import (
-    BookStatus,
     EngineHealth,
     FeedStatus,
     MarketDataEvent,
@@ -147,6 +146,8 @@ class MarketDataEngine:
                 on_snapshot_failed=self._snapshot_failed,
             )
         self._endpoint_state = {e.name: ConnectionState.CONNECTING for e in self._endpoints}
+        # Last message (or connect) per connection: the proof it is still alive.
+        self._endpoint_heard: dict[str, datetime | None] = {e.name: None for e in self._endpoints}
         self._endpoint_by_name = {e.name: e for e in self._endpoints}
         self._ref_endpoints: dict[MarketRef, list[str]] = {ref: [] for ref in refs}
         for endpoint in self._endpoints:
@@ -236,16 +237,14 @@ class MarketDataEngine:
         if tracker is None:
             raise UnknownMarketError(f"{ref} is not subscribed")
         now = self._clock()
-        book, book_status = (
-            self._books.view(ref) if self._books is not None else (None, BookStatus.DISABLED)
-        )
+        view = self._books.view(ref) if self._books is not None else DISABLED_VIEW
         ticker = tracker.ticker
         return MarketSnapshot(
             ref=ref,
             status=self._status(tracker, now),
             quote=tracker.quote,
-            book=book,
-            book_status=book_status,
+            book=view.book,
+            book_status=view.status,
             last_price=ticker.last_price if ticker else None,
             volume_24h=ticker.volume if ticker else None,
             quote_volume_24h=ticker.quote_volume if ticker else None,
@@ -259,6 +258,7 @@ class MarketDataEngine:
             updates=tracker.updates,
             gaps=tracker.gaps,
             resyncs=tracker.resyncs,
+            liquidity=view.liquidity,
         )
 
     def snapshots(self) -> list[MarketSnapshot]:
@@ -311,6 +311,7 @@ class MarketDataEngine:
     def _on_message(
         self, endpoint: StreamEndpoint, raw: str | bytes, received_at: datetime
     ) -> None:
+        self._endpoint_heard[endpoint.name] = received_at
         try:
             event = self._source.parse(endpoint, raw, received_at)
         except ExchangeDataError as exc:
@@ -383,6 +384,7 @@ class MarketDataEngine:
         self._endpoint_state[event.name] = event.state
         endpoint = self._endpoint_by_name[event.name]
         if event.state is ConnectionState.CONNECTED:
+            self._endpoint_heard[event.name] = event.at
             for ref in endpoint.refs:
                 self._trackers[ref].connected_at = event.at
             if event.connection_number > 1:
@@ -430,10 +432,17 @@ class MarketDataEngine:
             if tracker.last_update_at is None:
                 return FeedStatus.CONNECTING
             return FeedStatus.DISCONNECTED
-        # Measured from the later of the last message and the last (re)connect,
-        # so a fresh connection gets a full window to deliver.
+        # A connection that has gone quiet can vouch for nothing it carries.
+        for name in self._ref_endpoints[tracker.ref]:
+            heard = self._endpoint_heard[name]
+            if heard is None or _ms_between(now, heard) > self._config.stale_after_ms:
+                return FeedStatus.STALE
+        # On a live connection a quiet market is unchanged, not stale - the venue
+        # pushes every change - but a market silent this long may have lost its
+        # own stream. Measured from the later of its last message and the last
+        # (re)connect, so a fresh connection gets a full window.
         marks = [mark for mark in (tracker.last_update_at, tracker.connected_at) if mark]
-        if marks and _ms_between(now, max(marks)) > self._config.stale_after_ms:
+        if marks and _ms_between(now, max(marks)) > self._config.market_silence_ms:
             return FeedStatus.STALE
         return FeedStatus.CONNECTING if tracker.last_update_at is None else FeedStatus.LIVE
 

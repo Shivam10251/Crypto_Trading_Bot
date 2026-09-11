@@ -51,8 +51,10 @@ class TestSystemStatus:
         assert body["execution_mode"] == "paper"
         assert body["live_execution_armed"] is False
         assert body["exchange"] == "binance"
-        assert body["monitored_spot_markets"] == 1
-        assert body["monitored_perpetual_markets"] == 1
+        # This SQLite database has no market tables, so the monitored markets are
+        # unknown - reported as null rather than guessed from configuration.
+        assert body["monitored_spot_markets"] is None
+        assert body["monitored_perpetual_markets"] is None
 
     async def test_unbuilt_components_report_offline_not_fake_health(
         self, client: AsyncClient

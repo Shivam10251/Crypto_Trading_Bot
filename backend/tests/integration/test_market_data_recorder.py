@@ -118,6 +118,15 @@ class TestRegisterMarkets:
         fee = await db.scalar(select(Market.taker_fee_bps).where(Market.id == ids[SPOT]))
         assert fee == Decimal("7.5")
 
+    async def test_registration_records_exactly_one_selection(self, db: AsyncSession) -> None:
+        """is_monitored describes the latest selection, never a leftover."""
+        first = await register_markets(db, [spec(SPOT), spec(PERP)])
+        await register_markets(db, [spec(PERP)])
+        rows = await db.execute(
+            select(Market.id, Market.is_monitored).where(Market.id.in_(first.values()))
+        )
+        assert dict(rows.tuples().all()) == {first[SPOT]: False, first[PERP]: True}
+
 
 class TestSampling:
     async def test_only_changed_quotes_are_written(self, db: AsyncSession) -> None:

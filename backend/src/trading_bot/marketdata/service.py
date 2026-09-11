@@ -1,65 +1,41 @@
 """The market-data service: ``make market-data`` / ``uv run trading-bot-market-data``.
 
-Wires the Binance adapter, the engine, the recorder and the terminal view, then
-runs until interrupted. Shutdown is orderly: sockets closed, the last sample
-and a SHUTDOWN event flushed to the database.
+Chooses the markets, streams them through the engine, samples them through the
+monitor, persists quotes and events, and draws the terminal view - until
+interrupted. Shutdown is orderly: sockets closed, the last sample and a
+SHUTDOWN event flushed to the database.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import signal
 import sys
 from collections import deque
 from datetime import UTC, datetime
+from decimal import Decimal
 
-from trading_bot.core.config import MarketsConfig, Settings
+from trading_bot.core.config import Settings
 from trading_bot.core.logging import get_logger
-from trading_bot.db.models.enums import MarketType, Severity, SystemEventType
+from trading_bot.db.models.enums import Severity, SystemEventType
 from trading_bot.db.session import check_connection, dispose_engine, init_engine, session_scope
 from trading_bot.exchange.base import ExchangeAdapter
 from trading_bot.exchange.binance import BinanceExchangeAdapter
-from trading_bot.exchange.errors import ExchangeError, UnknownMarketError
+from trading_bot.exchange.errors import ExchangeError
 from trading_bot.exchange.models import MarketDataSubscription, MarketSpec
-from trading_bot.marketdata.display import CLEAR_SCREEN, render
 from trading_bot.marketdata.engine import MarketDataEngine
 from trading_bot.marketdata.models import MarketDataEvent
 from trading_bot.marketdata.recorder import MarketDataRecorder, register_markets
+from trading_bot.monitoring.display import CLEAR_SCREEN, FRAME_OVERHEAD, FrameContext, render
+from trading_bot.monitoring.monitor import MarketMonitor
+from trading_bot.monitoring.universe import select_universe
 
 logger = get_logger(__name__)
 
-
-async def resolve_markets(adapter: ExchangeAdapter, markets: MarketsConfig) -> list[MarketSpec]:
-    """Look the configured symbols up on the venue; refuse to start on a bad one.
-
-    An unknown or halted symbol is a configuration error. Streaming the rest
-    would leave a strategy blind to a leg it expects to have.
-    """
-    wanted = [(MarketType.SPOT, symbol) for symbol in markets.spot_symbols] + [
-        (MarketType.PERPETUAL, symbol) for symbol in markets.perpetual_symbols
-    ]
-    listed: dict[MarketType, dict[str, MarketSpec]] = {}
-    for kind in dict.fromkeys(kind for kind, _ in wanted):
-        listed[kind] = {spec.symbol: spec for spec in await adapter.get_markets(kind)}
-
-    specs: list[MarketSpec] = []
-    missing: list[str] = []
-    halted: list[str] = []
-    for kind, symbol in wanted:
-        spec = listed[kind].get(symbol)
-        label = f"{symbol} {kind.value.lower()}"
-        if spec is None:
-            missing.append(label)
-        elif not spec.is_active:
-            halted.append(label)
-        else:
-            specs.append(spec)
-    if missing:
-        raise UnknownMarketError(f"not listed on {adapter.venue}: {', '.join(missing)}")
-    if halted:
-        raise UnknownMarketError(f"not trading on {adapter.venue}: {', '.join(halted)}")
-    return specs
+# Piped output gets a full frame this often rather than every refresh.
+_UNATTENDED_INTERVAL_SECONDS = 10.0
 
 
 async def run_service(
@@ -71,10 +47,10 @@ async def run_service(
     config = settings.market_data
     stop = stop or _stop_on_signals()
     async with adapter or BinanceExchangeAdapter(settings.exchange) as venue:
-        specs = await resolve_markets(venue, settings.markets)
+        universe = await select_universe(venue, settings.markets)
         skew_ms = await _clock_skew(venue)
         subscription = MarketDataSubscription(
-            refs=tuple(spec.ref for spec in specs),
+            refs=universe.refs,
             include_depth=config.include_depth,
             depth_levels=config.depth_levels,
             include_ticker=config.include_ticker,
@@ -86,22 +62,32 @@ async def run_service(
             snapshot_fetcher=venue.get_order_book,
             max_backoff_seconds=settings.exchange.max_reconnect_backoff_seconds,
         )
+        monitor = MarketMonitor(engine, settings.monitoring, ranks=universe.ranks)
         recent: deque[MarketDataEvent] = deque(maxlen=6)
         engine.add_listener(recent.append)
 
-        recorder = await _open_recorder(settings, specs) if config.persist else None
+        recorder = await _open_recorder(settings, list(universe.specs)) if config.persist else None
         if recorder is not None:
             engine.add_listener(recorder.record_event)
             recorder.record_event(
-                _service_event(SystemEventType.STARTUP, f"started for {len(specs)} markets")
+                _service_event(SystemEventType.STARTUP, f"started: {universe.describe()}")
             )
             persistence = f"market_data every {config.persist_interval_ms} ms"
         else:
             persistence = "off" if not config.persist else "OFF - database unavailable"
+        context = FrameContext(
+            venue=venue.venue,
+            universe=universe.describe(),
+            clock_skew_ms=skew_ms,
+            persistence=persistence,
+            band_bps=Decimal(str(config.liquidity_band_bps)),
+            reference_notional=Decimal(str(config.reference_order_notional)),
+        )
 
         tasks: list[asyncio.Task[None]] = []
         try:
             async with engine:
+                tasks.append(asyncio.create_task(monitor.run(), name="market-monitor"))
                 if recorder is not None:
                     tasks.append(asyncio.create_task(recorder.run(engine.snapshots)))
                 if config.display:
@@ -109,10 +95,9 @@ async def run_service(
                         asyncio.create_task(
                             _display_loop(
                                 engine,
+                                monitor,
                                 recent,
-                                venue=venue.venue,
-                                skew_ms=skew_ms,
-                                persistence=persistence,
+                                context,
                                 interval_seconds=config.display_interval_ms / 1000,
                             )
                         )
@@ -175,27 +160,28 @@ async def _clock_skew(adapter: ExchangeAdapter) -> int | None:
 
 async def _display_loop(
     engine: MarketDataEngine,
+    monitor: MarketMonitor,
     recent: deque[MarketDataEvent],
+    context: FrameContext,
     *,
-    venue: str,
-    skew_ms: int | None,
-    persistence: str,
     interval_seconds: float,
 ) -> None:
     tty = sys.stdout.isatty()
+    interval = interval_seconds if tty else max(interval_seconds, _UNATTENDED_INTERVAL_SECONDS)
     while True:
+        rows = max(5, shutil.get_terminal_size().lines - FRAME_OVERHEAD) if tty else None
         frame = render(
-            engine.snapshots(),
+            monitor.metrics(),
+            monitor.summary(),
             engine.health(),
             list(recent),
             now=datetime.now(UTC),
-            venue=venue,
-            clock_skew_ms=skew_ms,
-            persistence=persistence,
+            context=context,
+            max_rows=rows,
         )
         sys.stdout.write((CLEAR_SCREEN if tty else "") + frame + "\n\n")
         sys.stdout.flush()
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(interval)
 
 
 def _stop_on_signals() -> asyncio.Event:

@@ -12,9 +12,11 @@ from trading_bot.core.config import (
     DatabaseConfig,
     ExecutionMode,
     MarketDataConfig,
+    MarketsConfig,
     Profile,
     RiskConfig,
     Settings,
+    UniverseConfig,
     active_profile,
     load_yaml_config,
 )
@@ -216,6 +218,36 @@ class TestMarketDataConfig:
         for url in (exchange.spot_ws_url, exchange.futures_ws_url):
             assert url.startswith("wss://")
             assert url.count("/") == 2
+
+
+class TestMarketSelection:
+    def test_shipped_configuration_ranks_by_volume(self) -> None:
+        markets = Settings().markets
+        assert markets.selection == "top_volume"
+        assert markets.top_volume.count == 50
+        assert "USDC" in markets.top_volume.exclude_base_assets
+
+    def test_the_count_is_configuration_not_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TB_MARKETS__TOP_VOLUME__COUNT", "120")
+        assert Settings().markets.top_volume.count == 120
+
+    def test_rule_lists_are_upper_cased(self) -> None:
+        rule = UniverseConfig(
+            quote_asset="usdt", exclude_base_assets=["usdc"], exclude_symbols=["pepeusdt"]
+        )
+        assert (rule.quote_asset, rule.exclude_base_assets, rule.exclude_symbols) == (
+            "USDT",
+            ["USDC"],
+            ["PEPEUSDT"],
+        )
+
+    def test_unknown_selection_modes_are_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MarketsConfig(selection="random")  # type: ignore[arg-type]
+
+    def test_status_window_must_outlast_the_persistence_interval(self) -> None:
+        with pytest.raises(ValidationError, match="status_fresh_within_ms"):
+            MarketDataConfig(persist_interval_ms=5000, status_fresh_within_ms=5000)
 
 
 class TestCachedSettings:

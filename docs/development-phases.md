@@ -9,7 +9,7 @@ stops for review before the next begins.
 | 1 | Database and data model | **Complete** |
 | 2 | Exchange abstraction (market data only) | **Complete** |
 | 3 | Real-time market data engine | **Complete** |
-| 4 | Market monitoring | Not started |
+| 4 | Market monitoring | **Complete** |
 | 5 | Strategy framework + spot/perp basis strategy | Not started |
 | 6 | Transaction cost model | Not started |
 | 7 | Opportunity engine | Not started |
@@ -225,7 +225,87 @@ both include the measured clock skew.
   the persistence interval (1 s) and needs the database.
 - Trade prints are not streamed yet; 24h volume comes from the ticker.
 
-## Phase 4 — next
+## Phase 4 — delivered
 
-Market monitoring, built on the engine's `MarketSnapshot` stream rather than on
-raw WebSocket data. See [architecture.md](architecture.md).
+`make market-data` now chooses its markets, streams them and shows a monitoring
+table: 50 spot/perpetual pairs - 100 markets - by default.
+
+- **Market selection** (`monitoring/universe.py`): `markets.selection:
+  top_volume` ranks every USDT pair listed on both spot and perpetual by the
+  *weaker* leg's 24h quote volume - a basis trade is bounded by its thinner
+  market - and monitors the top `count`. Count, volume floor and exclusions
+  (stablecoin bases by default) are configuration, never code; the explicit
+  symbol lists are always added, and `selection: explicit` keeps the Phase 3
+  behaviour
+- **Bulk 24h statistics** (`get_daily_stats`): one request per instrument class
+  ranks the whole venue (weight 80 spot, 40 futures)
+- **Liquidity** (`LocalOrderBook.liquidity`): value resting within ±10 bps of
+  the mid, measured from every level the local book knows rather than the 20
+  it publishes, and flagged as a lower bound when the band runs past the
+  snapshot's price range; plus buy/sell slippage for a 10,000 USDT market order
+- **Monitor** (`monitoring/monitor.py`): samples every market once a second into
+  `MarketMetrics` - mid, spread in bps and %, 60 s mean spread, 24h volume,
+  order-book imbalance within the band and its mean, liquidity, slippage, data
+  age and freshness, latency with p50/p95. Windows hold only live samples, so a
+  stale quote cannot drag an average
+- **Scale**: snapshot requests capped at 4 in flight; 100 markets start on 3
+  connections with every book synced in about 5 s
+- **Dashboard**: the API reads which markets the service selected
+  (`markets.is_monitored`, new migration) - "50 spot / 50 perp" - instead of
+  counting configuration, and shows `unknown` rather than a guess when the
+  database cannot be read
+- **Tests**: 474 backend (from 425), 9 of them opt-in live; 10 frontend
+
+### What checking reality changed
+
+1. **Staleness had to be split in two.** At 100 markets the Phase 3 rule - no
+   message for 2 s means stale - fired 924 STALE events in 3.5 minutes:
+   mid-cap spot markets routinely go several seconds without a message, because
+   Binance pushes only changes. Now a *connection* silent for 2 s makes every
+   market on it stale, and a *market* is stale on its own only after 30 s of
+   silence (its stream may have died). The same markets afterwards: no STALE
+   events at all.
+2. **Published depth is too shallow to measure liquidity on BTC.** 20 levels of
+   BTC spot span 0.7 bps and 1000 span 33 bps, while 20 levels of LTC already
+   span 37 bps. Liquidity therefore comes from the full local book with an
+   explicit completeness flag, not from the top of book.
+3. **Storage would have reached 17 GB a week.** A `market_data` row costs about
+   290 bytes with its indexes; at Phase 3's once-a-second sampling, 100 markets
+   write 2.5 GB a day. Sampling is now every 5 s (about 500 MB a day) and the
+   API's freshness window is 15 s.
+4. **Futures quoted in multiples of the coin do not pair.** `1000PEPEUSDT`
+   against `PEPEUSDT` differs by 1000x; exact-symbol matching leaves those nine
+   contracts out rather than inventing a basis.
+5. **Binance lists a symbol in Chinese characters** (`牛来USDT`, ranked 7th). Its
+   streams behave normally, so it is monitored; the terminal pads by display
+   width so it cannot break the table's alignment.
+
+### First live observation
+
+2026-09-11, 100 markets:
+
+```
+top 50 of 447 spot/perpetual pairs by weaker-leg 24h volume
+excluded: 295 without a USDT perpetual, 214 under 1M USDT on the weaker leg,
+          90 not trading, 1 stablecoin
+100/100 fresh, 3/3 connections, 100/100 books synced, 0 invalid messages
+median spread 1.74 bps; 34.4B USDT of 24h volume across the monitored markets
+BTCUSDT spot: 8.59M bid / 7.31M ask within ±10 bps; a 10K order slips 0.0 bps
+latency p95 about 50 ms on spot, about 200 ms on perpetual quotes
+CPU 22-35% of one core
+```
+
+### Limits
+
+- Monitoring statistics live in memory; only sampled quotes and events are
+  stored. The dashboard phases decide what to expose.
+- The ranking is taken once at start; restart the service to re-rank.
+- Perpetual quote latency p95 runs about four times spot's. Network, venue
+  batching and local load are all candidates; Phase 16 measures before
+  guessing.
+
+## Phase 5 — next
+
+Strategy framework and the first spot/perpetual basis strategy. Strategies
+consume `MarketSnapshot` and `MarketMetrics` only - never the WebSocket layer,
+the database or the dashboard. See [strategy.md](strategy.md).

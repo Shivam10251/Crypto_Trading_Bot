@@ -14,7 +14,7 @@ const STATUS: SystemStatus = {
   monitored_perpetual_markets: 1,
   components: [
     { name: "API", status: "HEALTHY", detail: "serving requests" },
-    { name: "Market Data", status: "OFFLINE", detail: "not implemented until Phase 3" },
+    { name: "Market Data", status: "OFFLINE", detail: "no markets selected yet" },
   ],
   server_time: "2026-09-11T06:00:00Z",
 };
@@ -42,6 +42,14 @@ describe("App", () => {
     expect(screen.getByText("1 spot / 1 perp")).toBeInTheDocument();
   });
 
+  it("says unknown when the backend cannot count monitored markets", async () => {
+    stubStatus({ ...STATUS, monitored_spot_markets: null, monitored_perpetual_markets: null });
+    render(<App />);
+
+    expect(await screen.findByText("unknown")).toBeInTheDocument();
+    expect(screen.queryByText(/spot \//)).not.toBeInTheDocument();
+  });
+
   it("shows live trading as disabled unless the backend says otherwise", async () => {
     stubStatus(STATUS);
     render(<App />);
@@ -55,7 +63,7 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByText("Market Data")).toBeInTheDocument();
-    expect(screen.getByText("not implemented until Phase 3")).toBeInTheDocument();
+    expect(screen.getByText("no markets selected yet")).toBeInTheDocument();
     expect(screen.getAllByRole("img", { name: "offline" })).toHaveLength(1);
     expect(screen.getAllByRole("img", { name: "healthy" })).toHaveLength(1);
   });
