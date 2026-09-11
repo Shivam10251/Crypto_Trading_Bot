@@ -11,21 +11,25 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phases 5 and 7 complete** — foundation, data model, the
-exchange abstraction, a real-time market-data engine, market monitoring of the
-50 most liquid spot/perpetual pairs, the strategy framework with the first
-spot/perpetual basis strategy, and the research record: every opportunity it
-detects is stored in PostgreSQL, profitable or not. `make market-data` streams
-those markets, shows what the strategy concludes about each one with every cost
-itemised, and records it. Detection only — nothing is executed before Phase 8.
+Current state: **Phases 0–7 complete** — foundation, data model, the exchange
+abstraction, a real-time market-data engine, market monitoring of the 50 most
+liquid spot/perpetual pairs, the strategy framework with the first spot/perpetual
+basis strategy, the transaction cost model, and the research record: every
+opportunity detected is stored in PostgreSQL, profitable or not. `make
+market-data` streams those markets, shows what the strategy concludes about
+each one with every cost itemised, and records it. Detection only — nothing is
+executed before Phase 8.
 
-Measured live on 2026-09-11 and queried back out of the database: across 340
-recorded opportunities the average gross basis was 13.0 bps against 30.0 bps of
-round-trip taker fees and 16.3 bps of slippage — an average **net edge of
--34 bps**, and **nothing tradeable**. Of the 23 that did survive costs, 22
-required selling spot, which a cash account cannot do. The basis persists for a
-median of 8 seconds, far longer than the 75 ms quote latency: it is not too
-fast to catch, it is too small to pay for. See
+**The finding so far.** Across 340 recorded opportunities the average gross
+basis was 13.0 bps against 30.0 bps of round-trip taker fees and 16.3 bps of
+slippage — an average **net edge of -34 bps**, and **nothing tradeable**.
+Re-costing that record under the cheapest fee structure available (BNB
+discount, maker on both legs) lifts the mean to -23 bps and makes 29
+opportunities clear costs — **all 29 of which require selling spot short**,
+which a cash account cannot do. Cost is not what blocks this strategy: the
+basis is nearly always in the unreachable direction. The basis itself persists
+for a median of 8 seconds against 75 ms quote latency, so it is not too fast to
+catch — it is too small to pay for, and when it is not, it is out of reach. See
 [docs/development-phases.md](docs/development-phases.md).
 
 ---
@@ -70,7 +74,7 @@ subsystems that later phases build are shown as `OFFLINE`, never faked.
 Exchange and Market Data turn `HEALTHY` while `make market-data` is running.
 
 A `Makefile` wraps these commands: `make up`, `make migrate`, `make api`,
-`make web`, `make market-data`, `make test`, `make check`.
+`make web`, `make market-data`, `make recost`, `make test`, `make check`.
 
 > The database password in `.env` must match the one PostgreSQL was first
 > initialised with. If you change it later, reset the volume:
@@ -89,7 +93,7 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 578 tests (14 live, opt-in)
+cd backend  && uv run pytest                # 604 tests (14 live, opt-in)
 cd frontend && pnpm test                    # 10 tests
 make check                                  # lint + types + tests
 ```

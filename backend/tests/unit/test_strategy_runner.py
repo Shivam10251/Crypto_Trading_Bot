@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -12,7 +12,7 @@ from trading_bot.core.config import CostsConfig, SpotPerpBasisConfig, StrategyCo
 from trading_bot.exchange.models import MarketRef
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.models import RejectionReason
 from trading_bot.strategy.registry import UnknownStrategyError, build_strategies
 from trading_bot.strategy.runner import StrategyRunner
@@ -22,9 +22,7 @@ FREE = CostsConfig(spot_taker_fee_bps=0.0, perp_taker_fee_bps=0.0, safety_buffer
 
 
 def runner(costs: CostsConfig = FREE, *, funding_interval: int | None = 8) -> StrategyRunner:
-    context = StrategyContext(
-        cost_model=ConfiguredCostModel(costs, funding_horizon=timedelta(hours=1))
-    )
+    context = StrategyContext(cost_model=TransactionCostModel(costs))
     instance = StrategyRunner(
         [SpotPerpBasisStrategy(SpotPerpBasisConfig())], context, clock=lambda: NOW
     )

@@ -15,6 +15,8 @@ from trading_bot.db.retention import purge_expired
 from trading_bot.db.session import dispose_engine, init_engine, session_scope
 from trading_bot.exchange.errors import ExchangeError
 from trading_bot.marketdata.service import run_service
+from trading_bot.opportunities.recost import recost
+from trading_bot.strategy.fees import FeeSchedule, OrderRole
 
 
 def run_api() -> None:
@@ -40,6 +42,34 @@ def run_market_data() -> None:
         # A mistyped symbol or an unreachable venue at startup: say so plainly.
         get_logger(__name__).error("market_data.startup_failed", error=str(exc))
         raise SystemExit(1) from exc
+
+
+def run_recost() -> None:
+    """Re-price stored opportunities under the current fee schedule.
+
+    Reports; never rewrites. A stored row is what the strategy believed at the
+    time, and overwriting it would destroy the only record of that.
+    """
+    settings = get_settings()
+    configure_logging(settings.logging)
+    logger = get_logger(__name__)
+
+    async def _recost() -> None:
+        init_engine(settings.database)
+        try:
+            async with session_scope() as session:
+                report = await recost(
+                    session,
+                    FeeSchedule.from_config(settings.costs),
+                    entry_role=OrderRole(settings.costs.entry_role.upper()),
+                    exit_role=OrderRole(settings.costs.exit_role.upper()),
+                )
+        finally:
+            await dispose_engine()
+        print(report.describe())
+        logger.info("recost.completed", opportunities=report.total)
+
+    asyncio.run(_recost())
 
 
 def run_retention_purge() -> None:

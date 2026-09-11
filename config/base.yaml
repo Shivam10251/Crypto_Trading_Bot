@@ -130,9 +130,6 @@ strategy:
     max_data_age_ms: 2000
     max_latency_ms: 500
     signal_ttl_ms: 500
-    # Assumed holding period for the perpetual leg, used to charge funding.
-    # Over minutes funding is negligible beside fees; over days it dominates.
-    funding_horizon_minutes: 60
     # Bulk funding poll: weight 10 however many markets are monitored.
     funding_refresh_seconds: 60
 
@@ -149,11 +146,31 @@ opportunities:
   min_duration_ms: 0
 
 costs:
-  # Binance spot taker fee and USDⓈ-M perp taker fee, in basis points.
+  # Published binance.com VIP 0 rates, in basis points. These follow the ACCOUNT
+  # tier, not the venue, and Binance only reports the real ones behind an
+  # authenticated endpoint - so they are configuration, and a venue that does
+  # publish them overrides these.
+  # Note spot maker == spot taker: resting a limit order on the spot leg saves
+  # nothing. Only the perpetual leg rewards patience.
+  spot_maker_fee_bps: 10.0
   spot_taker_fee_bps: 10.0
+  perp_maker_fee_bps: 2.0
   perp_taker_fee_bps: 5.0
+  # Paying fees in BNB discounts them - by different amounts on each leg.
+  pay_fees_in_bnb: false
+  bnb_discount_spot_pct: 25.0
+  bnb_discount_futures_pct: 10.0
+  # How the legs are assumed to fill. "maker" charges the cheaper rate and
+  # assumes a resting order was hit, which Phase 8 has to earn rather than
+  # assume - so taker on both sides is the honest default.
+  entry_role: "taker"
+  exit_role: "taker"
   # Extra margin subtracted from every edge so gross spread is never traded on.
   safety_buffer_bps: 2.0
+  # Assumed holding period for the perpetual leg. Funding settles at fixed
+  # times, so this decides how many settlements a position actually crosses -
+  # not a fraction of one.
+  funding_horizon_minutes: 60
 
 risk:
   max_order_notional_usd: 1000.0

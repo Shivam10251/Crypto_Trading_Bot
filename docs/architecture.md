@@ -33,7 +33,8 @@ Binance WebSocket / REST        (Phase 3)
    Strategy  (spot vs perp)     (Phase 5)  detect → calculate edge → validate
             │
             ▼
-   Transaction Cost Model       (Phase 6)  fees, slippage, funding, buffer
+   Transaction Cost Model       (Phase 6)  fee schedule, both-way slippage,
+            │                              funding at settlements crossed
             │                              NET EDGE = gross − all costs
             ▼
    Opportunity Engine           (Phase 7)  every opportunity, as an episode
@@ -110,12 +111,11 @@ Built: configuration, logging, database layer with the full 13-table data
 model and migrations, retention, the exchange abstraction with a Binance
 market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
 service, configurable market selection and per-market monitoring, the strategy
-framework with the spot/perpetual basis strategy and a provisional cost model,
+framework with the spot/perpetual basis strategy, the transaction cost model,
 the opportunity engine recording every detection to PostgreSQL, API skeleton,
 health and system-status endpoints, frontend shell, test tooling.
 
-Not built: the real cost model (Phase 6), execution, risk engine, portfolio,
-dashboard. The system-status endpoint reports those subsystems as `OFFLINE`
+Not built: execution (Phase 8), risk engine, portfolio, dashboard. The system-status endpoint reports those subsystems as `OFFLINE`
 with the phase that will implement them.
 
 ### The exchange boundary
@@ -190,10 +190,11 @@ EvaluatedOpportunity  - the signal, or the reason there is none
 
 Every opportunity is priced and kept, including the rejected ones: they are the
 research dataset, and a list of zero opportunities must be distinguishable from
-a broken feed. `CostModel` is an interface; Phase 5 ships a provisional
-implementation that measures slippage from the real book and funding from the
-venue's live rate and interval, and refuses to price what it cannot estimate.
-Phase 6 replaces the implementation, not the interface.
+a broken feed. `CostModel` is an interface, and Phase 6 replaced the implementation behind it
+without changing it. Fees come from the published schedule per instrument class
+and side of the book; slippage is walked in both directions against the real
+depth; funding is charged per settlement actually crossed, not accrued
+continuously. What cannot be estimated is refused rather than guessed.
 
 ### The research record
 

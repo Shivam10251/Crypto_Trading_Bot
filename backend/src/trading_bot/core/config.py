@@ -293,9 +293,6 @@ class SpotPerpBasisConfig(ConfigSection):
     max_latency_ms: int = Field(default=500, gt=0)
     # A signal acted on after this point is stale by definition.
     signal_ttl_ms: int = Field(default=500, gt=0)
-    # How long the perpetual leg is assumed to be held, for charging funding.
-    # Over minutes funding is negligible beside fees; over days it dominates.
-    funding_horizon_minutes: float = Field(default=60.0, gt=0)
     # Funding rates move on the venue's schedule, not ours; polling the bulk
     # endpoint costs weight 10 however many markets are monitored.
     funding_refresh_seconds: float = Field(default=60.0, gt=0)
@@ -326,9 +323,41 @@ class OpportunitiesConfig(ConfigSection):
 
 
 class CostsConfig(ConfigSection):
+    """The venue's fee schedule and what the cost model assumes about execution.
+
+    Defaults are the published binance.com VIP 0 rates. They are per account,
+    not per venue, and Binance only exposes the real ones behind an
+    authenticated endpoint - so they are configuration, and a venue that does
+    report them overrides these.
+
+    Note that spot maker and taker are the same rate: resting a limit order on
+    the spot leg saves nothing. Only the perpetual leg rewards patience.
+    """
+
+    spot_maker_fee_bps: float = Field(default=10.0, ge=0)
     spot_taker_fee_bps: float = Field(default=10.0, ge=0)
+    perp_maker_fee_bps: float = Field(default=2.0, ge=0)
     perp_taker_fee_bps: float = Field(default=5.0, ge=0)
+
+    # Paying fees in BNB discounts them, by different amounts on each leg.
+    pay_fees_in_bnb: bool = False
+    bnb_discount_spot_pct: float = Field(default=25.0, ge=0, le=100)
+    bnb_discount_futures_pct: float = Field(default=10.0, ge=0, le=100)
+
+    # How the legs are assumed to fill. "maker" charges the cheaper rate and
+    # assumes a resting order was hit - which Phase 8 has to earn, not assume.
+    # Taker on both sides is the honest default: it is what the strategy's
+    # book-walking prices already describe.
+    entry_role: Literal["maker", "taker"] = "taker"
+    exit_role: Literal["maker", "taker"] = "taker"
+
+    # Extra margin subtracted from every edge so gross spread is never traded on.
     safety_buffer_bps: float = Field(default=2.0, ge=0)
+
+    # How long the perpetual leg is assumed to be held, for charging funding.
+    # Funding settles at fixed times, so this decides how many settlements a
+    # position actually crosses - not a fraction of one.
+    funding_horizon_minutes: float = Field(default=60.0, gt=0)
 
 
 class RiskConfig(ConfigSection):

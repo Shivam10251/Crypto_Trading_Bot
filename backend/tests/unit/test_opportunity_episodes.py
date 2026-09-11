@@ -10,7 +10,7 @@ from trading_bot.exchange.models import MarketRef
 from trading_bot.opportunities.episodes import EpisodeTracker
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.models import RejectionReason
 from trading_bot.strategy.runner import StrategyRunner
 
@@ -38,7 +38,7 @@ def make_runner(costs: CostsConfig = FREE) -> tuple[StrategyRunner, Clock]:
     clock = Clock()
     runner = StrategyRunner(
         [SpotPerpBasisStrategy(SpotPerpBasisConfig())],
-        StrategyContext(cost_model=ConfiguredCostModel(costs, funding_horizon=timedelta(hours=1))),
+        StrategyContext(cost_model=TransactionCostModel(costs)),
         clock=clock,
     )
     runner.set_funding({PERP: funding_info(interval=8)})

@@ -44,12 +44,19 @@ class Leg:
     reference_price: Decimal
     executable_price: Decimal
     quantity: Decimal
+    # What unwinding this leg would cost against the book we can see now: a leg
+    # bought is sold back into the bids, a leg sold is bought back from the
+    # asks. None when the book could not fill the unwind, and the cost model
+    # then falls back to charging the entry again.
+    exit_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError(f"leg quantity must be positive for {self.ref}")
         if self.reference_price <= 0 or self.executable_price <= 0:
             raise ValueError(f"leg prices must be positive for {self.ref}")
+        if self.exit_price is not None and self.exit_price <= 0:
+            raise ValueError(f"leg exit price must be positive for {self.ref}")
 
     @property
     def notional(self) -> Decimal:
@@ -76,6 +83,29 @@ class Leg:
     @property
     def slippage_bps(self) -> Decimal:
         return to_bps(self.slippage, self.reference_price)
+
+    @property
+    def exit_slippage(self) -> Decimal | None:
+        """Per-unit cost of unwinding, measured rather than assumed.
+
+        The exit crosses the spread the other way - a bought leg is sold into
+        the bids - so it is a different walk of the same book, not a copy of
+        the entry. ``None`` when the book could not fill the unwind.
+        """
+        if self.exit_price is None:
+            return None
+        # Unwinding reverses the side: a BUY leg exits by selling.
+        signed = (
+            self.reference_price - self.exit_price
+            if self.side is Side.BUY
+            else self.exit_price - self.reference_price
+        )
+        return max(signed, Decimal(0))
+
+    @property
+    def exit_slippage_usd(self) -> Decimal | None:
+        exit_slippage = self.exit_slippage
+        return None if exit_slippage is None else exit_slippage * self.quantity
 
 
 @dataclass(frozen=True, slots=True)

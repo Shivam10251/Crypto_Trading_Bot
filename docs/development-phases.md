@@ -16,9 +16,9 @@ was never recorded is gone for good.
 | 3 | Real-time market data engine | **Complete** |
 | 4 | Market monitoring | **Complete** |
 | 5 | Strategy framework + spot/perp basis strategy | **Complete** |
-| 6 | Transaction cost model | Next |
+| 6 | Transaction cost model | **Complete** |
 | 7 | Opportunity engine | **Complete** |
-| 8 | Paper execution engine | Not started |
+| 8 | Paper execution engine | Next |
 | 9 | Risk engine | Not started |
 | 10 | Portfolio and P&L | Not started |
 | 11 | Backtest / replay engine | Not started |
@@ -522,10 +522,119 @@ is now the second-largest cost, over half the size of fees.
   unreachable, then drops the oldest with a warning rather than growing without
   bound.
 
-## Phase 6 — next
+## Phase 6 — delivered
 
-The transaction cost model: real fee tiers, the BNB discount, maker versus
-taker, depth-aware slippage and funding accrual, replacing the provisional
-implementation behind the `CostModel` interface Phase 5 defined. The stored
-opportunities give it something to validate against, and can be re-costed once
-it lands. See [execution.md](execution.md).
+The real cost model, behind the `CostModel` interface Phase 5 defined - the
+interface did not have to change.
+
+- **Fees follow the published schedule** (`strategy/fees.py`): maker and taker
+  per instrument class, with the BNB discount applied at the different rates
+  each leg receives. Rates follow the *account's* VIP tier, which Binance only
+  reports behind an authenticated endpoint, so they are configuration - and a
+  venue that does publish them overrides the configured guess
+- **Entry and exit roles are separate configuration**, defaulting to taker on
+  both. Charging the maker rate assumes a resting order was hit, which is an
+  execution question Phase 8 has to answer rather than a discount the cost
+  model may quietly award itself
+- **Funding is discrete** (`settlements_crossed`): it settles at fixed times,
+  so a position pays only if it is held across one, and the count comes from
+  the venue's own `nextFundingTime` and interval
+- **The exit is walked, not doubled**: unwinding crosses the spread the other
+  way - a bought leg is sold into the bids - so it is a different walk of the
+  same book. Phase 5 charged the entry's slippage twice; the strategy now
+  prices both sides, falling back to the old assumption only when depth cannot
+  fill the unwind
+- **Stored opportunities can be re-costed** (`opportunities/recost.py`,
+  `trading-bot-recost`): the Phase 7 premise made good. It reports and never
+  rewrites - a stored row is what the strategy believed at the time
+- **Tests**: 604 backend (from 578), 14 opt-in live; 10 frontend
+
+### What checking reality changed
+
+1. **Spot maker equals spot taker, so limit orders save nothing there.** Both
+   are 0.100% at VIP 0 on binance.com. Only the perpetual leg rewards patience
+   (0.020% maker against 0.050% taker). The "use maker orders" idea that looked
+   promising after Phase 5 is worth about 6 bps of a 30 bps round trip, all of
+   it on one leg.
+2. **That puts a hard floor on fees, and the floor is above the basis.**
+   Cheapest possible round trip - BNB discount, maker on both legs, entry and
+   exit - is **18.6 bps**, against an average gross basis of 13.0 bps. No fee
+   arrangement available to this account makes the average opportunity viable,
+   before slippage is charged at all.
+3. **Funding was being charged when none would be paid.** Phase 5 accrued it
+   continuously: `horizon / interval` of a settlement. Measured at 16:51 UTC, a
+   60-minute BTC hold crosses **zero** settlements while the continuous model
+   charges 0.125 of one. It is a payment at a fixed time, not a rate - a
+   position that opens and closes between two settlements pays nothing.
+4. **Doubling the entry overstated slippage.** With the exit walked against the
+   real opposite side of the book, IOSTUSDT's round-trip slippage fell from
+   44.13 bps to 30.52 bps in the same market. Doubling was a conservative
+   guess; the book had the answer all along.
+5. **No fee endpoint is public.** Both `/sapi/v1/asset/tradeFee` and
+   `/fapi/v1/commissionRate` require credentials, and `exchangeInfo` carries
+   only commission *precision*, not rates. Fees are configuration by necessity,
+   which is why the defaults are documented with their source.
+
+### First live observation
+
+The same 50 pairs, with the new model:
+
+```
+costs: spot 10/10 perp 2/5 bps maker/taker; taker in / taker out,
+       slippage walked both ways, funding at settlements crossed in 1h, buffer 2 bps
+
+PAIR        DIR         BASIS bps   FEES    SLIP    FUND   BUF   NET bps  VERDICT
+IOSTUSDT    sell spot       84.37  29.91   30.52   -9.43  2.00     31.36  spot short unavailable
+VTHOUSDT    sell spot       47.78  29.95   22.70    0.00  2.00     -6.86  below min edge
+TRXUSDT     sell spot       11.16  29.99    3.27    0.00  2.00    -24.11  below min edge
+XAUTUSDT    sell spot        5.50  29.99    0.52    0.00  2.00    -27.02  below min edge
+```
+
+Most markets now show **zero** funding rather than a smeared fraction: their
+next settlement falls outside the one-hour hold. IOST, which settles hourly,
+still pays - and receives 9.43 bps for it.
+
+### Re-costing the record
+
+`trading-bot-recost` re-priced all 340 stored opportunities. Under the same
+schedule it reproduces the stored numbers to within 0.02 bps, which is the
+check that it is arithmetic rather than a new opinion. Under the cheapest
+schedule available:
+
+```
+re-costed 340 stored opportunities under: spot 7.5/7.5 perp 1.8/4.5 bps (BNB discount applied)
+  mean net edge  -34.41 bps -> -23.03 bps
+  profitable     23 -> 29
+  6 opportunities newly clear costs, best VTHOUSDT at +10.10 bps
+```
+
+**And all 29 of them require selling spot short.** Not one is reachable from a
+cash account. That is the Phase 6 conclusion, and it is a larger finding than
+the cost model itself: **cost is not what blocks this strategy.** Perfect fee
+optimisation moves the mean edge from -34 to -23 bps and converts nothing
+tradeable into nothing tradeable. The binding constraint is the inability to
+short spot, because the basis is almost always in that direction - 47 of 48
+pairs in one frame had the perpetual at a discount.
+
+### Limits
+
+- The VIP tier is configuration. With credentials the account's real rates
+  could be read and would override it; without them the published VIP 0
+  schedule is the assumption.
+- The exit is priced against *today's* book. By the time a basis converges the
+  book will have moved - this is the best estimate available before Phase 8
+  measures real round trips.
+- The current funding rate is assumed to hold for each settlement crossed. Over
+  an hour that is reasonable; over a day it is the weakest assumption here.
+- Charging a maker rate assumes the resting order was hit. Nothing in the cost
+  model can know that, which is why the default is taker on both sides.
+- Re-costing can re-derive fees only. Slippage needed a book that retention
+  deletes after three days, and funding needed the schedule as it was; both are
+  carried through unchanged.
+
+## Phase 8 — next
+
+Paper execution: the simulator that turns a signal into fills, modelling
+spread, depth, latency, partial fills and rejection. It is also what settles
+the two assumptions Phase 6 had to leave open - whether a maker order fills,
+and what a round trip really costs. See [execution.md](execution.md).

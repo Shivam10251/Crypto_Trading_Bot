@@ -34,7 +34,7 @@ from trading_bot.marketdata.funding import FundingTracker
 from trading_bot.monitoring.universe import select_universe
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.runner import StrategyRunner
 
 pytestmark = pytest.mark.skipif(
@@ -99,7 +99,7 @@ class TestLiveBasis:
         await tracker.refresh()
 
         context = StrategyContext(
-            cost_model=ConfiguredCostModel(CostsConfig(), funding_horizon=timedelta(hours=1)),
+            cost_model=TransactionCostModel(CostsConfig()),
             specs={spec.ref: spec for spec in universe.specs},
         )
         runner = StrategyRunner([SpotPerpBasisStrategy(SpotPerpBasisConfig())], context)

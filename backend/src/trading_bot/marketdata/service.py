@@ -15,7 +15,7 @@ import signal
 import sys
 from collections import deque
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from trading_bot.core.config import Settings
@@ -37,7 +37,7 @@ from trading_bot.monitoring.universe import select_universe
 from trading_bot.opportunities.episodes import EpisodeTracker
 from trading_bot.opportunities.recorder import OpportunityRecorder
 from trading_bot.strategy.base import StrategyContext
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.registry import build_strategies
 from trading_bot.strategy.runner import StrategyRunner
 
@@ -253,11 +253,7 @@ def _build_strategy_layer(
     """
     if not settings.strategy.evaluate or not settings.strategy.enabled:
         return None
-    basis = settings.strategy.spot_perp_basis
-    cost_model = ConfiguredCostModel(
-        settings.costs,
-        funding_horizon=timedelta(minutes=basis.funding_horizon_minutes),
-    )
+    cost_model = TransactionCostModel(settings.costs)
     by_ref = {spec.ref: spec for spec in specs}
     runner = StrategyRunner(
         build_strategies(settings.strategy),

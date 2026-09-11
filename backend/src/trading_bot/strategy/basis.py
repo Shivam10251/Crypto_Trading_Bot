@@ -264,6 +264,9 @@ class SpotPerpBasisStrategy(Strategy):
             reference_price=_mid(buy_view),
             executable_price=buy_price,
             quantity=quantity,
+            # Unwinding sells this leg back into the bids - the other side of
+            # the same book, so the exit is measured rather than assumed.
+            exit_price=_unwind_price(buy_book, Side.SELL, quantity),
         )
         sell_leg = Leg(
             ref=sell_view.ref,
@@ -271,6 +274,7 @@ class SpotPerpBasisStrategy(Strategy):
             reference_price=_mid(sell_view),
             executable_price=sell_price,
             quantity=quantity,
+            exit_price=_unwind_price(sell_book, Side.BUY, quantity),
         )
         gross_per_unit = abs(basis)
         direction = Side.BUY if perp_rich else Side.SELL
@@ -326,6 +330,17 @@ def _fillable(book: OrderBook, side: Side, quantity: Decimal) -> Decimal:
     """How much of ``quantity`` this book can actually absorb."""
     _, filled = book.fill_price(side, quantity)
     return filled
+
+
+def _unwind_price(book: OrderBook, side: Side, quantity: Decimal) -> Decimal | None:
+    """What closing the position would fetch, or ``None`` if depth runs out.
+
+    Priced against the book we can see now. By the time a basis converges the
+    book will have moved, but a measured estimate of the other side beats
+    assuming the exit costs whatever the entry did.
+    """
+    price, filled = book.fill_price(side, quantity)
+    return price if filled >= quantity else None
 
 
 def _pair_liquidity(pair: BasisPair) -> Decimal | None:

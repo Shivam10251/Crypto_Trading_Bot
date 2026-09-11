@@ -18,7 +18,7 @@ from trading_bot.exchange.models import (
 from trading_bot.marketdata.models import BookLiquidity, BookStatus, FeedStatus, MarketSnapshot
 from trading_bot.strategy.base import MarketView, StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.models import RejectionReason
 
 NOW = datetime(2026, 9, 11, 16, 30, tzinfo=UTC)
@@ -93,13 +93,20 @@ def view(
     return MarketView(snapshot=snapshot, spec=spec, funding=funding)
 
 
-def funding_info(rate: str = "0", interval: int | None = 8) -> FundingInfo:
+def funding_info(
+    rate: str = "0",
+    interval: int | None = 8,
+    *,
+    next_at: datetime | None = None,
+) -> FundingInfo:
+    """Funding state. The default settlement is outside a one-hour hold, so no
+    funding is charged unless a test deliberately places one inside it."""
     return FundingInfo(
         ref=PERP,
         mark_price=Decimal(100),
         index_price=Decimal(100),
         last_funding_rate=Decimal(rate),
-        next_funding_time=NOW + timedelta(hours=4),
+        next_funding_time=next_at or NOW + timedelta(hours=4),
         local_timestamp=NOW,
         funding_interval_hours=interval,
     )
@@ -113,7 +120,7 @@ def strategy(
     instance = SpotPerpBasisStrategy(config)
     instance.initialize(
         StrategyContext(
-            cost_model=ConfiguredCostModel(costs, funding_horizon=timedelta(hours=1)),
+            cost_model=TransactionCostModel(costs),
             specs=specs or {},
         )
     )

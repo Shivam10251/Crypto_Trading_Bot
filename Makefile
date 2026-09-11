@@ -1,7 +1,7 @@
 # Thin wrappers around the underlying tools. Every target is a command you can
 # also run by hand - nothing here hides behaviour.
 .DEFAULT_GOAL := help
-.PHONY: help install up down logs api web market-data test test-backend test-frontend lint typecheck check migrate revision clean
+.PHONY: help install up down logs api web market-data recost test test-backend test-frontend lint typecheck check migrate revision clean
 
 BACKEND  := backend
 FRONTEND := frontend
@@ -30,6 +30,9 @@ web: ## Run the frontend dev server
 
 market-data: ## Stream live Binance market data (Ctrl-C to stop)
 	cd $(BACKEND) && uv run trading-bot-market-data
+
+recost: ## Re-price stored opportunities under the current fee schedule
+	cd $(BACKEND) && uv run trading-bot-recost
 
 test: test-backend test-frontend ## Run all tests
 

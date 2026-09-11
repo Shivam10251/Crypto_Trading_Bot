@@ -25,7 +25,7 @@ from trading_bot.opportunities.episodes import EpisodeTracker
 from trading_bot.opportunities.recorder import OpportunityRecorder
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.runner import StrategyRunner
 
 pytestmark = pytest.mark.requires_postgres
@@ -70,7 +70,7 @@ def make_runner(costs: CostsConfig = FREE) -> tuple[StrategyRunner, Clock]:
     clock = Clock()
     runner = StrategyRunner(
         [SpotPerpBasisStrategy(SpotPerpBasisConfig())],
-        StrategyContext(cost_model=ConfiguredCostModel(costs, funding_horizon=timedelta(hours=1))),
+        StrategyContext(cost_model=TransactionCostModel(costs)),
         clock=clock,
     )
     runner.set_funding({PERP: funding_info(interval=8)})
@@ -138,9 +138,15 @@ class TestOpportunityRows:
     async def test_a_funding_credit_is_stored_as_a_negative_cost(
         self, db: AsyncSession, market_ids: dict[MarketRef, int]
     ) -> None:
-        """A short perpetual receives funding; the schema allows it to be signed."""
+        """A short perpetual receives funding; the schema allows it to be signed.
+
+        The settlement is placed inside the holding period on purpose: funding
+        is discrete, so a hold that crosses none is charged nothing.
+        """
         runner, clock = make_runner()
-        runner.set_funding({PERP: funding_info(rate="0.0001", interval=8)})
+        runner.set_funding(
+            {PERP: funding_info(rate="0.0001", interval=8, next_at=NOW + timedelta(minutes=10))}
+        )
         tracker = EpisodeTracker()
         recorder = OpportunityRecorder(market_ids, session_factory(db), interval_seconds=1)
         recorder.record(tracker.update(runner.evaluate(RICH), clock.now))

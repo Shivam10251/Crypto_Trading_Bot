@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from tests.unit.test_spot_perp_basis import PERP, SPOT, funding_info, view
 from trading_bot.core.config import CostsConfig, SpotPerpBasisConfig
@@ -10,7 +10,7 @@ from trading_bot.marketdata.models import BookStatus
 from trading_bot.monitoring.strategy_view import render_evaluation
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
-from trading_bot.strategy.costs import ConfiguredCostModel
+from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.runner import StrategyRunner
 
 NOW = datetime(2026, 9, 11, 16, 30, tzinfo=UTC)
@@ -18,9 +18,7 @@ FREE = CostsConfig(spot_taker_fee_bps=0.0, perp_taker_fee_bps=0.0, safety_buffer
 
 
 def evaluate(costs: CostsConfig, snapshots: list[object], interval: int | None = 8):  # type: ignore[no-untyped-def]
-    context = StrategyContext(
-        cost_model=ConfiguredCostModel(costs, funding_horizon=timedelta(hours=1))
-    )
+    context = StrategyContext(cost_model=TransactionCostModel(costs))
     runner = StrategyRunner(
         [SpotPerpBasisStrategy(SpotPerpBasisConfig())], context, clock=lambda: NOW
     )
@@ -57,9 +55,9 @@ def test_a_rejected_row_names_the_reason() -> None:
 
 def test_the_cost_assumptions_are_printed() -> None:
     """The operator should not have to read the source to know what was charged."""
-    model = ConfiguredCostModel(CostsConfig(), funding_horizon=timedelta(hours=1))
+    model = TransactionCostModel(CostsConfig())
     frame = render_evaluation(evaluate(CostsConfig(), TRADEABLE), cost_summary=model.describe())
-    assert "taker" in frame and "funding over" in frame
+    assert "maker/taker" in frame and "settlements crossed" in frame
 
 
 def test_an_empty_result_explains_why_rather_than_showing_nothing() -> None:
@@ -88,9 +86,7 @@ def test_rows_are_ranked_by_net_edge() -> None:
 
     eth_spot = MarketRef(SPOT.venue, "ETHUSDT", SPOT.market_type)
     eth_perp = MarketRef(PERP.venue, "ETHUSDT", PERP.market_type)
-    context = StrategyContext(
-        cost_model=ConfiguredCostModel(FREE, funding_horizon=timedelta(hours=1))
-    )
+    context = StrategyContext(cost_model=TransactionCostModel(FREE))
     runner = StrategyRunner(
         [SpotPerpBasisStrategy(SpotPerpBasisConfig())], context, clock=lambda: NOW
     )
