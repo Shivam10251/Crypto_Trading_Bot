@@ -9,6 +9,7 @@ so a row explains its own verdict.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 
 from trading_bot.monitoring.display import compact, display_width
@@ -117,12 +118,33 @@ def _stats_line(stats: DetectionStats) -> str:
     return "   ".join(parts)
 
 
+@dataclass(frozen=True, slots=True)
+class RecordingStatus:
+    """What the research record has taken so far this run."""
+
+    episodes_open: int
+    opportunities_written: int
+    signals_written: int
+    unpriced: int
+
+    def describe(self) -> str:
+        text = (
+            f"recording: {self.episodes_open} episodes open, "
+            f"{self.opportunities_written} opportunities and "
+            f"{self.signals_written} signals stored"
+        )
+        if self.unpriced:
+            text += f", {self.unpriced} unpriced and not stored"
+        return text
+
+
 def render_evaluation(
     evaluation: StrategyEvaluation,
     *,
     cost_summary: str,
     max_rows: int | None = None,
     funding_unknown: Sequence[str] = (),
+    recording: RecordingStatus | None = None,
 ) -> str:
     """One strategy's view, ranked by net edge - what survives, not what glitters."""
     ranked = sorted(
@@ -145,6 +167,8 @@ def render_evaluation(
     ]
     if evaluation.stats is not None:
         lines.append(_stats_line(evaluation.stats))
+    if recording is not None:
+        lines.append(recording.describe())
     if funding_unknown:
         shown = ", ".join(sorted(funding_unknown)[:6])
         lines.append(

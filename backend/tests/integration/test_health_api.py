@@ -63,9 +63,23 @@ class TestSystemStatus:
         statuses = {c["name"]: c for c in body["components"]}
         assert statuses["API"]["status"] == "HEALTHY"
         assert statuses["Database"]["status"] == "HEALTHY"
-        for pending in ("Strategy Engine", "Risk Engine", "Paper Execution"):
+        for pending in ("Risk Engine", "Paper Execution"):
             assert statuses[pending]["status"] == "OFFLINE"
             assert "Phase" in statuses[pending]["detail"]
+
+    async def test_strategy_is_offline_without_recorded_opportunities(
+        self, client: AsyncClient
+    ) -> None:
+        """Built, but nothing is running here - so it may not claim to be.
+
+        This fixture has no opportunities table at all, which is the same
+        answer as an empty one: the API has no evidence, so it says OFFLINE
+        and why, rather than inventing a health.
+        """
+        body = (await client.get(f"{API_PREFIX}/system-status")).json()
+        strategy = {c["name"]: c for c in body["components"]}["Strategy Engine"]
+        assert strategy["status"] == "OFFLINE"
+        assert "opportunities" in strategy["detail"]
 
     async def test_market_data_is_offline_without_live_quotes(self, client: AsyncClient) -> None:
         """Nothing streams in this test, so nothing may claim to."""

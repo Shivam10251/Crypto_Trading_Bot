@@ -36,7 +36,7 @@ Binance WebSocket / REST        (Phase 3)
    Transaction Cost Model       (Phase 6)  fees, slippage, funding, buffer
             │                              NET EDGE = gross − all costs
             ▼
-   Opportunity Engine           (Phase 7)  persist every opportunity + status
+   Opportunity Engine           (Phase 7)  every opportunity, as an episode
             │
             ▼
    Risk Engine                  (Phase 9)  APPROVED / REJECTED / PAUSED
@@ -67,6 +67,7 @@ can never reach an execution adapter without a risk decision.
 | `trading_bot.marketdata` | Live engine: connections, local books, staleness, snapshots, recorder | exchange, config, db |
 | `trading_bot.monitoring` | Market selection, per-market statistics, terminal view | marketdata, exchange, config, strategy |
 | `trading_bot.strategy` | Strategy contract, domain types, cost model, basis strategy, runner | exchange + marketdata models only |
+| `trading_bot.opportunities` | Episode tracking and the research record | strategy, db |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -97,11 +98,11 @@ Settings resolve from `config/base.yaml`, then `config/<profile>.yaml`, then
 execution flags cannot change under a running process.
 
 Two processes run today, sharing configuration and the database: the API and
-the market-data service (`make market-data`). The API cannot ask the service
-how it is doing, so it judges it by its output - which markets the service
-last selected (`markets.is_monitored`) and whether each one's newest stored
-quote is recent - rather than by assumption. A strategy
-runner joins them in a later phase.
+the market-data service (`make market-data`), which also hosts the strategy
+runner and the opportunity recorder. The API cannot ask the service how it is
+doing, so it judges it by its output - which markets the service last selected
+(`markets.is_monitored`), whether each one's newest stored quote is recent, and
+how recently an opportunity was recorded - rather than by assumption.
 
 ## Status
 
@@ -110,14 +111,12 @@ model and migrations, retention, the exchange abstraction with a Binance
 market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
 service, configurable market selection and per-market monitoring, the strategy
 framework with the spot/perpetual basis strategy and a provisional cost model,
-API skeleton, health and system-status endpoints, frontend shell, test tooling.
+the opportunity engine recording every detection to PostgreSQL, API skeleton,
+health and system-status endpoints, frontend shell, test tooling.
 
-Not built: everything from Phase 6 onward - the real cost model, opportunity
-persistence, execution, risk engine, portfolio, dashboard. The system-status
-endpoint reports those subsystems as `OFFLINE` with the phase that will
-implement them, including the Strategy Engine: it runs inside the market-data
-process and stores nothing, so the API has no output to judge it by until
-Phase 7.
+Not built: the real cost model (Phase 6), execution, risk engine, portfolio,
+dashboard. The system-status endpoint reports those subsystems as `OFFLINE`
+with the phase that will implement them.
 
 ### The exchange boundary
 
@@ -195,3 +194,26 @@ a broken feed. `CostModel` is an interface; Phase 5 ships a provisional
 implementation that measures slippage from the real book and funding from the
 venue's live rate and interval, and refuses to price what it cannot estimate.
 Phase 6 replaces the implementation, not the interface.
+
+### The research record
+
+`trading_bot.opportunities` turns evaluations into stored rows. The unit is an
+**episode** - one contiguous period during which the same strategy sees the
+same discrepancy in the same direction - not one row per evaluation: measured
+live, per-cycle rows would be 4.0M a day against 81K for episodes, almost all
+of them restating the previous second.
+
+```
+StrategyEvaluation (every second)
+        │
+        ▼
+EpisodeTracker   opens / absorbs / closes, keeping the BEST moment
+        │ closed episodes
+        ▼
+OpportunityRecorder ──▶ opportunities  (status + every gate it failed)
+                    ──▶ signals        (one row per leg)
+```
+
+An episode that could never be priced is counted and logged, never stored with
+an invented net edge. Opportunities and signals are never purged - unlike raw
+market data, they are the point of the exercise.

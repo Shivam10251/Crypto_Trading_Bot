@@ -311,6 +311,20 @@ class StrategyConfig(ConfigSection):
     evaluate_interval_ms: int = Field(default=1000, ge=100)
 
 
+class OpportunitiesConfig(ConfigSection):
+    """Persisting what the strategies detect (Phase 7)."""
+
+    persist: bool = True
+    # An opportunity is one episode - a contiguous run of the same discrepancy
+    # in the same direction - not one row per evaluation. Measured live at 50
+    # pairs: per-cycle rows would be 4.0M a day, episodes are 81K.
+    flush_interval_ms: int = Field(default=5000, ge=100)
+    # Drop episodes shorter than this. Zero records everything, which is the
+    # honest default: filtering by duration biases the dataset toward exactly
+    # the long-lived opportunities the research is trying to count.
+    min_duration_ms: int = Field(default=0, ge=0)
+
+
 class CostsConfig(ConfigSection):
     spot_taker_fee_bps: float = Field(default=10.0, ge=0)
     perp_taker_fee_bps: float = Field(default=5.0, ge=0)
@@ -379,6 +393,7 @@ class Settings(BaseSettings):
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    opportunities: OpportunitiesConfig = Field(default_factory=OpportunitiesConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)

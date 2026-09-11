@@ -25,15 +25,17 @@ from trading_bot.db.session import check_connection, dispose_engine, init_engine
 from trading_bot.exchange.base import ExchangeAdapter
 from trading_bot.exchange.binance import BinanceExchangeAdapter
 from trading_bot.exchange.errors import ExchangeError
-from trading_bot.exchange.models import MarketDataSubscription, MarketSpec
+from trading_bot.exchange.models import MarketDataSubscription, MarketRef, MarketSpec
 from trading_bot.marketdata.engine import MarketDataEngine
 from trading_bot.marketdata.funding import FundingTracker
 from trading_bot.marketdata.models import MarketDataEvent
 from trading_bot.marketdata.recorder import MarketDataRecorder, register_markets
 from trading_bot.monitoring.display import CLEAR_SCREEN, FRAME_OVERHEAD, FrameContext, render
 from trading_bot.monitoring.monitor import MarketMonitor
-from trading_bot.monitoring.strategy_view import render_evaluation
+from trading_bot.monitoring.strategy_view import RecordingStatus, render_evaluation
 from trading_bot.monitoring.universe import select_universe
+from trading_bot.opportunities.episodes import EpisodeTracker
+from trading_bot.opportunities.recorder import OpportunityRecorder
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.costs import ConfiguredCostModel
 from trading_bot.strategy.registry import build_strategies
@@ -86,13 +88,32 @@ async def run_service(
         if funding is not None:
             await _prime_funding(funding)
 
-        recorder = await _open_recorder(settings, list(universe.specs)) if config.persist else None
+        wants_database = config.persist or (
+            settings.opportunities.persist and strategies is not None
+        )
+        opened = await _open_recorders(settings, list(universe.specs)) if wants_database else None
+        recorder, market_ids = opened if opened is not None else (None, {})
+        opportunities = (
+            OpportunityRecorder(
+                market_ids,
+                session_scope,
+                interval_seconds=settings.opportunities.flush_interval_ms / 1000,
+                min_duration_ms=settings.opportunities.min_duration_ms,
+            )
+            if market_ids and settings.opportunities.persist and strategies is not None
+            else None
+        )
+        episodes = EpisodeTracker() if opportunities is not None else None
         if recorder is not None:
             engine.add_listener(recorder.record_event)
             recorder.record_event(
                 _service_event(SystemEventType.STARTUP, f"started: {universe.describe()}")
             )
             persistence = f"market_data every {config.persist_interval_ms} ms"
+            if opportunities is not None:
+                persistence += (
+                    f" + opportunities every {settings.opportunities.flush_interval_ms} ms"
+                )
         else:
             persistence = "off" if not config.persist else "OFF - database unavailable"
         context = FrameContext(
@@ -113,6 +134,10 @@ async def run_service(
                 if strategies is not None and funding is not None:
                     runner, cost_summary = strategies
                     tasks.append(asyncio.create_task(funding.run(), name="funding-tracker"))
+                    if opportunities is not None:
+                        tasks.append(
+                            asyncio.create_task(opportunities.run(), name="opportunity-recorder")
+                        )
                     tasks.append(
                         asyncio.create_task(
                             _strategy_loop(
@@ -120,6 +145,8 @@ async def run_service(
                                 monitor,
                                 engine,
                                 funding,
+                                episodes,
+                                opportunities,
                                 interval_seconds=(settings.strategy.evaluate_interval_ms / 1000),
                             ),
                             name="strategy-runner",
@@ -139,6 +166,8 @@ async def run_service(
                                 runner=runner if settings.strategy.display else None,
                                 cost_summary=cost_summary,
                                 funding=funding,
+                                episodes=episodes,
+                                opportunities=opportunities,
                             )
                         )
                     )
@@ -147,9 +176,21 @@ async def run_service(
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if opportunities is not None and episodes is not None:
+                # Episodes still running when the process stops are real
+                # observations; closing them is what keeps them in the record.
+                opportunities.record(episodes.close_all())
+                await opportunities.flush()
+                logger.info(
+                    "opportunities.recorded",
+                    opportunities=opportunities.opportunities_written,
+                    signals=opportunities.signals_written,
+                    unpriced=opportunities.unpriced,
+                )
             if recorder is not None:
                 recorder.record_event(_service_event(SystemEventType.SHUTDOWN, "stopped"))
                 await recorder.flush(engine.snapshots())
+            if recorder is not None or opportunities is not None:
                 await dispose_engine()
     logger.info("market_data.service_stopped")
 
@@ -163,8 +204,15 @@ def _service_event(event_type: SystemEventType, message: str) -> MarketDataEvent
     )
 
 
-async def _open_recorder(settings: Settings, specs: list[MarketSpec]) -> MarketDataRecorder | None:
-    """Persistence is best effort: without a database the live view still runs."""
+async def _open_recorders(
+    settings: Settings, specs: list[MarketSpec]
+) -> tuple[MarketDataRecorder | None, dict[MarketRef, int]] | None:
+    """Open the database and register the markets, or report it unavailable.
+
+    Persistence is best effort: without a database the live view and the
+    strategy still run, they simply keep no record. The market ids come back
+    because the opportunity recorder needs them to link an opportunity's legs.
+    """
     init_engine(settings.database)
     if not await check_connection():
         logger.warning(
@@ -183,11 +231,16 @@ async def _open_recorder(settings: Settings, specs: list[MarketSpec]) -> MarketD
         )
         await dispose_engine()
         return None
-    return MarketDataRecorder(
-        market_ids,
-        session_scope,
-        interval_seconds=settings.market_data.persist_interval_ms / 1000,
+    quotes = (
+        MarketDataRecorder(
+            market_ids,
+            session_scope,
+            interval_seconds=settings.market_data.persist_interval_ms / 1000,
+        )
+        if settings.market_data.persist
+        else None
     )
+    return quotes, market_ids
 
 
 def _build_strategy_layer(
@@ -231,13 +284,22 @@ async def _strategy_loop(
     monitor: MarketMonitor,
     engine: MarketDataEngine,
     funding: FundingTracker,
+    episodes: EpisodeTracker | None,
+    opportunities: OpportunityRecorder | None,
     *,
     interval_seconds: float,
 ) -> None:
-    """Evaluate every strategy against the latest snapshots, on a fixed cadence."""
+    """Evaluate every strategy against the latest snapshots, on a fixed cadence.
+
+    Episodes are tracked here rather than in the recorder so that evaluation
+    and persistence stay independent: without a database the strategy still
+    runs and still draws, it simply keeps no record.
+    """
     while True:
         runner.set_funding(funding.rates)
-        runner.evaluate(engine.snapshots(), monitor.metrics())
+        evaluations = runner.evaluate(engine.snapshots(), monitor.metrics())
+        if episodes is not None and opportunities is not None:
+            opportunities.record(episodes.update(evaluations, datetime.now(UTC)))
         await asyncio.sleep(interval_seconds)
 
 
@@ -259,12 +321,16 @@ async def _display_loop(
     runner: StrategyRunner | None = None,
     cost_summary: str = "",
     funding: FundingTracker | None = None,
+    episodes: EpisodeTracker | None = None,
+    opportunities: OpportunityRecorder | None = None,
 ) -> None:
     tty = sys.stdout.isatty()
     interval = interval_seconds if tty else max(interval_seconds, _UNATTENDED_INTERVAL_SECONDS)
     while True:
         rows = max(5, shutil.get_terminal_size().lines - FRAME_OVERHEAD) if tty else None
-        panels = _strategy_panels(runner, cost_summary, funding, max_rows=rows)
+        panels = _strategy_panels(
+            runner, cost_summary, funding, episodes, opportunities, max_rows=rows
+        )
         if panels and rows is not None:
             # The strategy panel and the market table share one screen; give
             # the markets what is left rather than scrolling either away.
@@ -288,6 +354,8 @@ def _strategy_panels(
     runner: StrategyRunner | None,
     cost_summary: str,
     funding: FundingTracker | None,
+    episodes: EpisodeTracker | None,
+    opportunities: OpportunityRecorder | None,
     *,
     max_rows: int | None,
 ) -> list[str]:
@@ -295,6 +363,16 @@ def _strategy_panels(
     if runner is None:
         return []
     unknown = funding.markets_without_interval if funding is not None else set()
+    recording = (
+        RecordingStatus(
+            episodes_open=len(episodes.open_episodes()),
+            opportunities_written=opportunities.opportunities_written,
+            signals_written=opportunities.signals_written,
+            unpriced=opportunities.unpriced,
+        )
+        if episodes is not None and opportunities is not None
+        else None
+    )
     # A panel gets at most a third of the screen, so the market table survives.
     panel_rows = None if max_rows is None else max(3, max_rows // 3)
     return [
@@ -303,6 +381,7 @@ def _strategy_panels(
             cost_summary=cost_summary,
             max_rows=panel_rows,
             funding_unknown=sorted(unknown),
+            recording=recording,
         )
         for evaluation in runner.evaluations()
     ]

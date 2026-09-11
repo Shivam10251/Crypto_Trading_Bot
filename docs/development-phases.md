@@ -3,6 +3,11 @@
 One phase at a time. Each ends with working, tested code and a commit; work
 stops for review before the next begins.
 
+Phases 6 and 7 were swapped after Phase 5 measured the market. The reasoning is
+in [Phase 7](#phase-7--delivered): recording can begin now and be re-costed
+later, because an opportunity row keeps the prices behind it - but a day that
+was never recorded is gone for good.
+
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Architecture and project foundation | **Complete** |
@@ -12,7 +17,7 @@ stops for review before the next begins.
 | 4 | Market monitoring | **Complete** |
 | 5 | Strategy framework + spot/perp basis strategy | **Complete** |
 | 6 | Transaction cost model | Next |
-| 7 | Opportunity engine | Not started |
+| 7 | Opportunity engine | **Complete** |
 | 8 | Paper execution engine | Not started |
 | 9 | Risk engine | Not started |
 | 10 | Portfolio and P&L | Not started |
@@ -411,8 +416,116 @@ quote latency - three orders of magnitude of headroom. What stops the trade is
   it: the strategy runs inside the market-data process and writes nothing, so
   there is no output to judge it by until Phase 7.
 
+## Phase 7 — delivered
+
+Taken before Phase 6, deliberately. Phase 5 showed costs running about four
+times the basis, so a more precise cost model would sharpen that number without
+changing the conclusion. The open question was instead *how often* a wide basis
+happens at all - and that can only be answered by recording over days. Because
+an opportunity row stores the prices, quantity and itemised costs behind it, a
+better fee model can be re-applied to everything already recorded; a day that
+was never recorded cannot be recovered. Recording first loses nothing.
+
+- **An opportunity is an episode, not a sample**
+  (`opportunities/episodes.py`): one contiguous period during which the same
+  strategy sees the same discrepancy in the same direction. It opens when the
+  discrepancy appears, absorbs every evaluation while it lasts, and closes when
+  the direction flips or a leg stops being priceable
+- **The row keeps the episode's best moment**, not its first: if the peak never
+  cleared costs, no moment did. `detected_at` and `duration_ms` bound when it
+  happened
+- **`duration_ms` is a lower bound** - first observation to last. The
+  discrepancy existed for some unknown time before we first sampled it and
+  after we last did, and understating that is better than inventing it. An
+  episode seen once is 0 ms
+- **Everything is stored, including the rejected** (`opportunities/recorder.py`):
+  status, every gate it failed, and the itemised costs. Reasons are stored
+  sorted so research can group by them
+- **What cannot be priced is not invented**: an episode whose funding interval
+  the venue never published has no net edge, and `net_edge_bps` is NOT NULL for
+  good reason - a fabricated zero would corrupt every query asking what survived
+  costs. Those episodes are counted and logged instead
+- **Signals are written per leg**, linked to their opportunity. Batched inserts
+  use `sort_by_parameter_order` - without it PostgreSQL may return generated ids
+  in any order and every signal would silently attach to the wrong opportunity
+- **The API can finally see the strategy** (`api/strategy_status.py`): it reads
+  the opportunities the way it reads quotes for the feed, and reports how many
+  were recorded and how many survived costs. A strategy recording only
+  rejections is working correctly, so that is never flagged as a fault
+- **Tests**: 578 backend (from 491), 14 opt-in live; 10 frontend
+
+### What checking reality changed
+
+1. **Per-cycle rows would have been unusable.** Instrumenting a 180 s live run
+   across 50 pairs: one row per opportunity per evaluation is 8,378 rows, or
+   **4.0 million a day**, almost all restating the previous second. The same
+   run is **168 episodes** - 81K rows a day, a fiftyfold reduction and a
+   better answer to "how many opportunities existed?" than a count of samples.
+   The schema already had `duration_ms`, which is what an episode needs and a
+   sample does not; Phase 1 had designed for this.
+2. **No episode was shorter than one sample.** The worry was that a basis
+   flickering around zero would churn episodes and need a minimum-duration
+   filter - which would have biased the dataset toward exactly the long-lived
+   opportunities being counted. Measured: 0 of 168 episodes lasted under a
+   second, so the filter exists in configuration but defaults to off.
+3. **Storing the rejection reason unsorted split the dataset.** The first run
+   produced both `BELOW_MIN_EDGE, SPOT_SHORT_UNAVAILABLE` and the same two
+   reversed, because the order depended on which gate happened to fail first.
+   Research groups by that column, so the same population landed in two
+   buckets. Reasons are now sorted.
+
+### First live observation
+
+340 opportunities recorded across several runs on 2026-09-11, queried back out
+of PostgreSQL:
+
+```
+status      n     avg_net_bps   best_net_bps
+REJECTED    340       -34.41          53.89
+
+what killed them                          n
+BELOW_MIN_EDGE                          318
+SPOT_SHORT_UNAVAILABLE                   22
+
+beat fees   beat fees+slippage   beat everything   total
+       30                   22                23     340
+
+where the edge went (bps of notional)
+gross  fees  slippage  funding  buffer     net
+12.97  29.98    16.27    -0.87    2.00  -34.41
+
+persistence: median 8.4 s, max 146.7 s, 37 seen exactly once
+```
+
+**Every opportunity that survived costs was in the unreachable direction.** Of
+the 23 with a positive net edge, 22 were rejected as `SPOT_SHORT_UNAVAILABLE` -
+they needed spot sold short - and the twenty-third cleared zero but not the
+1 bps floor. Phase 5 found this in a single 75-second frame; the stored record
+shows it was not a fluke.
+
+Two details the record makes visible that a live panel could not: funding is a
+net **credit** of 0.87 bps on average, large enough that 23 opportunities beat
+everything while only 22 beat fees and slippage alone; and slippage at 16.27 bps
+is now the second-largest cost, over half the size of fees.
+
+### Limits
+
+- Rows carry no link to the `market_data` quotes behind them. The prices are on
+  the opportunity row, so fees can be re-costed from it, but slippage cannot be
+  re-derived - that needed a book, and retention deletes it after three days.
+- The episode's best moment is stored, not its full time series. "How wide did
+  it get and for how long" is answerable; "what was its shape" is not.
+- Opportunities are never purged, by design. At the measured 81K rows a day
+  that is roughly 24 MB a day, or 9 GB a year, and it is the point of the
+  system rather than overhead.
+- The recorder keeps at most 5,000 queued episodes while the database is
+  unreachable, then drops the oldest with a warning rather than growing without
+  bound.
+
 ## Phase 6 — next
 
-The transaction cost model: real fee tiers, maker/taker, depth-aware slippage
-and funding accrual, replacing the provisional implementation behind the
-`CostModel` interface Phase 5 defined. See [execution.md](execution.md).
+The transaction cost model: real fee tiers, the BNB discount, maker versus
+taker, depth-aware slippage and funding accrual, replacing the provisional
+implementation behind the `CostModel` interface Phase 5 defined. The stored
+opportunities give it something to validate against, and can be re-costed once
+it lands. See [execution.md](execution.md).

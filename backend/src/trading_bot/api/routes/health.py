@@ -1,7 +1,7 @@
 """Health, readiness and system-status endpoints.
 
 These are the only endpoints Phase 0 exposes. Subsystems that later phases build
-(market data, strategy, risk, execution) are reported OFFLINE with the phase
+(risk, execution) are reported OFFLINE with the phase
 that will implement them - the dashboard must never show invented values.
 """
 
@@ -21,6 +21,7 @@ from trading_bot.api.schemas import (
     ReadinessResponse,
     SystemStatusResponse,
 )
+from trading_bot.api.strategy_status import strategy_status
 from trading_bot.db.session import check_connection
 
 router = APIRouter(tags=["system"])
@@ -28,13 +29,6 @@ router = APIRouter(tags=["system"])
 # Subsystems not yet built. Kept here so exactly one place needs editing as
 # each phase lands, and so nothing reports a status it cannot substantiate.
 _PENDING_COMPONENTS: tuple[tuple[str, str], ...] = (
-    # Built in Phase 5 and evaluating inside the market-data service, but it
-    # stores nothing until Phase 7 - so the API has no output to judge it by
-    # and says so, rather than reporting a health it cannot substantiate.
-    (
-        "Strategy Engine",
-        "detection runs in the market-data service; not observable here until Phase 7",
-    ),
     ("Risk Engine", "not implemented until Phase 9"),
     ("Paper Execution", "not implemented until Phase 8"),
 )
@@ -94,12 +88,16 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
     api_component = ComponentHealth(
         name="API", status=ComponentStatus.HEALTHY, detail="serving requests"
     )
-    market = await market_data_status(settings, _now())
+    now = _now()
+    market = await market_data_status(settings, now)
     components = [
         api_component,
         await _database_health(),
         market.exchange,
         market.market_data,
+        # Judged by the opportunities it recorded, the same way the feed is
+        # judged by its quotes - the strategy runs in another process.
+        await strategy_status(settings, now),
         *_pending_components(),
     ]
     return SystemStatusResponse(
