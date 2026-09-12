@@ -1,6 +1,6 @@
 # Data Model
 
-Status: **implemented.** 13 tables, eight migrations. Phase 1 built the
+Status: **implemented.** 13 tables, nine migrations. Phase 1 built the
 schema; Phase 2 corrected the exchange-timestamp assumption after checking the
 live Binance API; Phase 3's market-data service is the first writer of
 `markets`, `market_data` and `system_events`; Phase 4 added
@@ -17,7 +17,10 @@ eighth (`7e6346f5153d`, Phase 9) gives `risk_events` the stable decision
 identity (`intent_id`) a retried evaluation converges on, the same
 provenance-without-a-foreign-key pattern as `orders.opportunity_uid`
 (`opportunity_uid`), and a shadow flag (`is_shadow`) - `risk_events` had
-existed since Phase 1 but had never had a writer until Phase 9.
+existed since Phase 1 but had never had a writer until Phase 9. The ninth
+(`e4f70b2c8d13`, Phase 10) adds the **exit** half of `positions` and the
+honesty columns both snapshot tables needed - see
+[What a position records after Phase 10](#what-a-position-records-after-phase-10).
 
 ## Traceability requirement
 
@@ -51,9 +54,9 @@ records the limit, the observed value and the reason.
 | `risk_events` | Every risk decision: approve, reject, pause | `intent_id`, `limit_value` vs `observed_value` |
 | `orders` | Intended and submitted orders | `client_order_id` (idempotency) |
 | `fills` | Executions, including partials | `slippage_bps`, fee rate, consumed levels, fill-time book sequence |
-| `positions` | Open and closed exposure | realized/unrealized P&L, `is_shadow` |
-| `portfolio_snapshots` | Cash, exposure, equity over time | `equity_usd` |
-| `pnl_snapshots` | Performance metrics per window | Sharpe, Sortino, drawdown |
+| `positions` | Open, closing and closed exposure | weighted entry/exit, `closed_quantity`, realized/unrealized P&L, `is_shadow` |
+| `portfolio_snapshots` | Cash, exposure, equity over time | `equity_usd`, `valuation_status` |
+| `pnl_snapshots` | Performance metrics per window | Sharpe, Sortino, drawdown, `scope_key` |
 | `system_events` | Connects, gaps, errors, reconciliation | JSONB `context` |
 
 Two legs are first-class on `opportunities` (`market_id` +
@@ -158,7 +161,62 @@ filter on it; mixing the three produces a number that describes nothing.
 
 **Realized P&L is stored, not derived on read.** It depends on the fee and
 slippage assumptions in force at the time; recomputing it later against changed
-assumptions would rewrite history.
+assumptions would rewrite history. Phase 10 *does* recompute a position's
+accounting - but from the position's own fills, whose fees and prices are what
+was actually charged, and never once the position is `CLOSED`. That is the
+line: re-deriving the same answer from the same evidence is not a later model
+rewriting history, and the `CLOSED` guard is where it is enforced.
+
+## What a position records after Phase 10
+
+A `positions` row used to describe an entry. It now describes a whole round
+trip, and every exit column is **recomputed from the position's `CLOSE` fills**
+rather than incremented - which makes repeated reconciliation and a restart
+after fills were committed converge on one row. A paper fill lost before its
+transaction commits is not durable and cannot be recovered from this table.
+
+| Column | Means |
+| --- | --- |
+| `closed_quantity` | How much of `quantity` has been given back. `quantity - closed_quantity` is the exposure that still exists, and the only quantity an exit may ask for |
+| `exit_price` / `exit_notional_usd` | Weighted average of the `CLOSE` fills, and their total |
+| `price_pnl_usd` | Signed price P&L on the closed portion, **before** fees |
+| `fees_usd` / `exit_fees_usd` | Lifetime fees, and the exit's share of them; entry fees are `fees_usd - exit_fees_usd` |
+| `slippage_usd` / `exit_slippage_usd` | Attribution only - already inside the fill prices, never subtracted from P&L a second time |
+| `funding_pnl_usd` / `borrow_cost_usd` | **NULL means not measured**, never zero |
+| `unmeasured_pnl` | Which cash-flow components a realized figure is missing |
+| `mark_price` / `marked_at` | The last honest mark, and when. A stale or missing mark leaves the previous pair alone rather than refreshing it |
+| `close_intent_id` / `close_claim_id` / `close_claimed_at` / `close_attempts` | The durable claim two workers cannot both take; each new claim has a deterministic sequence identity |
+| `exit_reason` | Which exit condition fired |
+
+`PositionStatus` gains `CLOSING`: an exit has been claimed and may be in
+flight. The exposure still exists - a `CLOSING` position is restored into the
+paper account exactly like an `OPEN` one - but no second worker may claim it.
+
+Reduce-only is a constraint, not a convention: `closed_quantity >= 0`,
+`closed_quantity <= quantity`, and `status <> 'CLOSED' OR closed_quantity =
+quantity`. No sequence of closes can give back more than was opened, reverse a
+position, or mark one closed while it still carries size.
+
+## A valuation that could not be made is not a zero
+
+`portfolio_snapshots.position_value_usd` and `equity_usd` are **nullable**, and
+`valuation_status` says which of three things happened: `COMPLETE` (every open
+position priced from a synchronised book), `DEGRADED` (the book is fully
+priced but carries an explicit problem such as unpaired exposure), or
+`UNAVAILABLE` (at least one position could not be priced, so no aggregate
+position value or equity is published and the equity curve skips the row).
+`unvalued_positions` says how many marks were missing. `unpaired_positions`
+counts attempts whose hedge is missing or unequal - real naked exposure.
+
+`pnl_snapshots` states its window rather than implying it (`window_start` /
+`window_end`), names what its realised figure is missing (`unmeasured_pnl`,
+with `funding_pnl_usd` / `borrow_cost_usd` NULL), and records what its Sharpe
+and Sortino were computed from (`return_observations`,
+`return_interval_seconds`) - a CHECK constraint refuses a ratio that does not
+state its sampling interval. `scope_key` is the non-null rendering of
+(`strategy`, `position_id`) that idempotency keys on, because a unique
+constraint over NULLs does not deduplicate in PostgreSQL and snapshot
+idempotency has to be a constraint rather than a convention.
 
 **Deletes protect the audit trail.** Raw market data cascades with its market,
 but `positions`, `orders` and `signals` use `RESTRICT` or `SET NULL` — a market

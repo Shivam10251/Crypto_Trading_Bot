@@ -24,9 +24,9 @@ from trading_bot.core.config import Settings
 from trading_bot.core.logging import get_logger
 from trading_bot.db.models import Market, Position
 from trading_bot.db.models.enums import (
+    LIVE_POSITION_STATUSES,
     ExecutionMode,
     OrderType,
-    PositionStatus,
     Severity,
     SystemEventType,
 )
@@ -52,8 +52,15 @@ from trading_bot.monitoring.strategy_view import RecordingStatus, render_evaluat
 from trading_bot.monitoring.universe import select_universe
 from trading_bot.opportunities.episodes import EpisodeTracker, episode_key
 from trading_bot.opportunities.recorder import OpportunityRecorder
+from trading_bot.portfolio.closer import PositionCloser
+from trading_bot.portfolio.pnl_source import PortfolioPnlSource
+from trading_bot.portfolio.service import PortfolioService
+from trading_bot.portfolio.snapshots import SnapshotWriter
+from trading_bot.portfolio.store import PortfolioStore
+from trading_bot.portfolio.valuation import MarkReader
 from trading_bot.risk.engine import RiskEngine
 from trading_bot.risk.kill_switch import KillSwitchState
+from trading_bot.risk.models import PnlSource
 from trading_bot.risk.store import RiskEventStore
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.costs import TransactionCostModel
@@ -150,17 +157,20 @@ async def run_service(
             if market_ids and wants_execution and settings.execution.shadow
             else None
         )
+        paper_adapter = (
+            _build_paper_adapter(settings, venue, engine, list(universe.specs), funding)
+            if market_ids and wants_execution and funding is not None
+            else None
+        )
         coordinator = (
             _build_execution_layer(
                 settings,
-                venue,
-                engine,
+                paper_adapter,
                 list(universe.specs),
-                funding,
                 paper_account,
                 shadow_account,
             )
-            if market_ids and wants_execution and funding is not None
+            if paper_adapter is not None
             else None
         )
         executions = (
@@ -175,12 +185,38 @@ async def run_service(
         risk_events = (
             RiskEventStore(session_scope) if market_ids and coordinator is not None else None
         )
+        # Built before the risk engine: it is the engine's realised-P&L
+        # source, which is what makes the Phase 9 daily-loss and
+        # consecutive-loss limits operate at all.
+        portfolio_parts = _build_portfolio(settings, engine, market_ids)
         risk = (
-            await _build_risk_engine(settings, paper_account, shadow_account, risk_events)
+            await _build_risk_engine(
+                settings,
+                paper_account,
+                shadow_account,
+                risk_events,
+                portfolio_parts[1] if portfolio_parts is not None else None,
+            )
             if risk_events is not None and paper_account is not None
             else None
         )
         risk_engine, kill_switch = risk if risk is not None else (None, None)
+        portfolio = (
+            _wire_portfolio(
+                settings,
+                portfolio_parts,
+                paper_adapter,
+                risk_engine,
+                paper_account,
+            )
+            if portfolio_parts is not None
+            else None
+        )
+        if settings.portfolio.enabled and portfolio is None:
+            logger.error(
+                "portfolio.disabled",
+                reason="no database, or execution and its risk engine are unavailable",
+            )
         # The risk engine is mandatory, not optional wiring: an execution
         # layer with a coordinator but no risk engine would place orders
         # ungated, which is exactly the invariant this phase exists to close.
@@ -272,6 +308,19 @@ async def run_service(
                                 name="risk-kill-switch-poll",
                             )
                         )
+                    if portfolio is not None:
+                        # Two loops, two cadences: an exit is evaluated
+                        # against a live book, while the snapshot interval is
+                        # also the return-sampling interval Sharpe and
+                        # Sortino are annualised from.
+                        tasks.append(
+                            asyncio.create_task(
+                                portfolio.run_snapshots(), name="portfolio-snapshots"
+                            )
+                        )
+                        tasks.append(
+                            asyncio.create_task(portfolio.run_exits(), name="portfolio-exits")
+                        )
                     strategy_task = asyncio.create_task(
                         _strategy_loop(
                             runner,
@@ -332,6 +381,18 @@ async def run_service(
                     fills=executions.fills_written,
                     unhedged=executions.unhedged,
                 )
+            if portfolio is not None:
+                # One last snapshot after execution has drained, so the final
+                # equity point describes the book the process is leaving
+                # behind rather than the one it had a minute ago.
+                with contextlib.suppress(Exception):
+                    await portfolio.snapshot()
+                logger.info(
+                    "portfolio.recorded",
+                    snapshots=portfolio.snapshots_written,
+                    pnl_rows=portfolio.pnl_rows_written,
+                    failures=portfolio.snapshot_failures,
+                )
             if risk_events is not None:
                 await risk_events.flush()
                 logger.info(
@@ -359,6 +420,7 @@ async def run_service(
                 or opportunities is not None
                 or executions is not None
                 or risk_events is not None
+                or portfolio is not None
             ):
                 await dispose_engine()
     logger.info("market_data.service_stopped")
@@ -435,21 +497,24 @@ def _build_strategy_layer(
     return runner, cost_model.describe()
 
 
-def _build_execution_layer(
+def _build_paper_adapter(
     settings: Settings,
     venue: ExchangeAdapter,
     engine: MarketDataEngine,
     specs: Sequence[MarketSpec],
     funding: FundingTracker,
-    account: PaperAccount | None,
-    shadow_account: PaperAccount | None = None,
-) -> ExecutionCoordinator | None:
-    """The paper adapter behind a coordinator, or ``None`` when it is off.
+) -> PaperExecutionAdapter | None:
+    """The simulator, or ``None`` when execution is off.
 
     Live execution cannot arrive here: the adapter is ``PaperExecutionAdapter``
     unconditionally, and the live one does not exist until Phase 17. The
     configuration guards in ``core.config`` refuse to boot an armed live
     process, so there are two independent reasons nothing real can be sent.
+
+    Built separately from the coordinator since Phase 10, because the exit
+    path needs the same adapter: a close has to fill against the same book,
+    with the same latency and the same cache of client order ids, or a retried
+    close would re-simulate a fill the entry path already recorded.
     """
     config = settings.execution
     if not (config.enabled or config.shadow):
@@ -461,7 +526,7 @@ def _build_execution_layer(
         )
         return None
     by_ref = {spec.ref: spec for spec in specs}
-    adapter = PaperExecutionAdapter(
+    return PaperExecutionAdapter(
         engine,
         config,
         fees=FeeSchedule.from_config(settings.costs),
@@ -469,6 +534,18 @@ def _build_execution_layer(
         mark_prices=lambda ref: funding.rates[ref].mark_price if ref in funding.rates else None,
         average_prices=venue.get_average_price,
     )
+
+
+def _build_execution_layer(
+    settings: Settings,
+    adapter: PaperExecutionAdapter,
+    specs: Sequence[MarketSpec],
+    account: PaperAccount | None,
+    shadow_account: PaperAccount | None = None,
+) -> ExecutionCoordinator:
+    """The coordinator that sends both legs of an entry at once."""
+    config = settings.execution
+    by_ref = {spec.ref: spec for spec in specs}
     return ExecutionCoordinator(
         adapter,
         order_type=OrderType(config.entry_order_type.upper()),
@@ -486,6 +563,7 @@ async def _build_risk_engine(
     account: PaperAccount,
     shadow_account: PaperAccount | None,
     store: RiskEventStore,
+    pnl_source: PnlSource | None = None,
 ) -> tuple[RiskEngine, KillSwitchState]:
     """The risk engine and the kill switch it reads, state already restored.
 
@@ -493,6 +571,11 @@ async def _build_risk_engine(
     reach here fails closed (the switch loads as active), which then rejects
     every signal until an operator can see why - never "assume clear". The
     switch comes back too so the caller can poll it and subscribe to it.
+
+    ``pnl_source`` is Phase 10's. Passing ``None`` leaves the daily-loss and
+    consecutive-loss controls reporting unavailable exactly as they did
+    before one existed - which is what the portfolio service being switched
+    off honestly means, not a reason to gate against zero.
     """
     kill_switch = KillSwitchState(store, session_scope, mode=ExecutionMode.PAPER)
     await kill_switch.load()
@@ -502,9 +585,95 @@ async def _build_risk_engine(
         store,
         kill_switch,
         shadow_account=shadow_account,
+        pnl_source=pnl_source,
         mode=ExecutionMode.PAPER,
     )
     return engine, kill_switch
+
+
+def _wire_portfolio(
+    settings: Settings,
+    parts: tuple[PortfolioStore, PortfolioPnlSource, MarkReader, SnapshotWriter],
+    adapter: PaperExecutionAdapter | None,
+    risk_engine: RiskEngine | None,
+    account: PaperAccount | None,
+) -> PortfolioService | None:
+    """The portfolio service, with an exit loop only when it can close safely.
+
+    Snapshots do not need execution: valuing the book and writing P&L is
+    useful on its own, and it is what supplies the risk engine's realised
+    P&L. Closing does need it - an adapter to send to and a risk engine to
+    audit the decision - so without either, the service still runs and simply
+    never closes anything, which is stated rather than silently assumed.
+    """
+    store, pnl_source, marks, writer = parts
+    closer = (
+        PositionCloser(
+            store=store,
+            session_factory=session_scope,
+            adapter=adapter,
+            risk=risk_engine,
+            marks=marks,
+            account=account,
+            config=settings.portfolio.exits,
+            venue=settings.exchange.venue,
+            mode=ExecutionMode.PAPER,
+        )
+        if settings.portfolio.exits.enabled and adapter is not None and risk_engine is not None
+        else None
+    )
+    if settings.portfolio.exits.enabled and closer is None:
+        logger.error(
+            "portfolio.exits_disabled",
+            reason="closing needs both an execution adapter and a risk engine",
+        )
+    return PortfolioService(
+        store=store,
+        writer=writer,
+        marks=marks,
+        closer=closer,
+        pnl_source=pnl_source,
+        config=settings.portfolio,
+        venue=settings.exchange.venue,
+    )
+
+
+def _build_portfolio(
+    settings: Settings,
+    engine: MarketDataEngine,
+    market_ids: dict[MarketRef, int],
+) -> tuple[PortfolioStore, PortfolioPnlSource, MarkReader, SnapshotWriter] | None:
+    """The portfolio's durable half, built before the risk engine needs it.
+
+    Returns ``None`` when the subsystem is switched off or has no database:
+    without durable rows there is no realised P&L to report, and reporting
+    one derived from memory alone would not survive a restart.
+    """
+    if not settings.portfolio.enabled or not market_ids:
+        return None
+    store = PortfolioStore(session_scope, mode=ExecutionMode.PAPER)
+    pnl_source = PortfolioPnlSource(
+        store,
+        venue=settings.exchange.venue,
+        # Risk only needs to know whether the threshold was reached. Reading
+        # this many newest trades preserves that answer without rescanning
+        # the entire history every second.
+        streak_limit=settings.risk.max_consecutive_losses,
+        refresh_interval=timedelta(milliseconds=settings.portfolio.pnl_refresh_ms),
+    )
+    marks = MarkReader(engine, max_book_age_ms=settings.portfolio.mark_max_age_ms)
+    writer = SnapshotWriter(
+        store,
+        session_scope,
+        initial_cash_usd=Decimal(str(settings.execution.paper_cash_usd)),
+        # Fees paid in BNB never touch the cash balance, so replaying cash
+        # from fills must not subtract them.
+        fees_paid_in_cash=not settings.costs.pay_fees_in_bnb,
+        interval=timedelta(milliseconds=settings.portfolio.snapshot_interval_ms),
+        min_return_observations=settings.portfolio.min_return_observations,
+        risk_free_rate_annual_pct=settings.portfolio.risk_free_rate_annual_pct,
+    )
+    return store, pnl_source, marks, writer
 
 
 def _paper_account(settings: Settings) -> PaperAccount:
@@ -520,27 +689,64 @@ def _paper_account(settings: Settings) -> PaperAccount:
 
 
 async def _restore_paper_account(settings: Settings) -> PaperAccount:
-    """Seed the in-memory reservation model from durable open paper positions."""
+    """Seed balances and exposure from all durable paper activity.
+
+    Seeded at the **remaining** open size, not the size originally opened.
+    Since Phase 10 a position can be partially closed, and restoring it whole
+    would restore exposure that has already been given back - the account
+    would drift further from the record on every restart. ``CLOSING`` rows are
+    included for the opposite reason: their exposure still exists.
+    """
     account = _paper_account(settings)
+    balance_writer = SnapshotWriter(
+        PortfolioStore(session_scope, mode=ExecutionMode.PAPER),
+        session_scope,
+        initial_cash_usd=Decimal(str(settings.execution.paper_cash_usd)),
+        fees_paid_in_cash=not settings.costs.pay_fees_in_bnb,
+        interval=timedelta(milliseconds=settings.portfolio.snapshot_interval_ms),
+        min_return_observations=settings.portfolio.min_return_observations,
+        risk_free_rate_annual_pct=settings.portfolio.risk_free_rate_annual_pct,
+    )
+    cash, paid_fees = await balance_writer.balances()
+    bnb_balance: Decimal | None = None
+    if settings.costs.pay_fees_in_bnb:
+        if settings.execution.paper_bnb_price_usd is None:  # settings validation guards this
+            raise RuntimeError("BNB fee payment needs a BNB/USD price")
+        bnb_balance = Decimal(str(settings.execution.paper_bnb_balance)) - paid_fees / Decimal(
+            str(settings.execution.paper_bnb_price_usd)
+        )
+        if bnb_balance < 0:
+            raise RuntimeError("durable fees exceed the configured paper BNB balance")
+    open_quantity = Position.quantity - Position.closed_quantity
     async with session_scope() as session:
         result = await session.execute(
             select(
                 Market.symbol,
                 Market.market_type,
                 Position.side,
-                Position.quantity,
-                Position.entry_notional_usd,
-                Position.fees_usd,
+                open_quantity,
+                # Prorate the entry notional onto what is left, so gross
+                # exposure matches the quantity actually being carried.
+                Position.entry_notional_usd * open_quantity / Position.quantity,
+                # Entry fees only: exit fees were paid out of the cash the
+                # close returned, and charging them again here would deduct
+                # them twice from the restored balance.
+                Position.fees_usd - Position.exit_fees_usd,
             )
             .join(Market, Market.id == Position.market_id)
             .where(
                 Position.mode == ExecutionMode.PAPER,
-                Position.status == PositionStatus.OPEN,
+                Position.status.in_(LIVE_POSITION_STATUSES),
                 Position.is_shadow.is_(False),
+                open_quantity > 0,
             )
         )
         seeds = [PaperPositionSeed(*row) for row in result]
-    account.restore(seeds)
+    account.restore(
+        seeds,
+        durable_cash_usd=cash,
+        durable_bnb_balance=bnb_balance,
+    )
     return account
 
 

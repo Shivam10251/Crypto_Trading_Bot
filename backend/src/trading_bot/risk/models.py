@@ -71,6 +71,18 @@ class RiskVerdict:
         return self.draft.decision
 
     @property
+    def is_durable(self) -> bool:
+        """Whether this decision is provably on disk.
+
+        Separate from ``is_approved`` because the two questions come apart for
+        a refusal: a ``PAUSED`` kill-switch verdict that could not be written
+        still halts trading in-process, and a caller that needs to know
+        whether the audit trail has it - the CLI's exit code, a close that
+        must not be sent without a record - asks this instead.
+        """
+        return self.risk_event_id is not None
+
+    @property
     def is_approved(self) -> bool:
         return self.decision is RiskDecision.APPROVED and self.risk_event_id is not None
 
@@ -79,27 +91,62 @@ class RiskVerdict:
         return self.draft.reason
 
 
+@dataclass(frozen=True, slots=True)
+class RealizedPnl:
+    """Committed realized P&L over a window, and what it is missing.
+
+    ``unmeasured`` names cash-flow components no part of this system can
+    measure yet (funding settlements, spot borrow interest). A reading that
+    names any of them is a measurement of what *was* measured - never a total
+    - and every audit row it gates says so.
+    """
+
+    net_usd: Decimal
+    trades: int
+    unmeasured: tuple[str, ...]
+    #: Start of the window this covers, and the moment it was read.
+    window_start: datetime
+    as_of: datetime
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.unmeasured
+
+
 class PnlSource(Protocol):
     """Realised P&L, when something can supply it.
 
-    Phase 10 owns the real implementation. Until it exists, every caller gets
-    ``None`` rather than a fabricated zero - a losing day and an unmeasured
-    one must never look the same to a limit that is supposed to stop trading.
+    **Asynchronous on purpose.** The real implementation (Phase 10's
+    ``PortfolioPnlSource``) reads committed rows from PostgreSQL, and the
+    alternative - a synchronous interface backed by a cache some other loop
+    refreshes - would have made the daily-loss gate read a number whose age
+    nothing bounded. The risk engine's callers are already asynchronous, so
+    the honest signature costs nothing.
+
+    ``None`` means "no realized P&L exists to measure", never zero: a losing
+    day and an unmeasured one must not look the same to a limit that is
+    supposed to stop trading. A source that cannot reach its database returns
+    ``None`` for the same reason, and the configured policy then decides.
     """
 
-    def realized_pnl_today_usd(self) -> Decimal | None: ...
+    async def realized_pnl_today_usd(self) -> RealizedPnl | None: ...
 
-    def consecutive_losses(self) -> int | None: ...
+    async def consecutive_losses(self) -> int | None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class NullPnlSource:
-    """The honest default: no realized P&L exists before Phase 10."""
+    """No realized P&L: the portfolio service is not running.
 
-    def realized_pnl_today_usd(self) -> Decimal | None:
+    Kept after Phase 10 rather than deleted, because "the portfolio subsystem
+    is switched off" is a real state and it must report unavailable rather
+    than zero, exactly as it did before a real source existed.
+    """
+
+    async def realized_pnl_today_usd(self) -> RealizedPnl | None:
         return None
 
-    def consecutive_losses(self) -> int | None:
+    async def consecutive_losses(self) -> int | None:
         return None
 
 

@@ -11,15 +11,21 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phases 0–8 complete, including the Phase 8 correctness
-remediation** — foundation, data model, the exchange
-abstraction, a real-time market-data engine, market monitoring of the 50 most
-liquid spot/perpetual pairs, the strategy framework with the first spot/perpetual
-basis strategy, the transaction cost model, and the research record: every
-opportunity detected is stored in PostgreSQL, profitable or not. `make
-market-data` streams those markets, shows what the strategy concludes about
-each one with every cost itemised, and records it. Paper execution is off by
-default and fails closed if its durable database audit is unavailable.
+Current state: **Phases 0–10 complete** — foundation, data
+model, the exchange abstraction, a real-time market-data engine, market
+monitoring of the 50 most liquid spot/perpetual pairs, the strategy framework
+with the first spot/perpetual basis strategy, the transaction cost model, and
+the research record: every opportunity detected is stored in PostgreSQL,
+profitable or not. `make market-data` streams those markets, shows what the
+strategy concludes about each one with every cost itemised, and records it.
+Paper execution is off by default and fails closed if its durable database
+audit is unavailable; every order it would place is gated behind a durable
+risk decision and a kill switch. Phase 10 adds the portfolio subsystem —
+positions close against the live books, realised P&L is computed from actual
+fills, and the daily-loss and consecutive-loss limits that Phase 9 reported as
+deferred now operate against measured price P&L and fees. It is off by default
+(`portfolio.enabled`), and nothing it produces has been calibrated against a
+live run.
 
 **The finding so far.** Across 340 recorded opportunities the average gross
 basis was 13.0 bps against 30.0 bps of round-trip taker fees and 16.3 bps of
@@ -125,6 +131,9 @@ backend/                  FastAPI service, strategy engine, data pipeline
     monitoring/           market selection, per-market statistics, terminal view
     strategy/             strategy contract, domain types, cost model, basis strategy
     opportunities/        episode tracking and the research record
+    execution/            dispatcher, paper simulator, account, order/fill record
+    risk/                 pre-trade, admission, exit and post-trade decisions
+    portfolio/            exit policy, valuation, P&L accounting, snapshots
   alembic/                database migrations
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)

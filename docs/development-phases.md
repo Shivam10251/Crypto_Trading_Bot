@@ -21,7 +21,7 @@ was never recorded is gone for good.
 | 7.5 | Correctness remediation before Phase 8 | **Complete** |
 | 8 | Paper execution engine | **Complete** |
 | 9 | Risk engine | **Complete** |
-| 10 | Portfolio and P&L | Not started |
+| 10 | Portfolio and P&L | **Complete** |
 | 11 | Backtest / replay engine | Not started |
 | 12 | Real-time dashboard | Not started |
 | 13 | Dashboard real-time backend | Not started |
@@ -1071,6 +1071,9 @@ tasks instead of abandoning them with the event loop.
   consecutive-loss breach needs an audited re-arm - but nothing can fire them
   until a real `PnlSource` exists. `"fail_closed"` makes that gap loud rather
   than trading blind through it; it is not the limit "working".
+  *(Closed by [Phase 10](#phase-10--delivered): `PortfolioPnlSource` supplies
+  the realised P&L, and both limits now fire. They still report unavailable -
+  never zero - when the portfolio service is switched off.)*
 - **A kill takes up to one poll interval to reach another process.** The
   bound is `risk.kill_switch_poll_ms` (1 s by default), not zero. A kill
   triggered inside the trading process itself is immediate; one written by
@@ -1092,3 +1095,220 @@ tasks instead of abandoning them with the event loop.
   reports naked exposure and can pause further entries; it never assumes a
   remedy succeeded or attempts one. Deciding what to do about existing naked
   exposure is Phase 10's, not this phase's.
+  *(Answered by [Phase 10](#phase-10--delivered): a naked leg is closed as
+  `UNPAIRED_RESIDUAL`, priced from the live books like any other exit, and a
+  close that creates one trips the same pause.)*
+
+## Phase 10 — delivered
+
+**Reviewed and signed off for paper execution.** The code has been
+independently reviewed, corrected, tested and type-checked. No number it
+produces has been calibrated against a live run, so this is an engineering
+sign-off, not evidence that the strategy is profitable.
+
+The portfolio subsystem (`trading_bot.portfolio`) closes positions, values
+what is still open, and computes realised P&L from actual fills. It is what
+Phase 9 was waiting for: `max_daily_loss_usd` and `max_consecutive_losses`
+now operate instead of reporting as deferred.
+
+```
+accounting.py   pure Decimal P&L per position and paired trade - no I/O
+statistics.py   pure performance statistics over sets of trades and equity
+exits.py        pure exit policy - when to stop holding, and why
+valuation.py    executable exit prices from the live books
+records.py      read models: a position and an attempt with their fills
+store.py        durable reads, claims, recomputation from fills
+close_record.py one close leg as the order and fill rows that prove it
+closer.py       orchestration: claim, risk, both legs at once, one transaction
+snapshots.py    valuing the book, and both snapshot tables
+pnl_source.py   the realised P&L the Phase 9 risk limits were waiting for
+service.py      two loops, wired by the market-data service
+```
+
+- **Exit accounting is recomputed from fills, never incremented.** A
+  position's exit columns are derived from the whole set of its `CLOSE` fills
+  every time. That makes repeated reconciliation and a restart after durable
+  fills converge on the same row - applying a delta twice double-counts,
+  recomputing twice does not. A paper fill lost before its transaction commits
+  cannot be recovered (see [Limits](#limits-1)). A position already `CLOSED`
+  is never revisited, which is where "a later cost model must not rewrite
+  history" is enforced rather than promised.
+- **The exit policy is four reasons, in priority order**:
+  `UNPAIRED_RESIDUAL` (one leg flat, another not - naked exposure),
+  `ADVERSE_BASIS` (the basis widened against the entry past a stop),
+  `MAX_HOLDING_PERIOD`, and `BASIS_CONVERGED`. Only the last is a *target*,
+  and only it requires a complete executable price on both legs; the three
+  risk-reducing reasons are attempted even on thin depth, because leaving the
+  exposure on is worse. Nothing here decides an exit is profitable -
+  convergence says the spread came back, not that the round trip cleared the
+  30 bps taker floor Phase 8 measured.
+- **Every exit is priced from the current synchronised books**, walked for the
+  exact residual quantity on the side that would actually have to trade.
+  A book that is missing, unsynced, or older than
+  `portfolio.exits.max_book_age_ms` prices nothing; there is no fallback to
+  the last price seen.
+- **A kill switch does not block a close.** A halt stops *new* exposure;
+  closing removes it, so `RiskEngine.evaluate_exit` is deliberately outside
+  that gate, and the switch's state is recorded on the decision instead. This
+  is not a general bypass: reduce-only is enforced independently, the
+  decision must still be durably stored before any order is sent, and a close
+  that leaves a leg naked trips the switch under `risk.pause_on_unhedged`
+  exactly as an unhedged entry does.
+- **Reduce-only is derived and rechecked from freshly locked rows.** `claim`
+  row-locks the attempt, verifies that quantity, closed quantity, status and
+  claim counter still match the policy's view, and returns the database view
+  actually claimed. Only then does `RiskEngine.evaluate_exit` verify mode,
+  status, side and size. `closed_quantity <= quantity` independently protects
+  the durable record. A live adapter must additionally set the venue's native
+  reduce-only flag; Phase 10 has only the paper adapter.
+- **Two workers cannot close the same position.** `claim` row-locks every row
+  of the attempt and changes its live legs to `CLOSING` in one transaction.
+  The loser abandons the whole claim rather than closing one leg. A stale
+  caller is also refused if a partial reconciliation changed its open size.
+  A terminal partial close releases its remaining claim immediately, while a
+  worker that disappears is recoverable after `claim_timeout_ms`.
+- **Both legs at once, always.** Exits are submitted concurrently, exactly as
+  entries are: a hedge that unwinds in sequence is unhedged in between. A
+  close is a MARKET order, because an IOC limit's failure mode on an *exit*
+  is the naked exposure the close was called to remove.
+- **The account is reduced, not re-grown.** `PaperAccount.settle_exit` gives
+  back the entry notional of the quantity closed - the same basis `settle`
+  added it on and `restore` seeds from - while cash and inventory move by the
+  actual exit notional. Perpetual price P&L settles into cash, and restart
+  restoration replays all durable fills before rebuilding open exposure, so
+  prior closed trades do not disappear from buying power. Without those two
+  pieces gross exposure would accumulate while cash reset after a restart.
+- **`NullPnlSource` is replaced by `PortfolioPnlSource`**, which reads
+  committed rows only. `max_daily_loss_usd` measures completed **paired
+  trades** whose last leg closed inside `[00:00 UTC today, now)`;
+  `max_consecutive_losses` counts completed paired trades, not losing legs -
+  counting legs would fire the limit on the losing half of every hedged
+  trade. A database it cannot read returns `None`, so Phase 9's fail-closed
+  policy behaviour is preserved unchanged.
+- **`PnlSource` is now asynchronous.** The alternative - keeping a
+  synchronous interface backed by a cache some other loop refreshed - would
+  have left the daily-loss gate reading a number whose age nothing bounded.
+  Its callers were already asynchronous, so the honest signature cost
+  nothing; a short TTL (`portfolio.pnl_refresh_ms`) and one refresh lock keep
+  the per-signal cost and concurrent database reads bounded. Loss streaks
+  read the newest `max_consecutive_losses` completed attempts rather than a
+  date cutoff, so a long idle period cannot hide a breach and the query stays
+  bounded.
+- **Nothing is valued from a stale mark, and partial equity is never
+  published.** If any open leg cannot be priced, the snapshot is
+  `UNAVAILABLE` with NULL position value, unrealized P&L and equity. The
+  equity curve skips it rather than treating missing exposure as zero.
+  `DEGRADED` is a fully valued but explicitly risky state, such as an
+  unpaired book.
+- **Sharpe and Sortino are annualised from one stated interval.** They are
+  computed only from equity snapshots at `portfolio.snapshot_interval_ms`,
+  only when the spacing is regular and there are at least
+  `min_return_observations` of them, and the interval and observation count
+  are stored beside them. Annualising irregular event-level returns as though
+  they were daily is the most common way a Sharpe ratio comes to describe
+  nothing; a series whose spacing varied is refused, not estimated.
+- **Funding and spot borrow are NULL, not zero.** Nothing in this system can
+  measure either yet, so every realised figure that omits them names them in
+  `unmeasured_pnl` and no total that is missing them is called complete. See
+  [Limits](#limits-1).
+- **Migration** `e4f70b2c8d13`, additive: the exit half of `positions`
+  (closed quantity, weighted exit price and notional, exit fees and slippage,
+  signed price P&L, the durable claim, the exit reason, the mark and when it
+  was taken), the honesty columns on both snapshot tables
+  (`valuation_status`, `unvalued_positions`, `unpaired_positions`,
+  `funding_pnl_usd`, `borrow_cost_usd`, `unmeasured_pnl`), the window bounds
+  and `scope_key` that snapshot idempotency keys on, and the reduce-only
+  CHECK constraints.
+- **Tests**: 52 unit tests on the pure arithmetic against hand-computed
+  numbers (long and short signs, weighted partial fills, fees charged exactly
+  once across successive partial closes, slippage never subtracted twice,
+  paired aggregation, statistics, drawdown, return sampling and
+  annualisation), the exit policy and the executable-exit pricing; PostgreSQL
+  coverage for the reduce-only constraints, concurrent claims, retried
+  closes, crash recovery, PAPER/LIVE separation, shadow exclusion, snapshot
+  idempotency, the UTC day boundary, consecutive-loss counting, both risk
+  limits genuinely firing, and every health state.
+
+### What checking reality changed
+
+1. **The entry recorder could resurrect a closed position.**
+   `ExecutionRecorder`'s position upsert set every column from the attempt,
+   so a retried entry flush landing after a close would write `status = OPEN`,
+   `realized_pnl_usd = 0` and the full entry quantity over a settled
+   position - exposure the account does not have. The upsert is now
+   conditional on the position still being untouched by an exit, and `CLOSE`
+   orders never reach it at all.
+2. **Account restoration was seeding the wrong quantity.** It restored
+   `positions.quantity`, which since this phase can be partly closed. A
+   restart would have restored exposure that had already been given back, and
+   drifted further on every restart. It now seeds the remaining open size with
+   a prorated notional, and includes `CLOSING` rows, whose exposure still
+   exists.
+3. **`RiskVerdict` needed `is_durable` as well as `is_approved`.** A
+   Phase 9 test asked for it and the property had never been added, so the
+   suite was red at `1a82004`. The two questions genuinely differ for a
+   refusal - a `PAUSED` kill-switch verdict that could not be written still
+   halts trading in-process - and a close that must not be sent without a
+   record asks the durability question, not the approval one.
+4. **"Unpaired" had to be read from the rows, not the fills.** The exposure a
+   snapshot counts comes from `closed_quantity`, so deriving naked exposure
+   from the fill history could disagree with it. `AttemptRecord.is_unpaired`
+   now answers from the same durable quantities the exposure figures use.
+5. **Perpetual close P&L was absent from both cash implementations.** The
+   position row reported the gain or loss, but `PaperAccount` and snapshot
+   cash did not settle it, and restart restoration discarded every closed
+   trade. Both now use the signed close-versus-entry cash flow, and restoration
+   seeds balances from all durable fills before adding open exposure.
+6. **Partial valuation was being published as account equity.** A snapshot
+   with one unpriceable position summed the rest and inserted that partial
+   number into the return curve. Any unvalued leg now makes aggregate value,
+   unrealized P&L and equity NULL; per-strategy unrealized P&L follows the same
+   rule.
+7. **One leg and unequal residual quantities were classified as paired.** A
+   one-leg attempt could become a completed "paired trade," and two non-zero
+   but unequal legs hid naked exposure. Completion now requires exactly two
+   flat legs, and hedge balance is checked by remaining quantity.
+8. **Risk approved a close before the database claim.** A partial fill between
+   approval and claim could leave a stale quantity headed for the adapter.
+   Claiming now locks and validates current rows first, returns their fresh
+   quantities, and a denied risk decision releases only its own claim.
+
+### Limits
+
+- **Funding and spot borrow are not measured.** A perpetual leg held across a
+  settlement really pays or receives funding, and a short spot leg really
+  accrues borrow interest. Nothing in this system attributes either to a
+  position, so both are stored as NULL and named in `unmeasured_pnl`, and
+  every realised figure that omits them says so. This is the largest known
+  gap in the accounting: on a basis position held for hours, funding is not a
+  rounding error, and a "realised P&L" that silently excluded it would be the
+  exact dishonesty the rest of this phase is built to avoid.
+- **Nothing has been calibrated against a live run.** The exit thresholds
+  (`target_basis_bps`, `adverse_basis_bps`, `max_holding_minutes`) are
+  defaults chosen to be defensible, not values measured against this market.
+  They decide when positions close and therefore what the P&L is; they need
+  live calibration before any result from them means anything.
+- **Sharpe and Sortino will be NULL in practice for a long time.** They need
+  at least `min_return_observations` (30) regularly spaced equity snapshots
+  inside the window, and any gap in the snapshot loop breaks the spacing and
+  refuses the sample. That is the intended behaviour, not a defect - but it
+  means the two ratios are a promise about later, not a number available now.
+- **The snapshot loop reads the whole closed history each cycle** to compute
+  the all-time window. That is fine at the volumes this system has and will
+  not be at scale; the right answer is an incremental aggregate, and it
+  should be built against measured row counts rather than guessed now.
+- **A close that keeps failing eventually stops being retried**
+  (`max_close_attempts`, default 5). The exposure then stays open, the
+  snapshot counts it as unpaired, the health endpoint reads DEGRADED and -
+  if it is naked - the kill switch is engaged. That is deliberate: retrying
+  forever against a venue that will not fill is not safer than telling an
+  operator. It does mean naked exposure can persist until someone looks.
+- **The portfolio service is single-process, like the risk engine.** The
+  durable claim is what makes concurrent closing safe, and it would work
+  across processes - but nothing today runs that way, and the `PaperAccount`
+  ledger the closer settles against is still one object in one service.
+- **Paper fills that were simulated but never recorded are lost on a crash.**
+  The adapter's result cache is in memory. A crash between `submit` and the
+  transaction that records it leaves the position open, and the next sweep
+  simulates the close again. For a simulator that is the correct recovery; a
+  live adapter (Phase 17) must reconcile against the venue instead.

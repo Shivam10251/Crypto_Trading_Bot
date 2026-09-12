@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -207,6 +208,13 @@ class Position(Base, RecordMixin):
     Realized P&L is stored rather than derived on read: it depends on the fee
     and slippage assumptions in force at the time, and recomputing it later
     against changed assumptions would rewrite history.
+
+    Phase 10 adds the exit half. Every exit column is **recomputed from the
+    position's own CLOSE fills** rather than incremented, which is what makes
+    a retried close, a crash between submission and recording, and a restart
+    all converge on the same row instead of double-counting one. See
+    ``trading_bot.portfolio.accounting`` for the exact formulas and
+    ``docs/data-model.md`` for the sign conventions.
     """
 
     __tablename__ = "positions"
@@ -232,15 +240,64 @@ class Position(Base, RecordMixin):
         POSITION_STATUS, nullable=False, default=PositionStatus.OPEN
     )
 
+    # Opened size (weighted over the entry fills) and how much of it CLOSE
+    # fills have given back. ``quantity - closed_quantity`` is the exposure
+    # that still exists, and the only quantity an exit may ever ask for.
     quantity: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
+    closed_quantity: Mapped[Decimal] = mapped_column(
+        QUANTITY, nullable=False, default=0, server_default=text("0")
+    )
     entry_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
+    # Weighted average of the CLOSE fills; NULL until one exists.
     exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
     entry_notional_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    exit_notional_usd: Mapped[Decimal | None] = mapped_column(MONEY)
 
+    # Net of fees, on the closed portion only. An open or partially closed
+    # position never counts its unclosed remainder here.
     realized_pnl_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
+    # Signed price P&L on the closed portion, BEFORE fees - kept separately so
+    # "what did the basis do" and "what did the venue charge" stay legible.
+    price_pnl_usd: Mapped[Decimal | None] = mapped_column(MONEY)
     unrealized_pnl_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
+    # Total fees charged on this position, entry plus exit; ``exit_fees_usd``
+    # is the exit share of it, so entry fees are ``fees_usd - exit_fees_usd``.
     fees_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
+    exit_fees_usd: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=0, server_default=text("0")
+    )
+    # Attribution only. Slippage is already inside the fill prices above; it
+    # is recorded so the cost model can be checked and is NEVER subtracted
+    # from realized P&L a second time.
     slippage_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
+    exit_slippage_usd: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=0, server_default=text("0")
+    )
+    # Cash flows nothing in this system can measure yet. NULL means
+    # "not measured", never zero: a position that paid funding and one that
+    # crossed no settlement must not read the same. ``unmeasured_pnl`` names
+    # them, so a realized total is never silently presented as complete.
+    funding_pnl_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    borrow_cost_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    unmeasured_pnl: Mapped[list[str] | None] = mapped_column(JSONB)
+
+    # Mark used for the newest unrealized figure, and when it was taken. A
+    # stale or missing mark leaves both NULL rather than reusing an old one.
+    mark_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    marked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # The exit in flight, or the one that closed this position. The claim
+    # columns are how two workers cannot close the same position: claiming
+    # writes ``status = CLOSING`` under a row lock in one transaction.
+    close_intent_id: Mapped[str | None] = mapped_column(String(80))
+    close_claim_id: Mapped[str | None] = mapped_column(String(64))
+    close_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Incremented per claim, so a retried exit after a failed one gets fresh
+    # deterministic order ids instead of colliding with the previous attempt.
+    close_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    exit_reason: Mapped[str | None] = mapped_column(String(32))
 
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -252,6 +309,9 @@ class Position(Base, RecordMixin):
         Index("ix_positions_status_opened", "status", "opened_at"),
         Index("ix_positions_market_opened", "market_id", "opened_at"),
         Index("ix_positions_mode_strategy", "mode", "strategy"),
+        # "Which trades completed today?" - the daily-loss and
+        # consecutive-loss gates' only query, and the P&L windows'.
+        Index("ix_positions_mode_closed_at", "mode", "closed_at"),
         UniqueConstraint("mode", "attempt_id", "market_id", name="mode_attempt_market"),
         CheckConstraint("quantity > 0", name="quantity_positive"),
         CheckConstraint("entry_price > 0", name="entry_price_positive"),
@@ -260,5 +320,21 @@ class Position(Base, RecordMixin):
         CheckConstraint(
             "status <> 'CLOSED' OR (closed_at IS NOT NULL AND exit_price IS NOT NULL)",
             name="closed_position_complete",
+        ),
+        # Reduce-only, enforced by the database rather than only by the code
+        # that is supposed to respect it: no sequence of closes can give back
+        # more than was opened, or reverse the position into the other side.
+        CheckConstraint("closed_quantity >= 0", name="closed_quantity_non_negative"),
+        CheckConstraint("closed_quantity <= quantity", name="closed_within_quantity"),
+        CheckConstraint("close_attempts >= 0", name="close_attempts_non_negative"),
+        CheckConstraint(
+            "exit_notional_usd IS NULL OR exit_notional_usd >= 0",
+            name="exit_notional_non_negative",
+        ),
+        # A fully closed position has given every unit back; anything less is
+        # still carrying exposure and must not read as CLOSED.
+        CheckConstraint(
+            "status <> 'CLOSED' OR closed_quantity = quantity",
+            name="closed_position_flat",
         ),
     )

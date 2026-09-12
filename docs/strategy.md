@@ -84,7 +84,8 @@ would actually be sent rather than the size that was asked for.
 **The gross edge is a theoretical convergence edge, not profit.** It is what
 the trade is worth if the two mids meet. Realised price P&L on a basis
 position is `signed_quantity x (entry basis - exit basis)`, and only an actual
-exit supplies the second term - Phase 8 measures it. The convergence
+exit supplies the second term - Phase 8 measures the entry, and Phase 10's
+exit policy supplies the exit. The convergence
 assumption is configuration (`costs.assumed_terminal_basis_bps`, default 0)
 and is stored with every opportunity rather than left implicit.
 
@@ -144,6 +145,6 @@ validated end to end.
   funding interval the venue does not publish yields no net edge at all, and
   neither does a position the book cannot show us closing. The opportunity is
   still stored - as `UNPRICEABLE`, with no costs on it - because it happened.
-- A strategy never reports profit; the portfolio module computes P&L from
+- A strategy never reports profit; `trading_bot.portfolio` computes P&L from
   simulated or real fills.
 - Backtest, paper and live P&L are labelled and never combined.

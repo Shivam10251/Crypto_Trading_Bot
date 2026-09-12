@@ -28,9 +28,10 @@ the capacity a real signal is competing for.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from trading_bot.core.config import RiskConfig
 from trading_bot.core.logging import get_logger
@@ -38,7 +39,7 @@ from trading_bot.db.models.enums import ExecutionMode, RiskDecision, RiskEventTy
 from trading_bot.execution.account import AccountRejection, AccountReservation, PaperAccount
 from trading_bot.execution.coordinator import ExecutionAttempt
 from trading_bot.execution.models import RejectionCode
-from trading_bot.risk import decisions, loss_limits, post_trade
+from trading_bot.risk import decisions, exit_decisions, loss_limits, position_exit, post_trade
 from trading_bot.risk.kill_switch import KillSwitchState
 from trading_bot.risk.models import NullPnlSource, PnlSource, RiskEventDraft, RiskVerdict
 from trading_bot.risk.store import RiskEventStore
@@ -152,9 +153,11 @@ class RiskEngine:
             return await deny.breach(slippage_breach)
 
         deferred: tuple[str, ...] = ()
+        incomplete: tuple[str, ...] = ()
         if not is_shadow:
-            outcome = loss_limits.evaluate(self._pnl_source, self._config, now)
+            outcome = await loss_limits.evaluate(self._pnl_source, self._config, now)
             deferred = outcome.deferred
+            incomplete = outcome.incomplete
             if outcome.breach is not None:
                 return await self._deny_loss_limit(outcome, deny)
 
@@ -183,6 +186,9 @@ class RiskEngine:
                 # had passed. These are named, every time, on every row.
                 "deferred_controls": list(deferred),
                 "enforced": decisions.enforced_controls(deferred),
+                # ...nor imply the realised P&L a control *did* use was a
+                # total when cash flows are missing from it.
+                "incomplete_pnl_components": list(incomplete),
             },
         )
         risk_event_id = await self._store.persist(draft)
@@ -317,6 +323,40 @@ class RiskEngine:
                 RejectionCode.RISK_WITHDRAWN, f"{breach.limit_name}: {breach.reason}"
             )
         return None
+
+    # --- exits ----------------------------------------------------------
+
+    async def evaluate_exit(self, request: position_exit.ExitRequest) -> RiskVerdict:
+        """Decide whether a close may be sent. See ``risk.exit_decisions``."""
+        return await exit_decisions.evaluate_exit(
+            request,
+            store=self._store,
+            kill_switch=self._kill_switch,
+            denier=self._denier(request.intent_id, None, False, request.strategy),
+            mode=self._mode,
+            now=self._clock(),
+        )
+
+    async def record_exit_residual(
+        self,
+        *,
+        attempt_id: str,
+        intent_id: str,
+        strategy: str | None,
+        residual: Mapping[str, Any],
+    ) -> RiskVerdict:
+        """A close that left a leg naked. See ``risk.exit_decisions``."""
+        return await exit_decisions.record_residual(
+            attempt_id=attempt_id,
+            intent_id=intent_id,
+            strategy=strategy,
+            residual=residual,
+            store=self._store,
+            kill_switch=self._kill_switch,
+            mode=self._mode,
+            now=self._clock(),
+            pause_on_unhedged=self._config.pause_on_unhedged,
+        )
 
     # --- queue ----------------------------------------------------------
 

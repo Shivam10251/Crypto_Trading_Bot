@@ -18,6 +18,7 @@ from trading_bot.db.models.enums import (
     SignalStatus,
     SystemEventType,
     TimeInForce,
+    ValuationStatus,
 )
 from trading_bot.db.models.events import RiskEvent, SystemEvent
 from trading_bot.db.models.execution import Fill, Order, Position
@@ -56,4 +57,5 @@ __all__ = [  # noqa: RUF022
     "SignalStatus",
     "SystemEventType",
     "TimeInForce",
+    "ValuationStatus",
 ]

@@ -47,8 +47,9 @@ Binance WebSocket / REST        (Phase 3)
    Execution Adapter            (Phase 8)  Paper today, Live behind a flag (17)
             │
             ▼
-   Portfolio & P&L              (Phase 10) exits, equity, drawdown
-            │
+   Portfolio & P&L              (Phase 10) exits priced from the live
+            │                              books, realised P&L from actual
+            │                              fills, equity and drawdown
             ▼
    API + WebSocket  →  Dashboard (Phases 12-13)
 ```
@@ -79,6 +80,8 @@ did. See [risk-management.md](risk-management.md) for the full account.
 | `trading_bot.strategy` | Strategy contract, domain types, cost model, basis strategy, runner | exchange + marketdata models only |
 | `trading_bot.opportunities` | Episode tracking and the research record | strategy, db |
 | `trading_bot.execution` | Bounded dispatcher, account reservations, adapter contract, paper simulator, leg coordination, order/fill/position record | strategy + marketdata models, db |
+| `trading_bot.risk` | Pre-trade, admission, exit and post-trade decisions; durable kill switch | execution, config, db |
+| `trading_bot.portfolio` | Exit policy, executable valuation, P&L accounting, snapshots, the realised P&L risk reads | execution, risk, marketdata models, db |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -110,7 +113,9 @@ execution flags cannot change under a running process.
 
 Two processes run today, sharing configuration and the database: the API and
 the market-data service (`make market-data`), which also hosts the strategy
-runner and the opportunity recorder. The API cannot ask the service how it is
+runner, the opportunity recorder, and - since Phase 10 - the portfolio
+service's exit and snapshot loops. The portfolio lives there because closing a
+position needs the same live book the simulator fills against. The API cannot ask the service how it is
 doing, so it judges it by its output - which markets the service last selected
 (`markets.is_monitored`), whether each one's newest stored quote is recent, and
 how recently an opportunity was recorded - rather than by assumption.
@@ -125,14 +130,18 @@ framework with the spot/perpetual basis strategy, the transaction cost model,
 the opportunity engine recording every detection to PostgreSQL with the
 evidence behind it, the paper execution engine and its order/fill record, the
 risk engine gating every order behind a durable decision and a kill switch,
-API skeleton, health and system-status endpoints, frontend shell, test
-tooling.
+the portfolio subsystem closing positions and computing realised P&L from
+actual fills (Phase 10), API skeleton, health and system-status
+endpoints, frontend shell, test tooling.
 
-Not built: exits/P&L portfolio service, dashboard. Daily-loss and
-consecutive-loss limits exist as configuration and policy but are honestly
-reported as deferred - they need Phase 10's realised P&L to mean anything.
-The system-status endpoint reports the not-yet-built subsystems as `OFFLINE`
-with the phase that will implement them.
+Daily-loss and consecutive-loss limits now operate: Phase 10 supplies the
+realised P&L they were waiting for, measured over completed paired trades and
+a documented UTC day boundary. When the portfolio service is switched off they
+report as unavailable exactly as they did before, never as zero.
+
+Not built: the dashboard. The system-status endpoint reports every subsystem
+by the durable evidence it wrote, and a not-yet-built one as `OFFLINE` with
+the phase that will implement it.
 
 ### The exchange boundary
 
@@ -275,8 +284,8 @@ isolated `PaperAccount`, so research can neither consume nor be blocked by
 trading capacity. Aborted reservations remain retryable and must pass every
 limit again; after a real settlement, actual notionals are checked for adverse
 fill-price breaches. See [risk-management.md](risk-management.md) for the full
-set of checks, the kill switch's precise guarantees, and what is honestly
-deferred to Phase 10.
+set of checks, the kill switch's precise guarantees, and how a close differs
+from an entry.
 
 The simulator reads the book **at fill time**, after the configured latency
 has elapsed, so the market moves before the order lands. Nothing in it is
@@ -285,6 +294,51 @@ partial fills come from observed depth. IOC/FOK are evaluated once at arrival;
 GTC is refused until trades and queue position can support it. There is no
 fill-probability knob, because a simulator whose disappointments are drawn
 from a seed measures the seed.
+
+### The portfolio boundary
+
+`trading_bot.portfolio` is the only thing that closes a position, and the only
+thing that says what one earned. It is layered so the arithmetic is testable
+without a database and the policy without a market:
+
+```
+positions + fills ──▶ accounting.py     pure Decimal P&L, from actual fills
+                      statistics.py    win rate, expectancy, drawdown, Sharpe
+live books        ──▶ valuation.py      what flattening would really fetch
+        │                                    │
+        └──────────────▶ exits.py  ◀─────────┘   four reasons to stop holding
+                            │
+                            ▼
+                        closer.py   RiskEngine.evaluate_exit (reduce-only)
+                            │       both legs at once, one transaction
+                            ▼
+                   store.py  ──▶ positions recomputed from their CLOSE fills
+                            │
+        ┌───────────────────┴───────────────────┐
+        ▼                                       ▼
+  snapshots.py                            pnl_source.py
+  portfolio_snapshots + pnl_snapshots      the realised P&L the Phase 9
+  (or an explicit DEGRADED/UNAVAILABLE)    loss limits read
+```
+
+Three rules run through it. **Actual fills, never estimates** - a strategy's
+expected price survives only as slippage attribution. **PAPER, LIVE and
+THEORETICAL never mix**, and `is_shadow` rows are excluded from every
+actionable total. **Unmeasured is not zero** - funding and spot borrow are
+real costs nothing here can measure yet, so they are NULL and named, and no
+total that omits them is called complete.
+
+Aggregate equity is all-or-nothing: if one open leg cannot be valued, position
+value, unrealized P&L and equity are NULL for that snapshot. `DEGRADED` never
+means "equity with a position omitted"; it is reserved for a fully priced but
+risky state such as unpaired exposure.
+
+A close is not an entry, and the risk engine treats it differently on purpose:
+the kill switch does not block one (a halt stops new exposure; closing removes
+it), no capacity is reserved (a close releases rather than consumes), and
+reduce-only is enforced independently of the code that computed the quantity.
+See [risk-management.md](risk-management.md#closing-a-position) and
+[execution.md](execution.md#exits).
 
 An episode that could never be priced is stored as `UNPRICEABLE` with no costs
 on it: it happened, so it is counted, and an invented zero would corrupt every

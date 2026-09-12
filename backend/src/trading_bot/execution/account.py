@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -43,12 +43,46 @@ class AccountReservation:
 
 @dataclass(frozen=True, slots=True)
 class PaperPositionSeed:
+    """Exposure that still exists, as restored from durable positions.
+
+    ``quantity`` and ``notional_usd`` are the **remaining open** size and its
+    entry notional, not what was originally opened. A partially closed
+    position seeded at its opening size would restore exposure that has
+    already been given back, and the account would drift further from the
+    record on every restart.
+    """
+
     symbol: str
     market_type: MarketType
     side: Side
     quantity: Decimal
     notional_usd: Decimal
     fees_usd: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ExitSettlement:
+    """One leg's close, as the account needs it to give exposure back.
+
+    Exposure is released at the **entry** notional of the quantity closed,
+    because that is the basis it was taken on (``settle`` adds fill notional,
+    and ``restore`` seeds from ``entry_notional_usd``). Cash and inventory
+    move by the *exit* notional, because that is what actually changed hands.
+    Using the exit notional for both would leave gross exposure drifting by
+    the position's own P&L every time something closed.
+    """
+
+    ref: MarketRef
+    #: The side the position was entered on, not the side of the close.
+    entry_side: Side
+    entry_price: Decimal
+    closed_quantity: Decimal
+    exit_notional_usd: Decimal
+    fees_usd: Decimal
+
+    @property
+    def released_notional_usd(self) -> Decimal:
+        return self.entry_price * self.closed_quantity
 
 
 class PaperAccount:
@@ -234,10 +268,28 @@ class PaperAccount:
                 )
             return reservation
 
-    def restore(self, positions: list[PaperPositionSeed]) -> None:
-        """Rebuild balances/exposure from durable open positions at startup."""
+    def restore(
+        self,
+        positions: list[PaperPositionSeed],
+        *,
+        durable_cash_usd: Decimal | None = None,
+        durable_bnb_balance: Decimal | None = None,
+    ) -> None:
+        """Rebuild balances/exposure from durable state at startup.
+
+        When ``durable_cash_usd`` is supplied, it already includes every
+        historical fill and cash-paid fee. Open rows are then used only to
+        rebuild inventory, margin and exposure; replaying their cash flow or
+        fees again would double-count them. The optional BNB balance follows
+        the same rule for fees paid out of the fee wallet.
+        """
         if self._reservations:
             raise RuntimeError("cannot restore an account after execution has started")
+        balances_replayed = durable_cash_usd is not None
+        if durable_cash_usd is not None:
+            self._cash = durable_cash_usd
+        if durable_bnb_balance is not None:
+            self._bnb = durable_bnb_balance
         for position in positions:
             signed = position.notional_usd if position.side is Side.BUY else -position.notional_usd
             self._gross += position.notional_usd
@@ -246,15 +298,20 @@ class PaperAccount:
                 self._position_gross.get(position_key, Decimal(0)) + position.notional_usd
             )
             self._net += signed
-            self._pay_fee(position.fees_usd)
+            if not balances_replayed:
+                self._pay_fee(position.fees_usd)
             if position.market_type is MarketType.SPOT:
                 quantity = position.quantity if position.side is Side.BUY else -position.quantity
-                self._inventory[position.symbol] = (
-                    self._inventory.get(position.symbol, Decimal(0)) + quantity
+                prior_inventory = self._inventory.get(position.symbol, Decimal(0))
+                self._inventory[position.symbol] = prior_inventory + quantity
+                if not balances_replayed:
+                    self._cash -= signed
+                newly_borrowed = max(Decimal(0), -self._inventory[position.symbol]) - max(
+                    Decimal(0), -prior_inventory
                 )
-                self._cash -= signed
-                if self._inventory[position.symbol] < 0:
-                    self._borrowed += abs(signed)
+                if newly_borrowed > 0:
+                    entry_price = position.notional_usd / position.quantity
+                    self._borrowed += newly_borrowed * entry_price
             else:
                 self._perp_margin += position.notional_usd / self._leverage
 
@@ -290,6 +347,62 @@ class PaperAccount:
                 else:
                     self._perp_margin += notional / self._leverage
             self._remember_completed(reservation.intent_id)
+
+    async def settle_exit(self, settlements: Sequence[ExitSettlement]) -> None:
+        """Reduce the ledger by what a close actually gave back.
+
+        The mirror of ``settle``. Without it the account only ever grows:
+        every close would leave its entry notional counted against
+        ``max_total_exposure_usd`` forever, and a strategy that opened and
+        closed the same position repeatedly would eventually be refused for
+        exposure it no longer had.
+
+        Floors at zero throughout. A close can only return exposure that was
+        taken on, and clamping is what stops floating-point-free but still
+        imperfect bookkeeping - a position restored at one price and closed
+        against another - from driving a counter negative.
+        """
+        async with self._lock:
+            for settlement in settlements:
+                if settlement.closed_quantity <= 0:
+                    continue
+                released = settlement.released_notional_usd
+                signed = released if settlement.entry_side is Side.BUY else -released
+                self._gross = max(Decimal(0), self._gross - released)
+                key = _position_key(settlement.ref)
+                left = self._position_gross.get(key, Decimal(0)) - released
+                if left > 0:
+                    self._position_gross[key] = left
+                else:
+                    self._position_gross.pop(key, None)
+                self._net -= signed
+                self._pay_fee(settlement.fees_usd)
+                if settlement.ref.market_type is MarketType.SPOT:
+                    inventory = self._inventory.get(settlement.ref.symbol, Decimal(0))
+                    if settlement.entry_side is Side.BUY:
+                        # Held it, sold it back: cash in, inventory out.
+                        self._cash += settlement.exit_notional_usd
+                        inventory -= settlement.closed_quantity
+                    else:
+                        # Borrowed it, bought it back: cash out, borrow repaid.
+                        self._cash -= settlement.exit_notional_usd
+                        inventory += settlement.closed_quantity
+                        self._borrowed = max(Decimal(0), self._borrowed - released)
+                    self._inventory[settlement.ref.symbol] = inventory
+                else:
+                    self._perp_margin = max(
+                        Decimal(0), self._perp_margin - released / self._leverage
+                    )
+                    # Perpetual margin is collateral, not a purchase. Its
+                    # price P&L settles into cash only when the position is
+                    # reduced; omitting it makes account cash reset to the
+                    # starting balance after every profitable or losing perp.
+                    price_pnl = (
+                        settlement.exit_notional_usd - released
+                        if settlement.entry_side is Side.BUY
+                        else released - settlement.exit_notional_usd
+                    )
+                    self._cash += price_pnl
 
     async def release(self, reservation: AccountReservation) -> None:
         """Abort a reservation without declaring its intent completed.

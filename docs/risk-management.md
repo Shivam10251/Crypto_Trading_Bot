@@ -1,7 +1,8 @@
 # Risk Management
 
-Status: **implemented and reviewed (Phase 9).** The risk engine
-(`trading_bot.risk`) sits in front of the execution adapter. Every signal -
+Status: **implemented and reviewed (Phase 9); extended and reviewed in Phase
+10.** The risk engine (`trading_bot.risk`) sits in front of the execution
+adapter. Every signal -
 real or shadow - is evaluated, and every decision is durably stored before
 anything downstream may act on it. The fourteen safety defects found auditing
 the first implementation are listed in
@@ -172,10 +173,12 @@ process takes effect immediately and does not wait for its own write.
   answered for. Paper orders do not remain resting after `submit` returns, but
   they are in flight during simulated latency and can be cancelled in that
   interval. The registry tracks individual orders across concurrent workers.
-- **Already-filled exposure is not unwound.** A kill stops new orders; it
-  does not close positions. Nothing here invents an unwind - that is Phase
-  10's decision, and pretending otherwise would be the dishonest kind of
-  safety.
+- **Already-filled exposure is not unwound *by the kill switch*.** A kill
+  stops new orders; it does not close positions. Since Phase 10 something else
+  does close them - the portfolio service's exit policy, which is deliberately
+  outside this gate (see [Closing a position](#closing-a-position)) - so a
+  halt stops entries while exits carry on reducing exposure. The switch itself
+  still invents no unwind.
 - **Every trigger and re-arm is audited**: who, why, and whether the write
   was durable, via `trading-bot-risk kill --who ... --reason ...` and
   `trading-bot-risk rearm --who ... --reason ...`.
@@ -229,13 +232,11 @@ and the post-trade measurement are the sum of *adverse* per-leg slippage, so
 a leg that filled better than expected can never net off one that filled
 worse, and the two numbers are comparable against the same limit.
 
-## Daily-loss and consecutive-loss limits: honestly deferred
+## Daily-loss and consecutive-loss limits
 
-Phase 10 does not exist yet, so there is no trustworthy realised P&L to
-measure a loss against. `RiskEngine` never evaluates these limits against a
-fabricated zero, which would silently report "not losing" on every signal.
-Instead, a `PnlSource` interface (`realized_pnl_today_usd`,
-`consecutive_losses`) says whether real numbers exist, and configuration
+**Phase 9 built these and honestly reported them as deferred; Phase 10 makes
+them operate.** `RiskEngine` still never evaluates them against a fabricated
+zero. A `PnlSource` says whether real numbers exist, and configuration
 (`risk.daily_loss_policy`, `risk.consecutive_loss_policy`) decides what
 happens while they do not:
 
@@ -249,8 +250,39 @@ happens while they do not:
   a real `PnlSource` is wired in. This is a way to say "do not trade without
   this control operating," not a way to make the limit operate.
 
-When a real `PnlSource` does exist, a breach does more than refuse one
-signal:
+`PortfolioPnlSource` (Phase 10) is the real implementation, and four choices
+decide whether its numbers mean anything:
+
+- **Committed rows only.** Every figure comes from `positions` whose close is
+  durable. A position still `CLOSING`, a fill not yet written, a close in
+  progress in this process - none of them count. A limit that could be moved
+  by work that later rolled back would stop trading for a loss that never
+  happened, or fail to stop it for one that did.
+- **The trade is the pair, not the leg.** A basis attempt's spot leg losing
+  what its perpetual leg made is the *intended* outcome. Both limits count
+  completed **paired** attempts; counting legs would fire
+  `max_consecutive_losses` on the losing half of every hedged trade.
+- **A day is a UTC day.** The daily window is `[00:00 UTC today, now)`, and an
+  attempt belongs to the day its **last** leg closed - the day the trade
+  finished, since that is when its result existed.
+- **Unavailable is still not zero.** A database it cannot read returns `None`,
+  exactly as `NullPnlSource` did, so the fail-closed behaviour above is
+  preserved unchanged. So does the portfolio service being switched off.
+
+The realised figure it supplies is **not complete**: nothing in this system
+measures funding settlements or spot borrow interest yet, so the reading names
+them in `unmeasured` and every approval's context carries
+`incomplete_pnl_components`. The limit is enforced against what *was*
+measured - a measured loss is a real loss - and no row calls that figure a
+total. See [development-phases.md](development-phases.md#limits-1).
+
+`PnlSource` is asynchronous since Phase 10. Keeping it synchronous would have
+meant backing it with a cache some other loop refreshed, leaving the
+daily-loss gate reading a number whose age nothing bounded; its callers were
+already asynchronous, and a short TTL (`portfolio.pnl_refresh_ms`) keeps the
+per-signal cost bounded.
+
+When a control fires, the response is more than refusing one signal:
 
 - **a daily-loss breach halts trading** for `risk.daily_loss_halt_minutes`
   (default 1440 - the day). The halt carries its own expiry, so it clears on
@@ -259,11 +291,38 @@ signal:
   strategy has stopped working" needs review and an explicit, audited
   re-arm.
 
-`NullPnlSource` is the only implementation today, and it always returns
-`None`. There is no way to make `max_daily_loss_usd` or
-`max_consecutive_losses` genuinely enforce a limit before Phase 10 supplies
-real realised P&L - claiming otherwise would be exactly the kind of
-misleading risk claim this phase exists to avoid.
+## Closing a position
+
+A close is not an entry, and gating it with the entry's rules would be a
+mistake. `RiskEngine.evaluate_exit` differs in three deliberate ways:
+
+- **The kill switch does not block a close.** A kill stops *new* exposure; a
+  close removes it, so refusing one while halted would leave the account
+  holding exactly the risk the halt was called for - and Phase 9's own
+  guarantee that a kill "does not close positions" said so precisely because
+  nothing existed to close them safely. The switch's state is recorded on the
+  decision, so a close made during a halt is visible as one.
+- **No capacity is reserved.** `PaperAccount.reserve` exists to stop an entry
+  consuming more than the account has; a close consumes nothing. The account
+  is reduced after the fills are durable, by `settle_exit`.
+- **Reduce-only is enforced here, not trusted.** A close may only give back
+  exposure that exists: the opposite side, a positive quantity, no more than
+  the position still has open, never a shadow probe, never an already-closed
+  position. Anything else is a `REDUCE_ONLY_VIOLATION` and no order is created
+  for it. This is checked even though the closer computes the quantity itself,
+  because "the caller worked it out correctly" is not a safety property - and
+  it is checked a third time by a database CHECK constraint.
+
+What a close *is* still gated on: its decision must be durably recorded before
+any order is sent. That is not the usual fail-closed trade-off - the same
+database that cannot store the decision cannot store the close's orders and
+fills either, and an unrecorded close is exposure the system believes it still
+has.
+
+**A close that flattens one leg and leaves another carrying size is naked
+exposure**, and gets the same response an unhedged *entry* does: a durable
+`ABNORMAL_EXECUTION` row and, under `risk.pause_on_unhedged`, the kill switch.
+The halt stops new entries; it does not stop the residual being closed.
 
 ## Shadow isolation
 
@@ -304,15 +363,15 @@ than the position limit):
 | `max_order_notional_usd` | 1,000 | Fat-finger and runaway sizing |
 | `max_position_notional_usd` | 5,000 | Concentration in one instrument |
 | `max_total_exposure_usd` | 10,000 | Portfolio-wide leverage |
-| `max_daily_loss_usd` | 200 | Losing day compounding - **deferred**, see above |
-| `max_consecutive_losses` | 5 | A strategy that has stopped working - **deferred**, see above |
+| `max_daily_loss_usd` | 200 | Losing day compounding - operates when the portfolio service runs, see above |
+| `max_consecutive_losses` | 5 | A strategy that has stopped working - counts completed paired trades, see above |
 | `max_slippage_bps` | 15 | Executing into thin books (adverse, summed across legs) |
 | `max_latency_ms` | 500 | Acting on information that has aged out |
 | `max_stale_data_ms` | 2,000 | Trading on a frozen feed |
 | `max_funding_age_ms` | 600,000 | Retaining a slow REST funding observation indefinitely |
 | `kill_switch_poll_ms` | 1,000 | Bounds how long another process's kill takes to stop this one |
-| `daily_loss_policy` | `deferred` | `deferred` \| `fail_closed`, see above |
-| `consecutive_loss_policy` | `deferred` | `deferred` \| `fail_closed`, see above |
+| `daily_loss_policy` | `deferred` | What happens while no realised P&L is available: `deferred` \| `fail_closed`, see above |
+| `consecutive_loss_policy` | `deferred` | The same, for the consecutive-loss control |
 | `daily_loss_halt_minutes` | 1,440 | How long a daily-loss breach halts trading for |
 | `pause_on_unhedged` | `true` | Whether naked exposure halts further entries |
 | `pause_on_abnormal_execution` | `true` | Whether realised slippage/latency or an adapter failure halts further entries |

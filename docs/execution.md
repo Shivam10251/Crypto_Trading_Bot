@@ -1,7 +1,8 @@
 # Execution
 
 Status: **paper execution implemented in Phase 8; gated by the risk engine
-since Phase 9.** Phase 17 builds the live path and leaves it disabled.
+since Phase 9; exits added and reviewed in Phase 10.** Phase 17 builds the live
+path and leaves it disabled.
 
 ## Adapter boundary
 
@@ -58,8 +59,9 @@ fails:
 | Zero liquidity | Empty book on one side → no fill |
 
 Supported adapter vocabulary is `BUY`, `SELL`, `OPEN`, `CLOSE`, `CANCEL`, and
-partial fills. The service currently wires entries (`OPEN`) only; exits remain
-Phase 10. Market and IOC/FOK limit orders are supported. GTC is refused until
+partial fills. Both `OPEN` and `CLOSE` are wired: entries come from the
+dispatcher, exits from `trading_bot.portfolio.closer` - see
+[Exits](#exits). Market and IOC/FOK limit orders are supported. GTC is refused until
 trade prints and queue position can justify maker fills. Every fill stores its
 fee rate, consumed levels, book sequence, and fill-time timestamp.
 
@@ -115,14 +117,55 @@ means the simulator receives inputs it can trust:
 - a stored row carrying the exact book levels the decision used, so a paper
   fill can be compared against what the strategy believed
 
-That question is still open after Phase 8: the gross edge assumes the basis
+That question was open after Phase 8: the gross edge assumes the basis
 converges, realised price P&L is
-`signed_quantity x (entry basis - exit basis)`, and nothing yet opens a
-position and closes it again. `OrderIntent.CLOSE` exists and the simulator
-will price one, but the service does not schedule exits. Phase 8 now records
-open exposure in `positions`; `positions.is_shadow` keeps hypothetical probes
-out of account restoration and portfolio reporting. Phase 10 supplies exit
-policy and realised P&L.
+`signed_quantity x (entry basis - exit basis)`, and nothing opened a position
+and closed it again. Phase 10 closes it - the mechanism, not the measurement:
+positions now close and realised P&L is computed from actual fills, but no
+result from a live run has been produced or calibrated yet.
+
+## Exits
+
+`trading_bot.portfolio.closer` is the only thing that closes a position, and
+it uses the same adapter, book and latency the entry did. The pieces that
+differ from an entry, and why:
+
+| Entry | Exit |
+| --- | --- |
+| Order type from `execution.entry_order_type` | **Always MARKET.** An IOC limit can leave part of one leg unfilled - measured on 3 of 21 Phase 8 limit entries - and on an exit that failure mode *creates* the naked exposure the close was called to remove |
+| `OrderIntent.OPEN` | `OrderIntent.CLOSE`, on the opposite side, for the position's remaining open quantity and no more |
+| Reserves capacity in `PaperAccount` | Releases it, via `settle_exit`, at the entry notional of the quantity closed |
+| Blocked by the kill switch | **Not blocked.** A halt stops new exposure; closing removes it. See [risk-management.md](risk-management.md#closing-a-position) |
+| Recorded by the batched `ExecutionRecorder` | Recorded synchronously, in **one transaction** with the position rows it settles |
+
+Both legs are submitted concurrently, exactly as an entry's are: a hedge that
+unwinds in sequence is unhedged in between. Every exit is priced by walking the
+current synchronised books for the exact residual quantity on the side that
+would have to trade - a missing, unsynced or stale book prices nothing, and
+there is no fallback to the last price seen.
+
+A close that fills one leg and not the other leaves **real naked exposure**.
+It is reported as such: a durable `ABNORMAL_EXECUTION` risk event, the kill
+switch under `risk.pause_on_unhedged`, `unpaired_positions` on the next
+portfolio snapshot, a DEGRADED health row, and an `UNPAIRED_RESIDUAL` close on
+the next sweep.
+
+Retries are idempotent within one claim: its execution-intent id is derived
+from the attempt and claim counter, and the unique indexes turn a replay of
+that claim into an update. A later terminal retry increments the counter and
+uses a new identity. The position's exit accounting is recomputed from all of
+its `CLOSE` fills rather than incremented, so applying the record twice is the
+same as applying it once.
+
+The paper close path derives size from freshly row-locked positions and risk
+rechecks it after the claim. The database prevents recorded closed quantity
+from exceeding opened quantity. A future live adapter must also send the
+exchange-native reduce-only flag: a database constraint cannot undo an order
+that an exchange has already filled.
+
+`positions.is_shadow` keeps hypothetical probes out of account restoration,
+portfolio reporting and the exit path entirely - a probe's exposure is
+hypothetical, and closing it would place a real order.
 
 ## Live execution (Phase 17, disabled)
 

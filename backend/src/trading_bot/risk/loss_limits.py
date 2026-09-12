@@ -4,16 +4,20 @@ Pure policy: this module decides *whether* a control fires and what response
 it calls for. ``RiskEngine`` owns the side effects (persisting the decision,
 halting trading), so the rules stay testable without a database.
 
-Two honest states these controls can be in, and they are not the same thing:
+Three honest states these controls can be in, and they are not the same thing:
 
-- **deferred** - there is no realised P&L to measure against (Phase 10 has
-  not built it), so the control is not enforced. It is named in every
-  approval's context so no row ever implies it passed.
-- **breached** - a real ``PnlSource`` supplied a number and it is past the
-  limit. A daily-loss breach halts trading for a configured period and then
-  expires on its own; a consecutive-loss breach is a durable pause that
-  needs review and an explicit re-arm, because "the strategy has stopped
-  working" is not a condition a timer can clear.
+- **deferred** - there is no realised P&L to measure against (the portfolio
+  service is not running, or its database cannot be read), so the control is
+  not enforced. It is named in every approval's context so no row ever
+  implies it passed.
+- **incomplete** - a real ``PnlSource`` supplied a number and named cash
+  flows it could not measure (funding, spot borrow). The limit is enforced
+  against measured price P&L and fees, and every decision names that gap.
+- **breached** - the measured figure is past the limit. A daily-loss breach
+  halts trading for a configured period and then expires on its own; a
+  consecutive-loss breach is a durable pause that needs review and an
+  explicit re-arm, because "the strategy has stopped working" is not a
+  condition a timer can clear.
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ class LossLimitOutcome:
     requires_rearm: bool = False
     #: Controls that could not be evaluated at all, named for the audit row.
     deferred: tuple[str, ...] = ()
+    #: Cash-flow components missing from the realised figure that *was*
+    #: evaluated. Named so no approval implies the number was a total.
+    incomplete: tuple[str, ...] = ()
 
     @property
     def halts_trading(self) -> bool:
@@ -53,18 +60,20 @@ def _unavailable(limit_name: str, policy_name: str) -> LimitBreach:
             else RiskEventType.CONSECUTIVE_LOSSES
         ),
         reason=(
-            f"{limit_name} cannot be evaluated: no realised P&L source is wired in yet "
-            f"(Phase 10). Failing closed per the configured {policy_name}."
+            f"{limit_name} cannot be evaluated: no realised P&L is available "
+            f"(the portfolio service is off, or its durable rows cannot be read). "
+            f"Failing closed per the configured {policy_name}."
         ),
         limit_name=policy_name,
     )
 
 
-def evaluate(pnl: PnlSource, config: RiskConfig, now: datetime) -> LossLimitOutcome:
+async def evaluate(pnl: PnlSource, config: RiskConfig, now: datetime) -> LossLimitOutcome:
     """Evaluate both P&L-sourced controls. Never against a fabricated zero."""
     deferred: list[str] = []
+    incomplete: list[str] = []
 
-    daily = pnl.realized_pnl_today_usd()
+    daily = await pnl.realized_pnl_today_usd()
     if daily is None:
         if config.daily_loss_policy == "fail_closed":
             return LossLimitOutcome(
@@ -73,22 +82,28 @@ def evaluate(pnl: PnlSource, config: RiskConfig, now: datetime) -> LossLimitOutc
             )
         deferred.append("max_daily_loss_usd")
     else:
+        incomplete.extend(daily.unmeasured)
         limit = Decimal(str(config.max_daily_loss_usd))
-        if daily <= -limit:
+        if daily.net_usd <= -limit:
+            missing = (
+                f"; measured without {', '.join(daily.unmeasured)}" if daily.unmeasured else ""
+            )
             return LossLimitOutcome(
                 breach=LimitBreach(
                     RiskEventType.DAILY_LOSS_LIMIT,
-                    f"realised loss today is {daily}, past the -{limit} limit; "
-                    f"trading is halted for {config.daily_loss_halt_minutes} minutes",
+                    f"realised loss since {daily.window_start.isoformat()} is "
+                    f"{daily.net_usd} over {daily.trades} completed trades, past the "
+                    f"-{limit} limit{missing}; trading is halted for "
+                    f"{config.daily_loss_halt_minutes} minutes",
                     "max_daily_loss_usd",
                     limit,
-                    daily,
+                    daily.net_usd,
                 ),
                 halted_until=now + timedelta(minutes=config.daily_loss_halt_minutes),
                 deferred=tuple(deferred),
+                incomplete=tuple(incomplete),
             )
-
-    losses = pnl.consecutive_losses()
+    losses = await pnl.consecutive_losses()
     if losses is None:
         if config.consecutive_loss_policy == "fail_closed":
             return LossLimitOutcome(
@@ -108,6 +123,7 @@ def evaluate(pnl: PnlSource, config: RiskConfig, now: datetime) -> LossLimitOutc
             ),
             requires_rearm=True,
             deferred=tuple(deferred),
+            incomplete=tuple(incomplete),
         )
 
-    return LossLimitOutcome(deferred=tuple(deferred))
+    return LossLimitOutcome(deferred=tuple(deferred), incomplete=tuple(incomplete))

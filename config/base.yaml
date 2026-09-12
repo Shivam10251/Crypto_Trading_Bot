@@ -212,6 +212,44 @@ risk:
   pause_on_unhedged: true
   pause_on_abnormal_execution: true
 
+portfolio:
+  # Phase 10: valuation, exits and realised P&L. Off by default, like
+  # execution - a service that closes positions must be switched on
+  # deliberately. While it is off, realised P&L is unavailable (never zero)
+  # and the two risk limits above report as deferred exactly as before.
+  enabled: false
+  # Snapshot cadence. This is ALSO the return-sampling interval that Sharpe
+  # and Sortino are annualised from; they are computed from nothing else, and
+  # stay NULL unless there are enough regularly spaced observations.
+  snapshot_interval_ms: 60000
+  # A mark older than this cannot value a position. The snapshot then reports
+  # DEGRADED (or UNAVAILABLE) rather than reusing the last price it saw.
+  mark_max_age_ms: 5000
+  min_return_observations: 30
+  # Zero is the honest default for a market-neutral book quoted in USDT.
+  risk_free_rate_annual_pct: 0.0
+  # How stale the risk engine's realised-P&L view may be before it is re-read
+  # from durable rows. Bounds the daily-loss gate's staleness.
+  pnl_refresh_ms: 1000
+  exits:
+    # Closing is off even when the portfolio service is on: valuing the book
+    # and closing it are different permissions.
+    enabled: false
+    evaluate_interval_ms: 1000
+    # Close once the basis has converged to within this many bps of flat,
+    # measured in the direction the position was entered. This says the
+    # spread came back - NOT that the round trip cleared its fees.
+    target_basis_bps: 0.0
+    # A basis position held indefinitely stops being the trade that was made.
+    max_holding_minutes: 240
+    # Stop: the basis has widened against the entry by this much.
+    adverse_basis_bps: 25.0
+    max_book_age_ms: 2000
+    # How long a claimed-but-unfinished close may sit before another pass may
+    # recover it. Bounds recovery after a crash mid-exit.
+    claim_timeout_ms: 30000
+    max_close_attempts: 5
+
 retention:
   # Raw market data is high volume and low long-term value: keep a working
   # window, not everything forever. Opportunities, orders, fills, positions,

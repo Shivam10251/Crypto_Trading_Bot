@@ -36,7 +36,7 @@ from trading_bot.execution.models import ExecutionResult, OrderRequest, Rejectio
 from trading_bot.risk import post_trade
 from trading_bot.risk.engine import RiskEngine
 from trading_bot.risk.kill_switch import KillSwitchState
-from trading_bot.risk.models import PnlSource, RiskEventDraft
+from trading_bot.risk.models import PnlSource, RealizedPnl, RiskEventDraft
 from trading_bot.strategy.evidence import (
     ConstraintEvidence,
     FillEvidence,
@@ -45,6 +45,9 @@ from trading_bot.strategy.evidence import (
     QuoteEvidence,
 )
 from trading_bot.strategy.models import Leg, Opportunity, Signal
+
+#: Midnight UTC of the day ``NOW`` falls in - the daily-loss window's start.
+_DAY_START = NOW.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 class FakeStore:
@@ -113,16 +116,36 @@ class _MutableClock:
 
 
 class FakePnl:
-    """A realised-P&L source, which Phase 10 will eventually supply for real."""
+    """A realised-P&L source. Phase 10 supplies the real one.
 
-    def __init__(self, *, daily: Decimal | None = None, consecutive: int | None = None) -> None:
+    Asynchronous like the protocol: the real source reads committed rows from
+    PostgreSQL, and a synchronous double here would let the engine drift away
+    from an interface it could not actually satisfy.
+    """
+
+    def __init__(
+        self,
+        *,
+        daily: Decimal | None = None,
+        consecutive: int | None = None,
+        unmeasured: tuple[str, ...] = (),
+    ) -> None:
         self._daily = daily
         self._consecutive = consecutive
+        self._unmeasured = unmeasured
 
-    def realized_pnl_today_usd(self) -> Decimal | None:
-        return self._daily
+    async def realized_pnl_today_usd(self) -> RealizedPnl | None:
+        if self._daily is None:
+            return None
+        return RealizedPnl(
+            net_usd=self._daily,
+            trades=1,
+            unmeasured=self._unmeasured,
+            window_start=_DAY_START,
+            as_of=_DAY_START,
+        )
 
-    def consecutive_losses(self) -> int | None:
+    async def consecutive_losses(self) -> int | None:
         return self._consecutive
 
 

@@ -17,6 +17,7 @@ from trading_bot import __version__
 from trading_bot.api.deps import SettingsDep
 from trading_bot.api.execution_status import execution_status
 from trading_bot.api.market_status import market_data_status
+from trading_bot.api.portfolio_status import portfolio_status
 from trading_bot.api.risk_status import risk_status
 from trading_bot.api.schemas import (
     ComponentHealth,
@@ -32,8 +33,9 @@ router = APIRouter(tags=["system"])
 
 # Subsystems not yet built. Kept here so exactly one place needs editing as
 # each phase lands, and so nothing reports a status it cannot substantiate.
-# Empty since Phase 9: Portfolio & P&L (Phase 10) has no component row of its
-# own yet, and will add one when it does.
+# Empty since Phase 10: every subsystem with a row now judges itself by the
+# evidence it wrote, and the dashboard (Phases 12-13) is a frontend rather
+# than a backend component.
 _PENDING_COMPONENTS: tuple[tuple[str, str], ...] = ()
 
 
@@ -109,6 +111,10 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
         # this strategy, so it reads OFFLINE with the reason rather than as a
         # fault - and never as HEALTHY on no evidence.
         await execution_status(settings, now),
+        # Judged by the portfolio snapshots it wrote, and DEGRADED whenever
+        # it cannot value what it is counting, is carrying exposure whose
+        # hedge is gone, or has cash flows it could not measure.
+        await portfolio_status(settings, now),
         *_pending_components(),
     ]
     return SystemStatusResponse(

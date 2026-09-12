@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
-from tests.unit.test_execution_coordinator import Adapter, opportunity, signal
+from decimal import Decimal
+
+from tests.unit.test_execution_coordinator import PERP, SPOT, Adapter, opportunity, signal
 from trading_bot.core.config import ExecutionConfig, RiskConfig
-from trading_bot.execution.account import AccountRejection, PaperAccount
+from trading_bot.db.models.enums import MarketType, Side
+from trading_bot.execution.account import (
+    AccountRejection,
+    ExitSettlement,
+    PaperAccount,
+    PaperPositionSeed,
+)
 from trading_bot.execution.coordinator import ExecutionCoordinator
 from trading_bot.execution.models import RejectionCode
 
@@ -171,3 +179,237 @@ async def test_retrying_a_completed_intent_does_not_double_count_exposure() -> N
     assert first is not None and second is not None
     assert gross_after_first > 0
     assert account.gross_exposure_usd == gross_after_first
+
+
+class TestExitSettlement:
+    """Exposure has to come back when a position closes.
+
+    Without ``settle_exit`` the account only ever grows: every closed
+    position's entry notional would count against ``max_total_exposure_usd``
+    forever, and a strategy that opened and closed the same position
+    repeatedly would eventually be refused for exposure it no longer had.
+    """
+
+    async def test_closing_gives_the_gross_exposure_back(self) -> None:
+        adapter = Adapter()
+        account = PaperAccount(ExecutionConfig(), RiskConfig())
+        coordinator = ExecutionCoordinator(adapter, account=account)
+        attempt = await coordinator.execute(signal(), execution_intent_id="open")
+        assert attempt is not None and attempt.is_hedged
+        opened = account.gross_exposure_usd
+        assert opened > 0
+
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=outcome.leg.ref,
+                    entry_side=outcome.leg.side,
+                    entry_price=outcome.result.average_price or Decimal(0),
+                    closed_quantity=outcome.result.filled_quantity,
+                    exit_notional_usd=outcome.result.notional,
+                    fees_usd=Decimal(0),
+                )
+                for outcome in attempt.legs
+            ]
+        )
+
+        assert account.gross_exposure_usd == Decimal(0)
+        assert account.net_exposure_usd == Decimal(0)
+
+    async def test_capacity_a_close_returned_can_be_used_again(self) -> None:
+        """The whole point: exposure that has been given back is available."""
+        risk = RiskConfig(
+            max_order_notional_usd=200,
+            max_position_notional_usd=300,
+            max_total_exposure_usd=300,
+        )
+        adapter = Adapter()
+        account = PaperAccount(ExecutionConfig(), risk)
+        coordinator = ExecutionCoordinator(adapter, account=account)
+        first = await coordinator.execute(signal(), execution_intent_id="first")
+        assert first is not None and first.is_hedged
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=outcome.leg.ref,
+                    entry_side=outcome.leg.side,
+                    entry_price=outcome.result.average_price or Decimal(0),
+                    closed_quantity=outcome.result.filled_quantity,
+                    exit_notional_usd=outcome.result.notional,
+                    fees_usd=Decimal(0),
+                )
+                for outcome in first.legs
+            ]
+        )
+
+        second = await coordinator.execute(signal(), execution_intent_id="second")
+
+        assert second is not None and second.is_hedged
+
+    async def test_a_spot_sale_returns_cash_and_removes_inventory(self) -> None:
+        account = PaperAccount(
+            ExecutionConfig(paper_cash_usd=1000, paper_spot_inventory={"BTCUSDT": 2.0}),
+            RiskConfig(),
+        )
+        before = account.cash_usd
+
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=SPOT,
+                    entry_side=Side.BUY,
+                    entry_price=Decimal(100),
+                    closed_quantity=Decimal(1),
+                    exit_notional_usd=Decimal(110),
+                    fees_usd=Decimal(1),
+                )
+            ]
+        )
+
+        # 110 of proceeds, less 1 of fee.
+        assert account.cash_usd == before + Decimal(109)
+
+    async def test_exposure_is_released_at_the_entry_price_not_the_exit_price(self) -> None:
+        """Releasing at the exit price would leave gross drifting by the
+        position's own P&L on every close."""
+        account = PaperAccount(ExecutionConfig(), RiskConfig())
+        account.restore(
+            [
+                PaperPositionSeed(
+                    symbol="BTCUSDT",
+                    market_type=MarketType.PERPETUAL,
+                    side=Side.SELL,
+                    quantity=Decimal(1),
+                    notional_usd=Decimal(100),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+        assert account.gross_exposure_usd == Decimal(100)
+
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=PERP,
+                    entry_side=Side.SELL,
+                    entry_price=Decimal(100),
+                    closed_quantity=Decimal(1),
+                    # Closed well away from the entry.
+                    exit_notional_usd=Decimal(140),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+
+        assert account.gross_exposure_usd == Decimal(0)
+
+    async def test_perpetual_price_pnl_settles_into_cash(self) -> None:
+        account = PaperAccount(ExecutionConfig(paper_cash_usd=1000), RiskConfig())
+        account.restore(
+            [
+                PaperPositionSeed(
+                    symbol="BTCUSDT",
+                    market_type=MarketType.PERPETUAL,
+                    side=Side.SELL,
+                    quantity=Decimal(1),
+                    notional_usd=Decimal(100),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=PERP,
+                    entry_side=Side.SELL,
+                    entry_price=Decimal(100),
+                    closed_quantity=Decimal(1),
+                    exit_notional_usd=Decimal(90),
+                    fees_usd=Decimal(1),
+                )
+            ]
+        )
+
+        assert account.cash_usd == Decimal(1009)
+
+    def test_durable_cash_restore_does_not_replay_open_cash_flows(self) -> None:
+        account = PaperAccount(ExecutionConfig(paper_cash_usd=1000), RiskConfig())
+
+        account.restore(
+            [
+                PaperPositionSeed(
+                    symbol="BTCUSDT",
+                    market_type=MarketType.SPOT,
+                    side=Side.BUY,
+                    quantity=Decimal(1),
+                    notional_usd=Decimal(100),
+                    fees_usd=Decimal(1),
+                )
+            ],
+            durable_cash_usd=Decimal(899),
+        )
+
+        assert account.cash_usd == Decimal(899)
+        assert account.gross_exposure_usd == Decimal(100)
+
+    async def test_a_partial_close_returns_only_the_part_it_closed(self) -> None:
+        account = PaperAccount(ExecutionConfig(), RiskConfig())
+        account.restore(
+            [
+                PaperPositionSeed(
+                    symbol="BTCUSDT",
+                    market_type=MarketType.PERPETUAL,
+                    side=Side.SELL,
+                    quantity=Decimal(2),
+                    notional_usd=Decimal(200),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=PERP,
+                    entry_side=Side.SELL,
+                    entry_price=Decimal(100),
+                    closed_quantity=Decimal(1),
+                    exit_notional_usd=Decimal(100),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+
+        assert account.gross_exposure_usd == Decimal(100)
+        assert account.net_exposure_usd == Decimal(-100)
+
+    async def test_a_zero_fill_close_changes_nothing(self) -> None:
+        account = PaperAccount(ExecutionConfig(), RiskConfig())
+        account.restore(
+            [
+                PaperPositionSeed(
+                    symbol="BTCUSDT",
+                    market_type=MarketType.PERPETUAL,
+                    side=Side.SELL,
+                    quantity=Decimal(1),
+                    notional_usd=Decimal(100),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+
+        await account.settle_exit(
+            [
+                ExitSettlement(
+                    ref=PERP,
+                    entry_side=Side.SELL,
+                    entry_price=Decimal(100),
+                    closed_quantity=Decimal(0),
+                    exit_notional_usd=Decimal(0),
+                    fees_usd=Decimal(0),
+                )
+            ]
+        )
+
+        assert account.gross_exposure_usd == Decimal(100)

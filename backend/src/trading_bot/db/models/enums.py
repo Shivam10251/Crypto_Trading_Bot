@@ -99,14 +99,44 @@ class RiskEventType(StrEnum):
     CONSECUTIVE_LOSSES = "CONSECUTIVE_LOSSES"
     ABNORMAL_EXECUTION = "ABNORMAL_EXECUTION"
     KILL_SWITCH = "KILL_SWITCH"
+    # Phase 10. An exit decision: which condition asked for the close, and
+    # what the current books priced it at. Recorded for every close attempt,
+    # unlike an entry approval, because a close is the one action the kill
+    # switch does not gate and its audit trail is the only record of it.
+    POSITION_EXIT = "POSITION_EXIT"
+    # A close request that would have increased, reversed or exceeded the
+    # exposure it claimed to reduce. Refused before any order exists.
+    REDUCE_ONLY_VIOLATION = "REDUCE_ONLY_VIOLATION"
     # Database or risk-state uncertainty: refused rather than guessed.
     FAIL_CLOSED = "FAIL_CLOSED"
 
 
 class PositionStatus(StrEnum):
     OPEN = "OPEN"
+    # An exit has been claimed for this position and may be in flight. The
+    # exposure still exists - a CLOSING position is restored into the paper
+    # account exactly like an OPEN one - but no second worker may claim it.
+    CLOSING = "CLOSING"
     CLOSED = "CLOSED"
     LIQUIDATED = "LIQUIDATED"
+
+
+#: Exposure that still exists and must be valued, reserved against and closed.
+LIVE_POSITION_STATUSES = (PositionStatus.OPEN, PositionStatus.CLOSING)
+
+
+class ValuationStatus(StrEnum):
+    """Whether a portfolio snapshot could value every position it counted.
+
+    A snapshot is never silently computed from a stale or missing mark: it
+    either values everything from a synchronised book (``COMPLETE``), says
+    which part it could not (``DEGRADED``), or declines to publish a number
+    at all (``UNAVAILABLE``, with NULL position value and equity).
+    """
+
+    COMPLETE = "COMPLETE"
+    DEGRADED = "DEGRADED"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 class ExecutionMode(StrEnum):

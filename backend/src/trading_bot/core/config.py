@@ -435,6 +435,65 @@ class RiskConfig(ConfigSection):
         return self
 
 
+class ExitPolicyConfig(ConfigSection):
+    """When an open basis attempt is closed, and how the close is priced.
+
+    Every condition here is a *reason to stop holding*, never a prediction
+    that closing now is profitable. The price an exit gets comes from walking
+    the current synchronised books for the exact residual quantity; nothing in
+    this section can make a close look better than the book it filled against.
+    """
+
+    # Off by default, like execution itself: a service that closes positions
+    # must be switched on deliberately.
+    enabled: bool = False
+    evaluate_interval_ms: int = Field(default=1000, ge=100)
+    # Close once the basis has converged to within this many bps of flat,
+    # measured in the direction the position was entered. Zero means full
+    # convergence, matching ``costs.assumed_terminal_basis_bps``'s default.
+    target_basis_bps: float = Field(default=0.0, ge=0)
+    # Close regardless of the basis after this long. A basis position held
+    # indefinitely is an unhedged bet on funding, not the trade that was made.
+    max_holding_minutes: float = Field(default=240.0, gt=0)
+    # Close when the basis has widened against the entry by this much. A stop,
+    # not a target: it does not claim the exit is profitable.
+    adverse_basis_bps: float = Field(default=25.0, gt=0)
+    # A book older than this cannot price an exit, exactly as it cannot price
+    # an entry (``execution.max_book_age_ms``).
+    max_book_age_ms: int = Field(default=2000, gt=0)
+    # How long a claimed-but-unfinished close may sit before another pass may
+    # reconcile and retry it. Bounds recovery after a crash mid-exit.
+    claim_timeout_ms: int = Field(default=30_000, gt=0)
+    # Retries of a close that filled nothing. A close that keeps failing is an
+    # operator's problem, not something to retry forever.
+    max_close_attempts: int = Field(default=5, ge=1, le=100)
+
+
+class PortfolioConfig(ConfigSection):
+    """Portfolio valuation, P&L snapshots and the exit policy (Phase 10)."""
+
+    # Off by default. With it off nothing closes positions and no snapshot is
+    # written; the risk engine's P&L source then reports unavailable, which is
+    # the honest state rather than a fabricated zero.
+    enabled: bool = False
+    # Snapshot cadence. Also the return-sampling interval for Sharpe/Sortino:
+    # they are annualised from this, and from nothing else.
+    snapshot_interval_ms: int = Field(default=60_000, ge=1000)
+    # A mark older than this cannot value a position. The snapshot then says
+    # DEGRADED (or UNAVAILABLE) rather than reusing the last price it saw.
+    mark_max_age_ms: int = Field(default=5000, gt=0)
+    # Sharpe and Sortino need enough regularly spaced observations to mean
+    # anything. Below this they are stored as NULL, never estimated.
+    min_return_observations: int = Field(default=30, ge=2)
+    # Annual risk-free rate used for both ratios, in percent. Zero is the
+    # honest default for a market-neutral crypto book quoted in USDT.
+    risk_free_rate_annual_pct: float = Field(default=0.0, ge=0)
+    # How fresh the risk engine's P&L view may be before it is re-read from
+    # durable rows. Bounds the staleness of the daily-loss gate.
+    pnl_refresh_ms: int = Field(default=1000, ge=100, le=60_000)
+    exits: ExitPolicyConfig = Field(default_factory=ExitPolicyConfig)
+
+
 class RetentionConfig(ConfigSection):
     """How long high-frequency raw data is kept.
 
@@ -547,6 +606,7 @@ class Settings(BaseSettings):
     opportunities: OpportunitiesConfig = Field(default_factory=OpportunitiesConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 

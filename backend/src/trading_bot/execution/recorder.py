@@ -31,7 +31,7 @@ from trading_bot.db.models import Position as PositionRow
 from trading_bot.db.models.enums import ExecutionMode, OrderStatus, PositionStatus
 from trading_bot.exchange.models import MarketRef
 from trading_bot.execution.coordinator import ExecutionAttempt, LegOutcome
-from trading_bot.execution.models import ExecutionResult
+from trading_bot.execution.models import ExecutionResult, OrderIntent
 
 logger = get_logger(__name__)
 
@@ -265,6 +265,12 @@ class ExecutionRecorder:
                 result_row.filled_quantity <= 0
                 or result_row.average_price is None
                 or request.attempt_id is None
+                # A close does not open a position - it settles one. Phase 10
+                # writes the exit side itself, transactionally with the
+                # position update, so a CLOSE order must never reach the
+                # entry upsert below: it would overwrite the position's entry
+                # price and quantity with the exit's.
+                or request.intent is not OrderIntent.OPEN
             ):
                 continue
             if request.expected_price is None:
@@ -309,6 +315,13 @@ class ExecutionRecorder:
                         for key in position_values[0]
                         if key not in {"mode", "attempt_id", "market_id"}
                     },
+                    # A retried entry flush must not resurrect a position an
+                    # exit has already touched. Without this the upsert would
+                    # write status OPEN, realized 0 and the entry quantity
+                    # over a position Phase 10 had closed - and a re-opened
+                    # position is exposure the account does not have.
+                    where=(PositionRow.status == PositionStatus.OPEN)
+                    & (PositionRow.closed_quantity == 0),
                 )
             )
             stored_positions = await session.execute(
