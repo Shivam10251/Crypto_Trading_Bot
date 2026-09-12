@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tests.integration.factories import make_market, make_opportunity
 from trading_bot.core.config import CostsConfig
 from trading_bot.db.models import Market, Opportunity
-from trading_bot.db.models.enums import MarketType
+from trading_bot.db.models.enums import MarketType, OpportunityStatus
 from trading_bot.opportunities.recost import recost, recost_row
 from trading_bot.strategy.fees import FeeSchedule, OrderRole
 
@@ -164,6 +164,40 @@ class TestRecostReport:
         report = await recost(db, CHEAPEST, entry_role=OrderRole.MAKER, exit_role=OrderRole.MAKER)
         assert report.newly_profitable == ()
         assert "no verdict changed" in report.describe()
+
+    async def test_an_unpriceable_row_is_skipped_and_counted(self, db: AsyncSession) -> None:
+        """A fee schedule cannot change a verdict that was never reached.
+
+        Treating an unpriceable row's missing costs as zero would invent the
+        very number it was stored without.
+        """
+        await seed(db)
+        spot = make_market("ETHUSDT", MarketType.SPOT)
+        perp = make_market("ETHUSDT", MarketType.PERPETUAL)
+        db.add_all([spot, perp])
+        await db.flush()
+        unpriceable = make_opportunity(
+            spot,
+            perp,
+            detected_at=NOW,
+            status=OpportunityStatus.UNPRICEABLE,
+            rejection_reason="FUNDING_UNKNOWN",
+            net_edge_bps=None,
+            net_edge_usd=None,
+            estimated_fees_usd=None,
+            estimated_slippage_usd=None,
+            funding_cost_usd=None,
+            borrow_cost_usd=None,
+            other_costs_usd=None,
+            safety_buffer_usd=None,
+        )
+        db.add(unpriceable)
+        await db.flush()
+
+        report = await recost(db, CHEAPEST)
+        assert report.total == 1
+        assert report.skipped_unpriceable == 1
+        assert "1 unpriceable opportunities skipped" in report.describe()
 
     async def test_an_empty_record_reports_cleanly(self, db: AsyncSession) -> None:
         report = await recost(db, BASE)

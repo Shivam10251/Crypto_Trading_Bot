@@ -233,16 +233,30 @@ class MarketDataEngine:
     # --- consumer API -----------------------------------------------------
 
     def snapshot(self, ref: MarketRef) -> MarketSnapshot:
+        return self._snapshot(ref, execution=False)
+
+    def execution_snapshot(self, ref: MarketRef) -> MarketSnapshot:
+        """A snapshot carrying every locally known depth level."""
+        return self._snapshot(ref, execution=True)
+
+    def _snapshot(self, ref: MarketRef, *, execution: bool) -> MarketSnapshot:
         tracker = self._trackers.get(ref)
         if tracker is None:
             raise UnknownMarketError(f"{ref} is not subscribed")
         now = self._clock()
-        view = self._books.view(ref) if self._books is not None else DISABLED_VIEW
+        view = (
+            self._books.execution_view(ref)
+            if execution and self._books is not None
+            else self._books.view(ref)
+            if self._books is not None
+            else DISABLED_VIEW
+        )
         ticker = tracker.ticker
+        quote = tracker.quote
         return MarketSnapshot(
             ref=ref,
             status=self._status(tracker, now),
-            quote=tracker.quote,
+            quote=quote,
             book=view.book,
             book_status=view.status,
             last_price=ticker.last_price if ticker else None,
@@ -254,6 +268,13 @@ class MarketDataEngine:
                 _ms_between(now, tracker.last_update_at)
                 if tracker.last_update_at is not None
                 else None
+            ),
+            # Per component, because the aggregate above hides a stale one: a
+            # 24h ticker refreshes last_update_at while the quote the strategy
+            # is about to price against goes on ageing.
+            quote_age_ms=(_ms_between(now, quote.local_timestamp) if quote is not None else None),
+            book_age_ms=(
+                _ms_between(now, view.book.local_timestamp) if view.book is not None else None
             ),
             updates=tracker.updates,
             gaps=tracker.gaps,

@@ -125,6 +125,7 @@ class TestEnumColumns:
             "DETECTED",
             "VALIDATED",
             "REJECTED",
+            "UNPRICEABLE",
             "PAPER_TRADE",
             "EXPIRED",
             "EXECUTED",

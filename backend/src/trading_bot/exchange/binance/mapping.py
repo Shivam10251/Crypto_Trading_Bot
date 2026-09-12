@@ -32,10 +32,33 @@ from trading_bot.exchange.models import (
     TradePrint,
 )
 
-# Filter names in exchangeInfo, which differ subtly between spot and futures.
+# Filter names and *keys* in exchangeInfo, which differ between spot and
+# futures. Verified against the live API on 2026-09-12:
+#   spot     NOTIONAL     {"minNotional": "5.00000000", "maxNotional": ...}
+#   futures  MIN_NOTIONAL {"notional": "50"}
+# All 3,698 spot symbols use the first shape and all 897 USD-M perpetuals the
+# second; not one futures symbol publishes a "minNotional" key. Reading only
+# "minNotional" left every perpetual's minimum unknown.
 _TICK_FILTERS = ("PRICE_FILTER",)
-_LOT_FILTERS = ("LOT_SIZE",)
+_LOT_FILTER = "LOT_SIZE"
+_MARKET_LOT_FILTER = "MARKET_LOT_SIZE"
 _NOTIONAL_FILTERS = ("NOTIONAL", "MIN_NOTIONAL")
+_NOTIONAL_KEYS = ("minNotional", "notional")
+
+
+def _filter_decimal(
+    raw_filter: dict[str, Any], keys: tuple[str, ...], symbol: str
+) -> Decimal | None:
+    """First of ``keys`` the venue actually published, as a Decimal."""
+    for key in keys:
+        if raw_filter.get(key) is not None:
+            return to_decimal(raw_filter[key], f"{symbol} {key}")
+    return None
+
+
+def _positive_or_none(value: Decimal | None) -> Decimal | None:
+    """Binance publishes ``0`` for a lot filter that constrains nothing."""
+    return value if value is not None and value > 0 else None
 
 
 def _require(payload: Any, key: str, context: str) -> Any:
@@ -81,18 +104,73 @@ def parse_market_spec(payload: dict[str, Any], venue: str, market_type: MarketTy
     status = str(payload.get("status", "")).upper()
 
     tick_size: Decimal | None = None
-    step_size: Decimal | None = None
+    min_price: Decimal | None = None
+    max_price: Decimal | None = None
+    percent_price_up: Decimal | None = None
+    percent_price_down: Decimal | None = None
+    bid_percent_price_up: Decimal | None = None
+    bid_percent_price_down: Decimal | None = None
+    ask_percent_price_up: Decimal | None = None
+    ask_percent_price_down: Decimal | None = None
+    percent_price_avg_mins = 0
     min_notional: Decimal | None = None
+    max_notional: Decimal | None = None
+    min_notional_apply_to_market = True
+    max_notional_apply_to_market = False
+    notional_avg_price_mins = 0
+    lot: dict[str, Any] = {}
+    market_lot: dict[str, Any] = {}
     for raw_filter in payload.get("filters", []):
         if not isinstance(raw_filter, dict):
             continue
         kind = raw_filter.get("filterType")
         if kind in _TICK_FILTERS and "tickSize" in raw_filter:
             tick_size = to_decimal(raw_filter["tickSize"], f"{symbol} tickSize")
-        elif kind in _LOT_FILTERS and "stepSize" in raw_filter:
-            step_size = to_decimal(raw_filter["stepSize"], f"{symbol} stepSize")
-        elif kind in _NOTIONAL_FILTERS and "minNotional" in raw_filter:
-            min_notional = to_decimal(raw_filter["minNotional"], f"{symbol} minNotional")
+            min_price = _positive_or_none(_filter_decimal(raw_filter, ("minPrice",), symbol))
+            max_price = _positive_or_none(_filter_decimal(raw_filter, ("maxPrice",), symbol))
+        elif kind == _LOT_FILTER:
+            lot = raw_filter
+        elif kind == _MARKET_LOT_FILTER:
+            market_lot = raw_filter
+        elif kind in _NOTIONAL_FILTERS:
+            min_notional = _filter_decimal(raw_filter, _NOTIONAL_KEYS, symbol)
+            max_notional = _positive_or_none(_filter_decimal(raw_filter, ("maxNotional",), symbol))
+            if kind == "NOTIONAL":
+                min_notional_apply_to_market = bool(raw_filter.get("applyMinToMarket", False))
+                max_notional_apply_to_market = bool(raw_filter.get("applyMaxToMarket", False))
+            else:
+                min_notional_apply_to_market = bool(raw_filter.get("applyToMarket", True))
+            try:
+                notional_avg_price_mins = int(raw_filter.get("avgPriceMins", 0))
+            except (TypeError, ValueError) as exc:
+                raise ExchangeDataError(
+                    f"{symbol} avgPriceMins: {raw_filter.get('avgPriceMins')!r} is not an integer"
+                ) from exc
+        elif kind in {"PERCENT_PRICE", "PERCENT_PRICE_BY_SIDE"}:
+            percent_price_up = _positive_or_none(
+                _filter_decimal(raw_filter, ("multiplierUp",), symbol)
+            )
+            percent_price_down = _positive_or_none(
+                _filter_decimal(raw_filter, ("multiplierDown",), symbol)
+            )
+            bid_percent_price_up = _positive_or_none(
+                _filter_decimal(raw_filter, ("bidMultiplierUp",), symbol)
+            )
+            bid_percent_price_down = _positive_or_none(
+                _filter_decimal(raw_filter, ("bidMultiplierDown",), symbol)
+            )
+            ask_percent_price_up = _positive_or_none(
+                _filter_decimal(raw_filter, ("askMultiplierUp",), symbol)
+            )
+            ask_percent_price_down = _positive_or_none(
+                _filter_decimal(raw_filter, ("askMultiplierDown",), symbol)
+            )
+            try:
+                percent_price_avg_mins = int(raw_filter.get("avgPriceMins", 0))
+            except (TypeError, ValueError) as exc:
+                raise ExchangeDataError(
+                    f"{symbol} avgPriceMins: {raw_filter.get('avgPriceMins')!r} is not an integer"
+                ) from exc
 
     return MarketSpec(
         ref=MarketRef(venue=venue, symbol=symbol, market_type=market_type),
@@ -101,8 +179,27 @@ def parse_market_spec(payload: dict[str, Any], venue: str, market_type: MarketTy
         # Futures use "TRADING" too; anything else means not tradeable now.
         is_active=status == "TRADING",
         tick_size=tick_size,
-        step_size=step_size,
+        min_price=min_price,
+        max_price=max_price,
+        percent_price_up=percent_price_up,
+        percent_price_down=percent_price_down,
+        bid_percent_price_up=bid_percent_price_up,
+        bid_percent_price_down=bid_percent_price_down,
+        ask_percent_price_up=ask_percent_price_up,
+        ask_percent_price_down=ask_percent_price_down,
+        percent_price_avg_mins=percent_price_avg_mins,
+        step_size=_positive_or_none(_filter_decimal(lot, ("stepSize",), symbol)),
         min_notional=min_notional,
+        max_notional=max_notional,
+        min_notional_apply_to_market=min_notional_apply_to_market,
+        max_notional_apply_to_market=max_notional_apply_to_market,
+        notional_avg_price_mins=notional_avg_price_mins,
+        market_notional_uses_mark_price=market_type is MarketType.PERPETUAL,
+        min_qty=_positive_or_none(_filter_decimal(lot, ("minQty",), symbol)),
+        max_qty=_positive_or_none(_filter_decimal(lot, ("maxQty",), symbol)),
+        market_min_qty=_positive_or_none(_filter_decimal(market_lot, ("minQty",), symbol)),
+        market_max_qty=_positive_or_none(_filter_decimal(market_lot, ("maxQty",), symbol)),
+        market_step_size=_positive_or_none(_filter_decimal(market_lot, ("stepSize",), symbol)),
         contract_size=(
             to_decimal(payload["contractSize"], f"{symbol} contractSize")
             if payload.get("contractSize") is not None
@@ -172,6 +269,8 @@ def parse_order_book(
         local_timestamp=local_timestamp,
         exchange_timestamp=exchange_timestamp,
         sequence=int(sequence) if sequence is not None else None,
+        bids_complete=False,
+        asks_complete=False,
     )
 
 

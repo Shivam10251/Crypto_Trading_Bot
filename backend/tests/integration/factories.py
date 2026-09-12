@@ -78,7 +78,8 @@ def make_opportunity(
     market: Market,
     secondary_market: Market | None = None,
     *,
-    net_edge_bps: str = "3.5",
+    # None for an UNPRICEABLE row: no cost was ever estimated for it.
+    net_edge_bps: str | None = "3.5",
     status: OpportunityStatus = OpportunityStatus.DETECTED,
     **overrides: object,
 ) -> Opportunity:
@@ -98,7 +99,7 @@ def make_opportunity(
         "estimated_fees_usd": Decimal("0.15"),
         "estimated_slippage_usd": Decimal("0.05"),
         "safety_buffer_usd": Decimal("0.05"),
-        "net_edge_bps": Decimal(net_edge_bps),
+        "net_edge_bps": Decimal(net_edge_bps) if net_edge_bps is not None else None,
         "net_edge_usd": Decimal("0.35"),
         "liquidity_usd": Decimal("25000"),
         "latency_ms": 18,

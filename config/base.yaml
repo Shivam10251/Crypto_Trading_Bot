@@ -126,8 +126,16 @@ strategy:
     # still detected and priced as research data, but never signalled.
     allow_spot_short: false
     # Both legs must be this fresh and this fast, or the basis describes a
-    # market that has already moved on.
+    # market that has already moved on. Freshness is judged per INPUT, not per
+    # market: a 24h ticker arriving refreshes a market's aggregate age while
+    # the quote and the book the strategy prices against go on ageing.
     max_data_age_ms: 2000
+    max_quote_age_ms: 2000
+    max_book_age_ms: 2000
+    # Funding comes over REST on a slow poll, and a failed poll keeps the last
+    # known rates - deliberately, since funding moves slowly. Past this it is
+    # refused rather than retained indefinitely.
+    max_funding_age_ms: 600000
     max_latency_ms: 500
     signal_ttl_ms: 500
     # Bulk funding poll: weight 10 however many markets are monitored.
@@ -169,8 +177,19 @@ costs:
   safety_buffer_bps: 2.0
   # Assumed holding period for the perpetual leg. Funding settles at fixed
   # times, so this decides how many settlements a position actually crosses -
-  # not a fraction of one.
+  # not a fraction of one. Settlements are counted in the half-open window
+  # (open, open + horizon], so the count does not depend on how stale the
+  # venue's nextFundingTime happened to be.
   funding_horizon_minutes: 60
+  # The basis the position is assumed to be closed at. Gross edge is a
+  # THEORETICAL CONVERGENCE edge - what the trade is worth if the two mids
+  # meet - and this names how far they are assumed to meet. Zero is full
+  # convergence, which is what the strategy has always assumed; stating it
+  # makes the assumption auditable. It is never tuned to flatter results.
+  assumed_terminal_basis_bps: 0.0
+  # Required to price a direction that sells spot short. Account-specific.
+  spot_borrow_rate_bps_per_day: null
+  spot_borrow_rounding_hours: 1
 
 risk:
   max_order_notional_usd: 1000.0
@@ -197,3 +216,43 @@ execution:
   mode: "paper"
   live_enabled: false
   live_confirmation_phrase: ""
+
+  # Phase 8: simulate what the strategy validates. Off by default - the
+  # strategy runs and records without anything pretending to trade.
+  enabled: false
+  # Decision to venue. The order is priced against the book as it is AFTER
+  # this delay, so the market gets to move first, which is the point of
+  # simulating one at all. An assumption, not a measurement: observed one-way
+  # quote latency was 41-75 ms, and this is a round trip plus our processing.
+  latency_ms: 100
+  latency_jitter_ms: 25
+  latency_ms_by_market_type: {}
+  # An order with no terminal state within this is FAILED, not "nothing".
+  timeout_ms: 5000
+  # A book older than this cannot price a fill.
+  max_book_age_ms: 2000
+  # "market" always pays taker. "limit" is immediate-or-cancel at the
+  # strategy's rounded price. GTC maker fills are not inferred from book moves.
+  entry_order_type: "market"
+  queue_size: 128
+  workers: 2
+  recent_attempts: 200
+  max_cached_orders: 2000
+  max_leg_skew_ms: 250
+  paper_bnb_balance: 0
+  paper_bnb_price_usd: null
+  paper_cash_usd: 100000
+  paper_spot_inventory: {}
+  paper_allow_margin_borrow: false
+  paper_max_borrow_usd: 0
+  paper_perp_leverage: 1
+
+  # Simulate the best REJECTED opportunity once per interval, to measure what
+  # a round trip really costs. Measured across 447 recorded opportunities,
+  # none has ever passed validation on this account, so without this the
+  # simulator would never execute anything against a real book.
+  # A probe is NOT a trade the strategy asked for: it is flagged
+  # `orders.is_shadow` and must be excluded from any question about what the
+  # strategy would have earned.
+  shadow: false
+  shadow_interval_ms: 60000

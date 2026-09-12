@@ -1,7 +1,7 @@
 # Execution
 
-Status: **not implemented.** Phase 8 builds paper execution; Phase 17 builds
-the live path and leaves it disabled.
+Status: **paper execution implemented in Phase 8.** Phase 17 builds the live
+path and leaves it disabled.
 
 ## Adapter boundary
 
@@ -13,13 +13,19 @@ Strategy → Risk Engine → ExecutionAdapter
 
 ```python
 class ExecutionAdapter(Protocol):
-    async def submit(self, order: OrderRequest) -> OrderAck: ...
-    async def cancel(self, order_id: OrderId) -> CancelAck: ...
-    async def status(self, order_id: OrderId) -> OrderStatus: ...
+    async def submit(self, request: OrderRequest) -> ExecutionResult: ...
+    async def cancel(self, client_order_id: str) -> CancelAck: ...
+    async def status(self, client_order_id: str) -> ExecutionResult | None: ...
 ```
 
+`submit` returns the full `ExecutionResult` rather than an acknowledgement:
+a paper order reaches a terminal state immediately, and splitting it into an
+ack plus a later status poll would invent an asynchrony the simulator does
+not have. The live adapter can fill the same type in as it learns more.
+
 The strategy never chooses an adapter; the runtime injects one based on
-configuration. Swapping adapters is the only difference between paper and live.
+configuration. The bounded dispatcher keeps adapter latency off the strategy
+cadence and admits each opportunity episode once.
 
 ## Paper execution must not be optimistic
 
@@ -31,15 +37,68 @@ fails:
 | Spread cost | Buy at ask, sell at bid — never at mid |
 | Slippage | Walk the order book by size; depth-dependent |
 | Latency | Delay between decision and fill; book may have moved |
-| Partial fills | Fill only what the visible depth supports |
-| Rejections | Price/size filters, insufficient margin |
-| Cancellations | Orders that expire before filling |
+| Partial fills | Fill only what the full locally known depth supports |
+| Rejections | Order-type-aware price/size/notional filters, cash, margin, inventory, borrow and exposure |
+| Cancellations | IOC/FOK remainder is cancelled immediately |
 | Timeouts | No response within the configured window |
 | Zero liquidity | Empty book on one side → no fill |
 
-Supported operations: `BUY`, `SELL`, `OPEN`, `CLOSE`, `CANCEL`, and partial
-fills. Every simulated order records the book snapshot it was priced against,
-so any paper fill can be re-derived later.
+Supported adapter vocabulary is `BUY`, `SELL`, `OPEN`, `CLOSE`, `CANCEL`, and
+partial fills. The service currently wires entries (`OPEN`) only; exits remain
+Phase 10. Market and IOC/FOK limit orders are supported. GTC is refused until
+trade prints and queue position can justify maker fills. Every fill stores its
+fee rate, consumed levels, book sequence, and fill-time timestamp.
+
+Execution is fail-closed when PostgreSQL is unavailable. The paper account
+reserves cash and perpetual margin before concurrent leg submission, requires
+spot inventory or an explicitly capped margin borrow, applies configured
+gross-exposure limits, and restores open positions after restart. BNB-discounted
+fees require a configured paper BNB balance.
+
+## What Phase 8 measured
+
+The figures below are historical exploratory observations; their raw run
+artifacts were not checked in and the simulator semantics have since changed.
+They motivate tests, but are not reproducible acceptance evidence.
+
+Three 110 s runs against the live book, 80 simulated orders. The headline is
+in [development-phases.md](development-phases.md#phase-8--delivered); the two
+findings that change how the system should be built:
+
+- **The maker rate is unreachable by this strategy.** Zero maker fills out of
+  42 limit orders. The strategy's target price is the VWAP of walking the
+  book, so a limit there always crosses the spread. The 18.6 bps floor Phase 6
+  computed assumed maker fills; the reachable floor is the 30 bps taker one.
+- **An IOC limit can break the hedge.** Market entries left nothing
+  naked across 19 attempts; limit entries left 3 of 21 naked, because each leg
+  runs out of depth inside its own limit at a different point.
+
+Realised slippage against the cost model's estimate averaged -0.014 bps on
+market entries, so the entry half of the Phase 6 model is validated. The exit
+half is not: nothing here closes a position yet.
+
+## What Phase 8 can rely on
+
+The remediation before it (see
+[development-phases.md](development-phases.md#phase-75--correctness-remediation-delivered))
+means the simulator receives inputs it can trust:
+
+- a quantity valid on **both** venues - rounded down to a common step, inside
+  each leg's `LOT_SIZE` and `MARKET_LOT_SIZE` bounds, above each minimum
+  notional (including the perpetual minimum, which used to read as unknown)
+- prices no stale quote, book or funding observation can produce
+- no finite edge where the modelled unwind had no depth to price it
+- a stored row carrying the exact book levels the decision used, so a paper
+  fill can be compared against what the strategy believed
+
+That question is still open after Phase 8: the gross edge assumes the basis
+converges, realised price P&L is
+`signed_quantity x (entry basis - exit basis)`, and nothing yet opens a
+position and closes it again. `OrderIntent.CLOSE` exists and the simulator
+will price one, but the service does not schedule exits. Phase 8 now records
+open exposure in `positions`; `positions.is_shadow` keeps hypothetical probes
+out of account restoration and portfolio reporting. Phase 10 supplies exit
+policy and realised P&L.
 
 ## Live execution (Phase 17, disabled)
 

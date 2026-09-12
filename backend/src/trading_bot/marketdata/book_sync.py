@@ -59,6 +59,7 @@ class _Book:
     __slots__ = (
         "buffer",
         "buffered",
+        "cached_execution",
         "cached_liquidity",
         "cached_top",
         "failures",
@@ -77,6 +78,7 @@ class _Book:
         self.buffered = asyncio.Event()
         # Derived views, computed when first read after an update.
         self.cached_top: OrderBook | None = None
+        self.cached_execution: OrderBook | None = None
         self.cached_liquidity: BookLiquidity | None = None
         self.task: asyncio.Task[None] | None = None
         # Event-loop time of the last snapshot request, for the rate floor.
@@ -89,6 +91,7 @@ class _Book:
 
     def forget_views(self) -> None:
         self.cached_top = None
+        self.cached_execution = None
         self.cached_liquidity = None
 
     def discard(self) -> None:
@@ -192,6 +195,22 @@ class BookSynchronizer:
         return BookView(
             book=book.cached_top, status=BookStatus.SYNCED, liquidity=book.cached_liquidity
         )
+
+    def execution_view(self, ref: MarketRef) -> BookView:
+        """Every known level for conservative execution simulation."""
+        book = self._books.get(ref)
+        if book is None:
+            return DISABLED_VIEW
+        if book.status is not BookStatus.SYNCED:
+            return BookView(book=None, status=book.status)
+        try:
+            if book.cached_execution is None:
+                book.cached_execution = book.local.all_known()
+            return BookView(book=book.cached_execution, status=BookStatus.SYNCED)
+        except BookSyncError as exc:
+            self._invalidate(book, exc)
+            self._ensure_rebuild(book)
+            return BookView(book=None, status=BookStatus.SYNCING)
 
     def invalidate(self, ref: MarketRef, reason: str) -> None:
         """Routine invalidation, such as the depth stream disconnecting."""

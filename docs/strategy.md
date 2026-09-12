@@ -64,10 +64,29 @@ costs to cross to executable prices is slippage, priced by walking the real
 depth for the real size. Netting the two together would hide how much edge the
 spreads eat - which is exactly what research needs to know.
 
-**Both legs must be usable at the same instant.** A basis computed from a live
-spot quote and a stale perpetual one is a measurement error that looks like
-free money. A pair whose legs are not both LIVE, both fresh and both backed by
-a synchronised book produces nothing at all, and the reason is counted.
+**Both legs must be usable at the same instant, input by input.** A basis
+computed from a live spot quote and a stale perpetual one is a measurement
+error that looks like free money. A pair whose legs are not both LIVE, both
+fresh and both backed by a synchronised book produces nothing at all, and the
+reason is counted. Freshness is judged on the quote, on the book and on the
+funding observation *separately*: a market's aggregate age is reset by any
+message at all, so a 24h ticker tick used to make a market look current while
+the quote being priced against was seconds old.
+
+**The quantity has to be one both venues would accept.** BTC spot steps in
+0.00001 and its perpetual in 0.001, so a size valid on one leg is routinely
+invalid on the other. The traded size is rounded *down* to an increment valid
+on both and capped by the tighter of each venue's `LOT_SIZE` and
+`MARKET_LOT_SIZE` maxima - then both books are re-walked at it, so fills,
+unwinds, notionals, slippage, fees and the edge all describe the size that
+would actually be sent rather than the size that was asked for.
+
+**The gross edge is a theoretical convergence edge, not profit.** It is what
+the trade is worth if the two mids meet. Realised price P&L on a basis
+position is `signed_quantity x (entry basis - exit basis)`, and only an actual
+exit supplies the second term - Phase 8 measures it. The convergence
+assumption is configuration (`costs.assumed_terminal_basis_bps`, default 0)
+and is stored with every opportunity rather than left implicit.
 
 ### Why this is not free money
 
@@ -119,9 +138,12 @@ validated end to end.
 
 - Opportunities are recorded whether or not they were profitable, and every
   rejection carries a reason - `BELOW_MIN_EDGE`, `SPOT_SHORT_UNAVAILABLE`,
-  `FUNDING_UNKNOWN`, `STALE_DATA` and the rest.
+  `FUNDING_UNKNOWN`, `STALE_QUOTE`, `STALE_BOOK`, `STALE_FUNDING`,
+  `UNWIND_NOT_FILLABLE`, `BELOW_MIN_QUANTITY` and the rest.
 - A cost that cannot be estimated is refused, not guessed: a perpetual whose
-  funding interval the venue does not publish yields no net edge at all.
+  funding interval the venue does not publish yields no net edge at all, and
+  neither does a position the book cannot show us closing. The opportunity is
+  still stored - as `UNPRICEABLE`, with no costs on it - because it happened.
 - A strategy never reports profit; the portfolio module computes P&L from
   simulated or real fills.
 - Backtest, paper and live P&L are labelled and never combined.

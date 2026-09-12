@@ -1,11 +1,18 @@
 # Data Model
 
-Status: **implemented.** 13 tables, three migrations. Phase 1 built the
+Status: **implemented.** 13 tables, seven migrations. Phase 1 built the
 schema; Phase 2 corrected the exchange-timestamp assumption after checking the
 live Binance API; Phase 3's market-data service is the first writer of
 `markets`, `market_data` and `system_events`; Phase 4 added
 `markets.is_monitored` - the service's latest market selection, which is how
-the API knows which markets should be live.
+the API knows which markets should be live. The fourth migration
+(`c3a7f21b8d46`) added the venue quantity filters an order has to satisfy and
+the provenance an opportunity needs to outlive the raw data behind it. The
+fifth added paper-order provenance; the sixth (`f1e2a93c7b10`) adds stable
+execution-intent/attempt identity, fill-time book evidence, idempotent fill
+indexes, signal linkage, and durable open paper positions. The seventh
+(`a4c9e8126f30`) marks hypothetical shadow positions so account restoration
+and portfolio research cannot silently mix them with strategy exposure.
 
 ## Traceability requirement
 
@@ -38,15 +45,73 @@ records the limit, the observed value and the reason.
 | `signals` | Intent to trade a validated opportunity | `expires_at` |
 | `risk_events` | Every risk decision: approve, reject, pause | `limit_value` vs `observed_value` |
 | `orders` | Intended and submitted orders | `client_order_id` (idempotency) |
-| `fills` | Executions, including partials | `slippage_bps`, `is_maker` |
-| `positions` | Open and closed exposure | realized/unrealized P&L |
+| `fills` | Executions, including partials | `slippage_bps`, fee rate, consumed levels, fill-time book sequence |
+| `positions` | Open and closed exposure | realized/unrealized P&L, `is_shadow` |
 | `portfolio_snapshots` | Cash, exposure, equity over time | `equity_usd` |
 | `pnl_snapshots` | Performance metrics per window | Sharpe, Sortino, drawdown |
 | `system_events` | Connects, gaps, errors, reconciliation | JSONB `context` |
 
 Two legs are first-class on `opportunities` (`market_id` +
 `secondary_market_id`) because the first strategy trades spot against
-perpetual futures. Both legs' quote snapshots are recorded.
+perpetual futures.
+
+## Provenance travels with the opportunity
+
+The traceability diagram above has one link it cannot honestly make.
+`market_data` holds a quote **sampled every 5 s**, not the quote a decision
+priced against, and retention deletes those rows after 7 days while
+opportunities are kept forever. A foreign key into it would name an
+observation the strategy never saw, and then name nothing.
+
+So `opportunities.evidence` (JSONB) carries the decision's own inputs: both
+legs' quotes with their bid/ask/size, local and exchange clocks and sequence
+ids; both books' sequence and timestamps; the levels actually consumed on
+entry and on the modelled unwind; the venue filters that decided the quantity;
+the fee role and rate charged on each leg; the funding rate, mark price, next
+settlement, interval and observation time; and the cost model's version and
+assumption snapshot. A row stays re-derivable after the raw tables are empty.
+`market_data_id` and `secondary_market_data_id` stay for a future writer that
+can populate them meaningfully.
+
+**`evidence IS NULL` means legacy**, not lost: rows written before this
+existed keep their values and are not backfilled with invention.
+
+## Three timestamps, because they are three facts
+
+An opportunity is an episode, and the row keeps its *best* moment:
+
+| Column | Means |
+| --- | --- |
+| `detected_at` | when the discrepancy was first observed - the episode opened |
+| `best_observed_at` | when the moment the economics describe actually happened |
+| `last_seen_at` | the final observation; with `detected_at` it bounds the run |
+| `samples` | evaluations absorbed |
+
+`detected_at` alone used to carry all of this, so the numbers and the
+timestamp on one row described different instants.
+
+## Prices whose names mean what they say
+
+| Column | Means |
+| --- | --- |
+| `entry_price` | the **bought** leg's executable entry |
+| `sell_entry_price` | the **sold** leg's executable entry |
+| `buy_unwind_price` / `sell_unwind_price` | each leg's modelled exit, walked against the other side of its own book |
+| `exit_price` | **legacy only.** Held the sold leg's *entry* price - not an exit of anything. No longer written |
+
+`signals.target_exit_price` is now that leg's own modelled unwind; rows
+written before 2026-09-12 hold the counterpart leg's entry price there.
+
+## Unpriceable is not zero
+
+An opportunity whose costs could never be estimated - an unpublished funding
+interval, or no depth to price the unwind against - is stored with status
+`UNPRICEABLE`, NULL costs and a NULL `net_edge_bps`. It used to be discarded,
+which removed real observations from the count of how many opportunities
+existed; a fabricated zero would have been worse still. A CHECK constraint
+enforces that `UNPRICEABLE` and a NULL net edge always agree, so the four
+research populations - unpriceable, priced-and-rejected, validated, and
+(from Phase 8) paper-executed - cannot blur.
 
 ## Design decisions
 

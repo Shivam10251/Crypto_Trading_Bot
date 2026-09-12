@@ -8,6 +8,7 @@ firmly disabled.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,8 @@ def make_adapter(recorder: list[httpx.Request] | None = None) -> BinanceExchange
             return httpx.Response(200, json=fixture("spot_depth" if spot else "futures_depth"))
         if path.endswith("trades"):
             return httpx.Response(200, json=fixture("spot_trades"))
+        if path.endswith("avgPrice"):
+            return httpx.Response(200, json={"mins": 5, "price": "76980.25"})
         if path.endswith("premiumIndex"):
             return httpx.Response(200, json=fixture("futures_premium_index"))
         if path.endswith("time"):
@@ -120,7 +123,7 @@ class TestMarketData:
         """Futures exchangeInfo mixes delivery contracts with perpetuals."""
         adapter = make_adapter()
         specs = await adapter.get_markets(MarketType.PERPETUAL)
-        assert [spec.symbol for spec in specs] == ["BTCUSDT"]
+        assert [spec.symbol for spec in specs] == ["BTCUSDT", "IOSTUSDT"]
 
     async def test_order_book_is_trimmed_to_requested_levels(self) -> None:
         """The venue rounds the limit up; the caller still gets what it asked."""
@@ -130,6 +133,7 @@ class TestMarketData:
         )
         assert len(book.bids) == 2
         assert len(book.asks) == 2
+        assert not book.bids_complete and not book.asks_complete
 
     async def test_depth_limit_is_snapped_to_an_allowed_value(self) -> None:
         seen: list[httpx.Request] = []
@@ -157,6 +161,16 @@ class TestMarketData:
         clock = await adapter.get_server_time()
         assert clock.round_trip_ms >= 0
         assert isinstance(clock.skew_ms, int)
+
+    async def test_spot_average_price_is_parsed_for_venue_filters(self) -> None:
+        adapter = make_adapter()
+        price = await adapter.get_average_price(adapter.market_ref("BTCUSDT", MarketType.SPOT))
+        assert price == Decimal("76980.25")
+
+    async def test_futures_average_price_is_not_faked(self) -> None:
+        adapter = make_adapter()
+        with pytest.raises(NotSupportedError, match="no average-price endpoint"):
+            await adapter.get_average_price(adapter.market_ref("BTCUSDT", MarketType.PERPETUAL))
 
     @pytest.mark.parametrize("levels", [0, -5])
     async def test_invalid_depth_request_rejected(self, levels: int) -> None:

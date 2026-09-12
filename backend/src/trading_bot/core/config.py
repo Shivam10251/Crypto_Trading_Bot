@@ -288,8 +288,18 @@ class SpotPerpBasisConfig(ConfigSection):
     # is detected and priced - it is research data - but never signalled.
     allow_spot_short: bool = False
     # Both legs must be this fresh, and no slower than this, or the basis
-    # describes a market that has moved on.
+    # describes a market that has moved on. Freshness is judged per *input*,
+    # not per market: a 24h ticker arriving keeps a market's aggregate age
+    # small while the quote and the book the strategy actually prices against
+    # go on ageing, so each has its own limit.
     max_data_age_ms: int = Field(default=2000, gt=0)
+    max_quote_age_ms: int = Field(default=2000, gt=0)
+    max_book_age_ms: int = Field(default=2000, gt=0)
+    # Funding is polled over REST on a slow cadence and a failed poll keeps the
+    # last known rates, so an observation can be minutes old. Beyond this it is
+    # refused rather than retained indefinitely. Generous against the 60 s poll
+    # because funding genuinely moves slowly - but finite.
+    max_funding_age_ms: int = Field(default=600_000, gt=0)
     max_latency_ms: int = Field(default=500, gt=0)
     # A signal acted on after this point is stale by definition.
     signal_ttl_ms: int = Field(default=500, gt=0)
@@ -359,6 +369,18 @@ class CostsConfig(ConfigSection):
     # position actually crosses - not a fraction of one.
     funding_horizon_minutes: float = Field(default=60.0, gt=0)
 
+    # The basis the position is assumed to be closed at. The gross edge is a
+    # *theoretical convergence* edge - what the trade is worth if the two mids
+    # meet - and this says how far they are assumed to meet. Zero keeps the
+    # assumption at full convergence, which is what the strategy has always
+    # assumed; naming it makes the assumption auditable instead of implicit.
+    # It is never tuned to make recorded results look better.
+    assumed_terminal_basis_bps: float = Field(default=0.0, ge=0)
+    # Account-specific spot margin borrow cost.  ``None`` means unknown and a
+    # spot-short opportunity is unpriceable rather than free to borrow.
+    spot_borrow_rate_bps_per_day: float | None = Field(default=None, ge=0)
+    spot_borrow_rounding_hours: int = Field(default=1, ge=1, le=24)
+
 
 class RiskConfig(ConfigSection):
     max_order_notional_usd: float = Field(default=1000.0, gt=0)
@@ -396,9 +418,75 @@ class RetentionConfig(ConfigSection):
 
 
 class ExecutionConfig(ConfigSection):
+    """Paper execution (Phase 8) and the guards around the live path (Phase 17)."""
+
     mode: ExecutionMode = ExecutionMode.PAPER
     live_enabled: bool = False
     live_confirmation_phrase: str = ""
+
+    # Whether a validated signal is actually simulated. Off by default: the
+    # strategy runs and records without anything pretending to trade.
+    enabled: bool = False
+
+    # Decision to venue. The order is priced against the book as it is AFTER
+    # this delay, so the market gets to move first - which is the point.
+    # Measured quote latency was 41-75 ms one way; 100 ms is a round trip plus
+    # our own processing, and it is an assumption, not a measurement.
+    latency_ms: int = Field(default=100, ge=0)
+    latency_jitter_ms: int = Field(default=25, ge=0)
+    latency_ms_by_market_type: dict[str, int] = Field(default_factory=dict)
+    # An order that has not reached a terminal state within this fails.
+    timeout_ms: int = Field(default=5000, gt=0)
+    # A book older than this cannot price a fill; the order is refused rather
+    # than filled against a price that may no longer exist.
+    max_book_age_ms: int = Field(default=2000, gt=0)
+
+    # How the entry is placed. "market" crosses the spread and always pays
+    # taker; "limit" is IOC at the strategy's rounded price. GTC is not
+    # simulated until trade prints and queue position are available.
+    entry_order_type: Literal["market", "limit"] = "market"
+
+    # Execution is decoupled from strategy evaluation by a bounded queue.
+    # Overflow is rejected explicitly rather than allowed to create stale work.
+    queue_size: int = Field(default=128, ge=1, le=10_000)
+    workers: int = Field(default=2, ge=1, le=32)
+    recent_attempts: int = Field(default=200, ge=2, le=10_000)
+    max_cached_orders: int = Field(default=2_000, ge=2, le=100_000)
+    max_leg_skew_ms: int = Field(default=250, gt=0)
+    # A BNB fee discount is executable only when the paper account actually
+    # owns BNB.  Zero is the safe default.
+    paper_bnb_balance: float = Field(default=0.0, ge=0)
+    paper_bnb_price_usd: float | None = Field(default=None, gt=0)
+    paper_cash_usd: float = Field(default=100_000.0, gt=0)
+    paper_spot_inventory: dict[str, float] = Field(default_factory=dict)
+    paper_allow_margin_borrow: bool = False
+    paper_max_borrow_usd: float = Field(default=0.0, ge=0)
+    paper_perp_leverage: float = Field(default=1.0, ge=1, le=125)
+
+    # Simulate the best *rejected* opportunity each cycle, to measure what a
+    # round trip really costs. Measured live, no opportunity has ever passed
+    # validation on this account, so without this the simulator would never
+    # execute anything and its fill, partial-fill and expiry paths would be
+    # exercised by unit tests alone.
+    #
+    # A shadow order is a PROBE, not a trade the strategy asked for. It is
+    # flagged on the row (`orders.is_shadow`) and must be excluded from any
+    # question about what the strategy would have earned.
+    shadow: bool = False
+    # Probes are spaced out: one per interval, not one per evaluation cycle.
+    shadow_interval_ms: int = Field(default=60_000, gt=0)
+
+    @model_validator(mode="after")
+    def _check_timing(self) -> ExecutionConfig:
+        normalized = {key.upper(): value for key, value in self.latency_ms_by_market_type.items()}
+        valid = {"SPOT", "PERPETUAL", "FUTURE"}
+        if normalized.keys() - valid or any(value < 0 for value in normalized.values()):
+            raise ValueError("latency_ms_by_market_type needs non-negative known market types")
+        object.__setattr__(self, "latency_ms_by_market_type", normalized)
+        largest = max([self.latency_ms, *normalized.values()]) + self.latency_jitter_ms
+        if self.timeout_ms <= largest:
+            raise ValueError("timeout_ms must exceed the maximum configured latency plus jitter")
+        return self
 
 
 class Settings(BaseSettings):
@@ -476,6 +564,35 @@ class Settings(BaseSettings):
             )
         if self.is_live_execution_armed and not self.exchange.has_credentials:
             raise ValueError("live execution armed but exchange API credentials are missing")
+        if (
+            (self.execution.enabled or self.execution.shadow)
+            and self.execution.mode is ExecutionMode.PAPER
+            and self.costs.pay_fees_in_bnb
+            and self.execution.paper_bnb_balance <= 0
+        ):
+            raise ValueError(
+                "paper execution with BNB fee discounts requires paper_bnb_balance > 0"
+            )
+        if (
+            (self.execution.enabled or self.execution.shadow)
+            and self.execution.mode is ExecutionMode.PAPER
+            and self.costs.pay_fees_in_bnb
+            and self.execution.paper_bnb_price_usd is None
+        ):
+            raise ValueError("paper execution with BNB fee discounts requires paper_bnb_price_usd")
+        if (
+            (self.execution.enabled or self.execution.shadow)
+            and self.execution.mode is ExecutionMode.PAPER
+            and self.costs.pay_fees_in_bnb
+            and self.execution.paper_bnb_price_usd is not None
+        ):
+            available = self.execution.paper_bnb_balance * self.execution.paper_bnb_price_usd
+            max_rate = max(self.costs.spot_taker_fee_bps, self.costs.perp_taker_fee_bps)
+            required = self.risk.max_total_exposure_usd * max_rate / 10_000
+            if available < required:
+                raise ValueError(
+                    "paper BNB balance is too small for maximum configured exposure fees"
+                )
         return self
 
 

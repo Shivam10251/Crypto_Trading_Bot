@@ -11,14 +11,15 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phases 0–7 complete** — foundation, data model, the exchange
+Current state: **Phases 0–8 complete, including the Phase 8 correctness
+remediation** — foundation, data model, the exchange
 abstraction, a real-time market-data engine, market monitoring of the 50 most
 liquid spot/perpetual pairs, the strategy framework with the first spot/perpetual
 basis strategy, the transaction cost model, and the research record: every
 opportunity detected is stored in PostgreSQL, profitable or not. `make
 market-data` streams those markets, shows what the strategy concludes about
-each one with every cost itemised, and records it. Detection only — nothing is
-executed before Phase 8.
+each one with every cost itemised, and records it. Paper execution is off by
+default and fails closed if its durable database audit is unavailable.
 
 **The finding so far.** Across 340 recorded opportunities the average gross
 basis was 13.0 bps against 30.0 bps of round-trip taker fees and 16.3 bps of
@@ -93,7 +94,7 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 604 tests (14 live, opt-in)
+cd backend  && uv run pytest                # 723 tests (14 live, opt-in)
 cd frontend && pnpm test                    # 10 tests
 make check                                  # lint + types + tests
 ```

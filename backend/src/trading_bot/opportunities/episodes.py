@@ -19,13 +19,14 @@ when it happened. Nothing is filtered - unprofitable episodes are the dataset.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
 from trading_bot.exchange.models import MarketRef
-from trading_bot.strategy.models import RejectionReason
+from trading_bot.strategy.models import RejectionReason, Signal
 from trading_bot.strategy.runner import EvaluatedOpportunity, StrategyEvaluation
 
 # (strategy, bought market, sold market). A basis that flips sign swaps the two
@@ -48,11 +49,25 @@ class OpportunityEpisode:
     # The highest-net-edge evaluation seen, and when it happened.
     best: EvaluatedOpportunity
     best_at: datetime
+    # Best evaluation that actually produced a signal.  The episode's best
+    # priced observation can be rejected for another reason, so using ``best``
+    # to write signals can otherwise lose an execution's provenance entirely.
+    best_actionable: EvaluatedOpportunity | None = None
+    # The exact signal accepted by the execution queue. This can differ from
+    # the episode's later best observation and is the only honest target for
+    # an order's signal_id foreign key.
+    executed_signal: Signal | None = None
     samples: int = 1
     # True if any evaluation produced a signal that passed validation.
     ever_actionable: bool = False
     # Every reason this episode was turned down, in the order first seen.
     rejections: list[RejectionReason] = field(default_factory=list)
+    # Identity of the row this episode will become, fixed when the episode
+    # opens rather than when it is written. A flush that fails and retries -
+    # or a shutdown that closes an episode already queued - then presents the
+    # same row twice, and the unique index on ``opportunities.uid`` is what
+    # makes the second one impossible rather than a second observation.
+    uid: uuid.UUID = field(default_factory=uuid.uuid4)
 
     @property
     def duration_ms(self) -> int:
@@ -74,6 +89,8 @@ class OpportunityEpisode:
         self.last_seen_at = now
         if item.is_actionable:
             self.ever_actionable = True
+            if self.best_actionable is None or _is_better(item, self.best_actionable):
+                self.best_actionable = item
         if item.rejection is not None and item.rejection not in self.rejections:
             self.rejections.append(item.rejection)
         if _is_better(item, self.best):
@@ -100,6 +117,23 @@ class EpisodeTracker:
 
     def open_episodes(self) -> list[OpportunityEpisode]:
         return list(self._open.values())
+
+    def uid_for(self, key: EpisodeKey) -> uuid.UUID | None:
+        """The id the open episode will be stored under, if it is open.
+
+        Execution needs this *before* the episode closes: an order placed
+        during an episode has to name the opportunity behind it, and the
+        opportunity's row does not exist yet. The uid is fixed when the
+        episode opens precisely so it can be handed out early.
+        """
+        episode = self._open.get(key)
+        return None if episode is None else episode.uid
+
+    def mark_executed(self, key: EpisodeKey, signal: Signal) -> None:
+        """Remember the exact signal accepted for this one-shot episode."""
+        episode = self._open.get(key)
+        if episode is not None and episode.executed_signal is None:
+            episode.executed_signal = signal
 
     def update(
         self, evaluations: Sequence[StrategyEvaluation], now: datetime
@@ -141,5 +175,6 @@ def _start(
         best=item,
         best_at=now,
         ever_actionable=item.is_actionable,
+        best_actionable=item if item.is_actionable else None,
         rejections=[item.rejection] if item.rejection is not None else [],
     )

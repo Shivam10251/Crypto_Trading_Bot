@@ -53,6 +53,11 @@ class OpportunityStatus(StrEnum):
     DETECTED = "DETECTED"
     VALIDATED = "VALIDATED"
     REJECTED = "REJECTED"
+    # Detected and real, but a cost could not be estimated - an unpublished
+    # funding interval, or no depth to price the unwind against. Kept as its
+    # own outcome: counting it as REJECTED would put it in the population of
+    # opportunities that were priced and did not survive, which it never was.
+    UNPRICEABLE = "UNPRICEABLE"
     PAPER_TRADE = "PAPER_TRADE"
     EXPIRED = "EXPIRED"
     EXECUTED = "EXECUTED"

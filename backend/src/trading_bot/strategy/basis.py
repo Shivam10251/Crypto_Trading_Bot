@@ -13,10 +13,20 @@ slippage, priced by walking the depth for the size we would trade. Netting the
 two together would hide how much edge the spreads eat, which is precisely what
 research needs to know.
 
-**Both legs must be usable at the same instant.** A basis computed from a live
-spot quote and a stale perpetual one is not a discrepancy, it is a measurement
-error - and it would look like free money. A pair whose legs are not both LIVE,
-both fresh and both backed by a synchronised book produces nothing at all.
+**Both legs must be usable at the same instant, input by input.** A basis
+computed from a live spot quote and a stale perpetual one is not a
+discrepancy, it is a measurement error - and it would look like free money.
+Freshness is checked on the quote, on the synchronised book and on the funding
+observation separately, because a market's aggregate age is refreshed by any
+message at all: a 24h ticker tick makes a market look current while the quote
+being priced against is seconds old.
+
+**The quantity has to be one both venues would accept.** The two legs do not
+share a step size - BTC spot steps in 0.00001 and its perpetual in 0.001 - so
+a size valid on one is routinely invalid on the other. The traded quantity is
+rounded *down* to an increment valid on both, and everything downstream of it
+- both fills, both unwinds, notionals, slippage, fees and the edge - is
+recomputed from the rounded size rather than the size we asked for.
 """
 
 from __future__ import annotations
@@ -29,14 +39,31 @@ from typing import ClassVar
 
 from trading_bot.core.config import SpotPerpBasisConfig
 from trading_bot.db.models.enums import MarketType, Side
-from trading_bot.exchange.models import FundingInfo, MarketRef, OrderBook
+from trading_bot.exchange.models import (
+    Fill,
+    FundingInfo,
+    MarketRef,
+    MarketSpec,
+    OrderBook,
+    combined_step,
+    floor_to_step,
+)
 from trading_bot.marketdata.models import BookStatus
 from trading_bot.strategy.base import MarketView, Strategy, StrategyContext
+from trading_bot.strategy.evidence import (
+    ConstraintEvidence,
+    FillEvidence,
+    LegEvidence,
+    MarketEvidence,
+    QuoteEvidence,
+)
 from trading_bot.strategy.models import (
     DetectionStats,
     Edge,
     Leg,
     Opportunity,
+    PricingRefusal,
+    PricingResult,
     RejectionReason,
     Signal,
     ValidationResult,
@@ -154,9 +181,25 @@ class SpotPerpBasisStrategy(Strategy):
             opportunities.append(opportunity)
         return opportunities
 
-    def calculate_edge(self, opportunity: Opportunity) -> Edge | None:
+    def calculate_edge(self, opportunity: Opportunity) -> PricingResult:
         context = self._require_context()
-        funding = self._funding_for(opportunity)
+        perpetual = next(
+            (leg.ref for leg in opportunity.legs if leg.ref.market_type is not MarketType.SPOT),
+            None,
+        )
+        funding = None if perpetual is None else self._funding_by_ref().get(perpetual)
+        if funding is not None:
+            # A poll that failed keeps the last known rates rather than
+            # dropping them - deliberately, since funding moves slowly - so an
+            # observation can be arbitrarily old. Old is not the same as
+            # current, and the cost model must not be handed it silently.
+            age_ms = (opportunity.detected_at - funding.local_timestamp).total_seconds() * 1000
+            if age_ms > self._config.max_funding_age_ms:
+                return PricingRefusal(
+                    RejectionReason.STALE_FUNDING,
+                    f"funding observed {age_ms / 1000:.1f} s ago, limit "
+                    f"{self._config.max_funding_age_ms / 1000:.1f} s",
+                )
         return context.cost_model.estimate(opportunity, funding)
 
     def generate_signal(self, opportunity: Opportunity, edge: Edge) -> Signal | None:
@@ -202,7 +245,23 @@ class SpotPerpBasisStrategy(Strategy):
         context = self._require_context()
         for leg in opportunity.legs:
             spec = context.spec(leg.ref)
-            minimum = spec.min_notional if spec else None
+            if spec is None:
+                continue
+            # Rounding down to a valid lot can leave less than the venue will
+            # accept; the venue would reject the order, so the strategy does.
+            minimum_qty = spec.order_min_qty
+            if minimum_qty is not None and leg.quantity < minimum_qty:
+                return ValidationResult.rejected(
+                    RejectionReason.BELOW_MIN_QUANTITY,
+                    f"{leg.ref.symbol} {leg.quantity} < venue minimum {minimum_qty}",
+                )
+            maximum_qty = spec.order_max_qty
+            if maximum_qty is not None and leg.quantity > maximum_qty:
+                return ValidationResult.rejected(
+                    RejectionReason.INSUFFICIENT_LIQUIDITY,
+                    f"{leg.ref.symbol} {leg.quantity} > venue maximum {maximum_qty}",
+                )
+            minimum = spec.min_notional
             if minimum is not None and leg.notional < minimum:
                 return ValidationResult.rejected(
                     RejectionReason.BELOW_MIN_NOTIONAL,
@@ -223,19 +282,48 @@ class SpotPerpBasisStrategy(Strategy):
         return self._context
 
     def _unusable_reason(self, pair: BasisPair) -> RejectionReason | None:
-        """A basis is only real when both legs are real at the same instant."""
+        """A basis is only real when both legs are real at the same instant.
+
+        Each input is aged on its own. The market-wide age is checked too, but
+        it cannot stand in for the others: it is the age of the newest message
+        of *any* kind, so a 24h ticker arriving resets it while the quote and
+        the book being priced against keep ageing.
+        """
+        config = self._config
         for view in (pair.spot, pair.perpetual):
             snapshot = view.snapshot
             if not snapshot.is_live or snapshot.mid_price is None:
                 return RejectionReason.NOT_LIVE
             if snapshot.book_status is not BookStatus.SYNCED or snapshot.book is None:
                 return RejectionReason.BOOK_NOT_SYNCED
-            if snapshot.age_ms is not None and snapshot.age_ms > self._config.max_data_age_ms:
+            if snapshot.age_ms is not None and snapshot.age_ms > config.max_data_age_ms:
                 return RejectionReason.STALE_DATA
+            if (
+                snapshot.quote_age_ms is not None
+                and snapshot.quote_age_ms > config.max_quote_age_ms
+            ):
+                return RejectionReason.STALE_QUOTE
+            if snapshot.book_age_ms is not None and snapshot.book_age_ms > config.max_book_age_ms:
+                return RejectionReason.STALE_BOOK
         return None
 
+    def _spec_for(self, view: MarketView) -> MarketSpec | None:
+        """The view's own reference data, or the context's if it carries none."""
+        if view.spec is not None:
+            return view.spec
+        context = self._context
+        return None if context is None else context.spec(view.ref)
+
     def _price(self, pair: BasisPair, now: datetime) -> Opportunity | None:
-        """Turn a basis into a sized, book-priced opportunity."""
+        """Turn a basis into an order-valid, book-priced opportunity.
+
+        Sizing happens twice on purpose. The first pass asks the books how
+        much they could absorb; the quantity that comes out of it is then
+        rounded down to something both venues would accept, and **every**
+        number is re-derived from the rounded size. Pricing the size we wanted
+        and trading the size we can get is how a model quietly reports an edge
+        that was never available.
+        """
         basis = pair.basis
         if basis == 0:
             return None
@@ -247,26 +335,56 @@ class SpotPerpBasisStrategy(Strategy):
         buy_book, sell_book = buy_view.snapshot.book, sell_view.snapshot.book
         if buy_book is None or sell_book is None:  # pragma: no cover - guarded above
             return None
+        buy_spec, sell_spec = self._spec_for(buy_view), self._spec_for(sell_view)
 
         spot_mid = pair.spot_mid
-        target = self._max_notional / spot_mid
-        quantity = min(
-            _fillable(buy_book, Side.BUY, target), _fillable(sell_book, Side.SELL, target)
-        )
-        if quantity <= 0:
+        requested_notional = self._max_notional
+        requested = requested_notional / spot_mid
+        # Cap at what each venue admits before asking the book: requesting
+        # more than the maximum order size measures depth we could not use.
+        for spec in (buy_spec, sell_spec):
+            cap = spec.order_max_qty if spec is not None else None
+            if cap is not None:
+                requested = min(requested, cap)
+        if requested <= 0:
             return None
 
-        buy_price, _ = buy_book.fill_price(Side.BUY, quantity)
-        sell_price, _ = sell_book.fill_price(Side.SELL, quantity)
+        available = min(
+            _fillable(buy_book, Side.BUY, requested), _fillable(sell_book, Side.SELL, requested)
+        )
+        if available <= 0:
+            return None
+        # An increment valid on BOTH venues: BTC spot steps in 0.00001 and
+        # its perpetual in 0.001, so a size one accepts the other rejects.
+        step = combined_step(
+            buy_spec.order_step_size if buy_spec else None,
+            sell_spec.order_step_size if sell_spec else None,
+        )
+        quantity = floor_to_step(available, step)
+        if quantity <= 0:
+            # Rounding down took the whole size: the books can absorb less
+            # than one lot, so there is no order here to price.
+            self._stats.unusable[RejectionReason.INSUFFICIENT_LIQUIDITY] += 1
+            return None
+
+        # Re-walk both books at the quantity we would actually send.
+        buy_fill = buy_book.walk(Side.BUY, quantity)
+        sell_fill = sell_book.walk(Side.SELL, quantity)
+        # Unwinding crosses the spread the other way: the leg bought is sold
+        # back into the bids, the leg sold is bought back from the asks.
+        buy_unwind = buy_book.walk(Side.SELL, quantity)
+        sell_unwind = sell_book.walk(Side.BUY, quantity)
+        buy_price, sell_price = buy_fill.average_price, sell_fill.average_price
+        if buy_price is None or sell_price is None:  # pragma: no cover - quantity > 0
+            return None
+
         buy_leg = Leg(
             ref=buy_view.ref,
             side=Side.BUY,
             reference_price=_mid(buy_view),
             executable_price=buy_price,
             quantity=quantity,
-            # Unwinding sells this leg back into the bids - the other side of
-            # the same book, so the exit is measured rather than assumed.
-            exit_price=_unwind_price(buy_book, Side.SELL, quantity),
+            unwind_price=_complete_price(buy_unwind),
         )
         sell_leg = Leg(
             ref=sell_view.ref,
@@ -274,7 +392,7 @@ class SpotPerpBasisStrategy(Strategy):
             reference_price=_mid(sell_view),
             executable_price=sell_price,
             quantity=quantity,
-            exit_price=_unwind_price(sell_book, Side.BUY, quantity),
+            unwind_price=_complete_price(sell_unwind),
         )
         gross_per_unit = abs(basis)
         direction = Side.BUY if perp_rich else Side.SELL
@@ -288,9 +406,19 @@ class SpotPerpBasisStrategy(Strategy):
             notional_usd=spot_mid * quantity,
             gross_edge_bps=to_bps(gross_per_unit, spot_mid),
             gross_edge_usd=gross_per_unit * quantity,
+            requested_notional_usd=requested_notional,
             liquidity_usd=_pair_liquidity(pair),
             latency_ms=pair.latency_ms,
             duration_ms=self._duration_ms(pair.symbol, direction, now),
+            evidence=MarketEvidence(
+                evaluated_at=now,
+                requested_notional_usd=requested_notional,
+                requested_quantity=requested,
+                executable_quantity=quantity,
+                common_step_size=step,
+                buy=_leg_evidence(buy_view, Side.BUY, buy_fill, buy_unwind, buy_spec),
+                sell=_leg_evidence(sell_view, Side.SELL, sell_fill, sell_unwind, sell_spec),
+            ),
         )
 
     def _duration_ms(self, symbol: str, direction: Side, now: datetime) -> int:
@@ -332,15 +460,36 @@ def _fillable(book: OrderBook, side: Side, quantity: Decimal) -> Decimal:
     return filled
 
 
-def _unwind_price(book: OrderBook, side: Side, quantity: Decimal) -> Decimal | None:
-    """What closing the position would fetch, or ``None`` if depth runs out.
+def _complete_price(fill: Fill) -> Decimal | None:
+    """A price only when the whole quantity filled; ``None`` otherwise.
 
-    Priced against the book we can see now. By the time a basis converges the
-    book will have moved, but a measured estimate of the other side beats
-    assuming the exit costs whatever the entry did.
+    A partial unwind is not a cheaper unwind, it is a position we could not
+    close. Reporting the average price of the part that did fill would hide
+    that behind a plausible number.
     """
-    price, filled = book.fill_price(side, quantity)
-    return price if filled >= quantity else None
+    return fill.average_price if fill.is_complete else None
+
+
+def _leg_evidence(
+    view: MarketView, side: Side, entry: Fill, unwind: Fill, spec: MarketSpec | None
+) -> LegEvidence:
+    """The quote, the book and both walks, as they were at the decision."""
+    snapshot = view.snapshot
+    quote, book = snapshot.quote, snapshot.book
+    if quote is None or book is None:  # pragma: no cover - the pair guarantees both
+        raise ValueError(f"no quote or book for {view.ref}")
+    return LegEvidence(
+        ref=view.ref,
+        side=side,
+        quote=QuoteEvidence.of(quote, snapshot.quote_age_ms),
+        book_sequence=book.sequence,
+        book_local_timestamp=book.local_timestamp,
+        book_exchange_timestamp=book.exchange_timestamp,
+        book_age_ms=snapshot.book_age_ms,
+        entry=FillEvidence.of(entry),
+        unwind=FillEvidence.of(unwind) if unwind.filled > 0 else None,
+        constraints=ConstraintEvidence.of(spec),
+    )
 
 
 def _pair_liquidity(pair: BasisPair) -> Decimal | None:

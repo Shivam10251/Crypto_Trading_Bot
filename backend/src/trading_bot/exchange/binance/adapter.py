@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from decimal import Decimal
 from time import perf_counter
 from typing import Any
 
@@ -139,6 +140,8 @@ class BinanceExchangeAdapter(ExchangeAdapter):
                 local_timestamp=book.local_timestamp,
                 exchange_timestamp=book.exchange_timestamp,
                 sequence=book.sequence,
+                bids_complete=book.bids_complete,
+                asks_complete=book.asks_complete,
             )
         return book
 
@@ -172,6 +175,19 @@ class BinanceExchangeAdapter(ExchangeAdapter):
             local_time=datetime.now(UTC),
             round_trip_ms=round_trip_ms,
         )
+
+    async def get_average_price(self, ref: MarketRef) -> Decimal:
+        """Spot rolling average used by Binance's order filters."""
+        routes = routes_for(ref.market_type)
+        if routes.average_price is None:
+            raise NotSupportedError(f"no average-price endpoint for {ref}")
+        payload = await self._fetch_symbol(
+            routes.url(routes.average_price), ref, context="avgPrice"
+        )
+        from trading_bot.exchange.binance.mapping import to_decimal
+
+        price = payload.get("price") if isinstance(payload, dict) else None
+        return to_decimal(price, f"avgPrice {ref}")
 
     async def get_funding(self, ref: MarketRef) -> FundingInfo:
         """Funding state for a perpetual. Spot markets have none."""

@@ -15,31 +15,51 @@ import signal
 import sys
 from collections import deque
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+
+from sqlalchemy import select
 
 from trading_bot.core.config import Settings
 from trading_bot.core.logging import get_logger
-from trading_bot.db.models.enums import Severity, SystemEventType
+from trading_bot.db.models import Market, Position
+from trading_bot.db.models.enums import (
+    ExecutionMode,
+    OrderType,
+    PositionStatus,
+    Severity,
+    SystemEventType,
+)
 from trading_bot.db.session import check_connection, dispose_engine, init_engine, session_scope
 from trading_bot.exchange.base import ExchangeAdapter
 from trading_bot.exchange.binance import BinanceExchangeAdapter
 from trading_bot.exchange.errors import ExchangeError
 from trading_bot.exchange.models import MarketDataSubscription, MarketRef, MarketSpec
+from trading_bot.execution.account import PaperAccount, PaperPositionSeed
+from trading_bot.execution.coordinator import ExecutionAttempt, ExecutionCoordinator
+from trading_bot.execution.dispatcher import ExecutionDispatcher
+from trading_bot.execution.paper import PaperExecutionAdapter
+from trading_bot.execution.recorder import ExecutionRecorder
+from trading_bot.execution.shadow import choose_probe, probe_signal
 from trading_bot.marketdata.engine import MarketDataEngine
 from trading_bot.marketdata.funding import FundingTracker
 from trading_bot.marketdata.models import MarketDataEvent
 from trading_bot.marketdata.recorder import MarketDataRecorder, register_markets
 from trading_bot.monitoring.display import CLEAR_SCREEN, FRAME_OVERHEAD, FrameContext, render
+from trading_bot.monitoring.execution_view import render_execution
 from trading_bot.monitoring.monitor import MarketMonitor
 from trading_bot.monitoring.strategy_view import RecordingStatus, render_evaluation
 from trading_bot.monitoring.universe import select_universe
-from trading_bot.opportunities.episodes import EpisodeTracker
+from trading_bot.opportunities.episodes import EpisodeTracker, episode_key
 from trading_bot.opportunities.recorder import OpportunityRecorder
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.costs import TransactionCostModel
+from trading_bot.strategy.fees import FeeSchedule
 from trading_bot.strategy.registry import build_strategies
-from trading_bot.strategy.runner import StrategyRunner
+from trading_bot.strategy.runner import (
+    StrategyEvaluation,
+    StrategyRunner,
+)
 
 logger = get_logger(__name__)
 
@@ -88,8 +108,13 @@ async def run_service(
         if funding is not None:
             await _prime_funding(funding)
 
-        wants_database = config.persist or (
-            settings.opportunities.persist and strategies is not None
+        wants_execution = bool(
+            strategies is not None and (settings.execution.enabled or settings.execution.shadow)
+        )
+        wants_database = (
+            config.persist
+            or (settings.opportunities.persist and strategies is not None)
+            or wants_execution
         )
         opened = await _open_recorders(settings, list(universe.specs)) if wants_database else None
         recorder, market_ids = opened if opened is not None else (None, {})
@@ -103,7 +128,55 @@ async def run_service(
             if market_ids and settings.opportunities.persist and strategies is not None
             else None
         )
-        episodes = EpisodeTracker() if opportunities is not None else None
+        episodes = (
+            EpisodeTracker()
+            if strategies is not None and (opportunities is not None or wants_execution)
+            else None
+        )
+        # Execution fails closed without its audit database.  Simulating fills
+        # that cannot be persisted would leave exposure with no durable trail.
+        paper_account = (
+            await _restore_paper_account(settings) if market_ids and wants_execution else None
+        )
+        coordinator = (
+            _build_execution_layer(
+                settings,
+                venue,
+                engine,
+                list(universe.specs),
+                funding,
+                paper_account,
+            )
+            if market_ids and wants_execution and funding is not None
+            else None
+        )
+        executions = (
+            ExecutionRecorder(
+                market_ids,
+                session_scope,
+                interval_seconds=settings.opportunities.flush_interval_ms / 1000,
+            )
+            if market_ids and coordinator is not None
+            else None
+        )
+        dispatcher = (
+            ExecutionDispatcher(
+                coordinator,
+                executions,
+                queue_size=settings.execution.queue_size,
+                workers=settings.execution.workers,
+                recent_attempts=settings.execution.recent_attempts,
+                timeout_ms=settings.execution.timeout_ms,
+            )
+            if coordinator is not None and executions is not None
+            else None
+        )
+        attempts = dispatcher.attempts if dispatcher is not None else ()
+        if wants_execution and dispatcher is None:
+            logger.error(
+                "execution.disabled",
+                reason="durable database audit is unavailable",
+            )
         if recorder is not None:
             engine.add_listener(recorder.record_event)
             recorder.record_event(
@@ -114,6 +187,8 @@ async def run_service(
                 persistence += (
                     f" + opportunities every {settings.opportunities.flush_interval_ms} ms"
                 )
+            if executions is not None:
+                persistence += " + paper orders"
         else:
             persistence = "off" if not config.persist else "OFF - database unavailable"
         context = FrameContext(
@@ -126,8 +201,11 @@ async def run_service(
         )
 
         tasks: list[asyncio.Task[None]] = []
+        strategy_task: asyncio.Task[None] | None = None
         try:
             async with engine:
+                if dispatcher is not None:
+                    dispatcher.start()
                 tasks.append(asyncio.create_task(monitor.run(), name="market-monitor"))
                 if recorder is not None:
                     tasks.append(asyncio.create_task(recorder.run(engine.snapshots)))
@@ -138,20 +216,25 @@ async def run_service(
                         tasks.append(
                             asyncio.create_task(opportunities.run(), name="opportunity-recorder")
                         )
-                    tasks.append(
-                        asyncio.create_task(
-                            _strategy_loop(
-                                runner,
-                                monitor,
-                                engine,
-                                funding,
-                                episodes,
-                                opportunities,
-                                interval_seconds=(settings.strategy.evaluate_interval_ms / 1000),
-                            ),
-                            name="strategy-runner",
+                    if executions is not None:
+                        tasks.append(
+                            asyncio.create_task(executions.run(), name="execution-recorder")
                         )
+                    strategy_task = asyncio.create_task(
+                        _strategy_loop(
+                            runner,
+                            monitor,
+                            engine,
+                            funding,
+                            episodes,
+                            opportunities,
+                            settings,
+                            dispatcher,
+                            interval_seconds=(settings.strategy.evaluate_interval_ms / 1000),
+                        ),
+                        name="strategy-runner",
                     )
+                    tasks.append(strategy_task)
                 else:
                     runner, cost_summary = None, ""
                 if config.display:
@@ -168,14 +251,35 @@ async def run_service(
                                 funding=funding,
                                 episodes=episodes,
                                 opportunities=opportunities,
+                                attempts=attempts,
                             )
                         )
                     )
                 await stop.wait()
+                # Stop the producer first, then drain accepted execution while
+                # the market feed is still live. Draining after __aexit__
+                # would turn queued work into shutdown-induced stale failures.
+                if strategy_task is not None:
+                    strategy_task.cancel()
+                    await asyncio.gather(strategy_task, return_exceptions=True)
+                if dispatcher is not None:
+                    await dispatcher.stop()
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if dispatcher is not None:
+                await dispatcher.stop()
+            if executions is not None:
+                # Orders must exist before the opportunity recorder back-links
+                # their signal and position provenance below.
+                await executions.flush()
+                logger.info(
+                    "execution.recorded",
+                    orders=executions.orders_written,
+                    fills=executions.fills_written,
+                    unhedged=executions.unhedged,
+                )
             if opportunities is not None and episodes is not None:
                 # Episodes still running when the process stops are real
                 # observations; closing them is what keeps them in the record.
@@ -190,7 +294,7 @@ async def run_service(
             if recorder is not None:
                 recorder.record_event(_service_event(SystemEventType.SHUTDOWN, "stopped"))
                 await recorder.flush(engine.snapshots())
-            if recorder is not None or opportunities is not None:
+            if recorder is not None or opportunities is not None or executions is not None:
                 await dispose_engine()
     logger.info("market_data.service_stopped")
 
@@ -253,14 +357,93 @@ def _build_strategy_layer(
     """
     if not settings.strategy.evaluate or not settings.strategy.enabled:
         return None
-    cost_model = TransactionCostModel(settings.costs)
     by_ref = {spec.ref: spec for spec in specs}
+    # The specs go to the cost model as well as to the strategy: they carry
+    # any fee rate the venue publishes, and a rate nothing is handed cannot
+    # override the configured guess.
+    cost_model = TransactionCostModel(settings.costs, specs=by_ref)
     runner = StrategyRunner(
         build_strategies(settings.strategy),
         StrategyContext(cost_model=cost_model, specs=by_ref),
         specs=by_ref,
     )
     return runner, cost_model.describe()
+
+
+def _build_execution_layer(
+    settings: Settings,
+    venue: ExchangeAdapter,
+    engine: MarketDataEngine,
+    specs: Sequence[MarketSpec],
+    funding: FundingTracker,
+    account: PaperAccount | None,
+) -> ExecutionCoordinator | None:
+    """The paper adapter behind a coordinator, or ``None`` when it is off.
+
+    Live execution cannot arrive here: the adapter is ``PaperExecutionAdapter``
+    unconditionally, and the live one does not exist until Phase 17. The
+    configuration guards in ``core.config`` refuse to boot an armed live
+    process, so there are two independent reasons nothing real can be sent.
+    """
+    config = settings.execution
+    if not (config.enabled or config.shadow):
+        return None
+    if config.mode.value != "paper":
+        logger.critical(
+            "execution.live_adapter_unavailable",
+            detail="live mode cannot fall back to paper execution",
+        )
+        return None
+    by_ref = {spec.ref: spec for spec in specs}
+    adapter = PaperExecutionAdapter(
+        engine,
+        config,
+        fees=FeeSchedule.from_config(settings.costs),
+        specs=lambda ref: by_ref.get(ref),
+        mark_prices=lambda ref: funding.rates[ref].mark_price if ref in funding.rates else None,
+        average_prices=venue.get_average_price,
+    )
+    return ExecutionCoordinator(
+        adapter,
+        order_type=OrderType(config.entry_order_type.upper()),
+        specs=lambda ref: by_ref.get(ref),
+        # The strategy's gate, restated where an order would actually be sent.
+        allow_spot_short=settings.strategy.spot_perp_basis.allow_spot_short,
+        max_leg_skew_ms=config.max_leg_skew_ms,
+        account=account,
+    )
+
+
+async def _restore_paper_account(settings: Settings) -> PaperAccount:
+    """Seed the in-memory reservation model from durable open paper positions."""
+    account = PaperAccount(
+        settings.execution,
+        settings.risk,
+        pays_fees_in_bnb=settings.costs.pay_fees_in_bnb,
+        max_fee_bps=Decimal(
+            str(max(settings.costs.spot_taker_fee_bps, settings.costs.perp_taker_fee_bps))
+        ),
+    )
+    async with session_scope() as session:
+        result = await session.execute(
+            select(
+                Market.symbol,
+                Market.market_type,
+                Position.side,
+                Position.quantity,
+                Position.entry_notional_usd,
+                Position.fees_usd,
+            )
+            .join(Market, Market.id == Position.market_id)
+            .where(
+                Position.mode == ExecutionMode.PAPER,
+                Position.status == PositionStatus.OPEN,
+                Position.is_shadow.is_(False),
+            )
+        )
+        seeds = [PaperPositionSeed(*row) for row in result]
+    account.restore(seeds)
+    return account
 
 
 async def _prime_funding(tracker: FundingTracker) -> None:
@@ -282,6 +465,8 @@ async def _strategy_loop(
     funding: FundingTracker,
     episodes: EpisodeTracker | None,
     opportunities: OpportunityRecorder | None,
+    settings: Settings,
+    dispatcher: ExecutionDispatcher | None = None,
     *,
     interval_seconds: float,
 ) -> None:
@@ -290,13 +475,80 @@ async def _strategy_loop(
     Episodes are tracked here rather than in the recorder so that evaluation
     and persistence stay independent: without a database the strategy still
     runs and still draws, it simply keeps no record.
+
+    Execution hangs off the same loop, after evaluation, and only ever sees
+    what the strategy already validated - plus, if shadow probing is on, one
+    deliberately chosen rejection per interval.
     """
+    last_probe: datetime | None = None
     while True:
         runner.set_funding(funding.rates)
+        now = datetime.now(UTC)
         evaluations = runner.evaluate(engine.snapshots(), monitor.metrics())
-        if episodes is not None and opportunities is not None:
-            opportunities.record(episodes.update(evaluations, datetime.now(UTC)))
+        if episodes is not None:
+            ended = episodes.update(evaluations, now)
+            if opportunities is not None:
+                opportunities.record(ended)
+            if dispatcher is not None:
+                dispatcher.release({episode.uid for episode in ended})
+        if dispatcher is not None and episodes is not None:
+            last_probe = _enqueue_executions(
+                evaluations,
+                dispatcher,
+                episodes,
+                settings,
+                now=now,
+                last_probe=last_probe,
+            )
         await asyncio.sleep(interval_seconds)
+
+
+def _enqueue_executions(
+    evaluations: list[StrategyEvaluation],
+    dispatcher: ExecutionDispatcher,
+    episodes: EpisodeTracker,
+    settings: Settings,
+    *,
+    now: datetime,
+    last_probe: datetime | None,
+) -> datetime | None:
+    """Simulate what the strategy validated, and optionally one probe.
+
+    Returns when the last probe happened, so they stay spaced out rather than
+    firing every evaluation cycle.
+    """
+    config = settings.execution
+    if config.enabled:
+        for evaluation in evaluations:
+            for item in evaluation.actionable:
+                if item.signal is None:  # pragma: no cover - actionable implies one
+                    continue
+                uid = episodes.uid_for(episode_key(evaluation.strategy, item))
+                if uid is not None and dispatcher.enqueue(item.signal, uid, is_shadow=False):
+                    episodes.mark_executed(episode_key(evaluation.strategy, item), item.signal)
+
+    if not config.shadow:
+        return last_probe
+    due = last_probe is None or (now - last_probe) >= timedelta(
+        milliseconds=config.shadow_interval_ms
+    )
+    if not due:
+        return last_probe
+    chosen = choose_probe(
+        evaluations, allow_spot_short=settings.strategy.spot_perp_basis.allow_spot_short
+    )
+    if chosen is None:
+        return last_probe
+    evaluation, item = chosen
+    signal = probe_signal(
+        evaluation, item, now, timedelta(milliseconds=settings.execution.timeout_ms)
+    )
+    if signal is None:  # pragma: no cover - choose_probe guarantees a priced edge
+        return last_probe
+    uid = episodes.uid_for(episode_key(evaluation.strategy, item))
+    if uid is None:
+        return last_probe
+    return now if dispatcher.enqueue(signal, uid, is_shadow=True) else last_probe
 
 
 async def _clock_skew(adapter: ExchangeAdapter) -> int | None:
@@ -319,13 +571,14 @@ async def _display_loop(
     funding: FundingTracker | None = None,
     episodes: EpisodeTracker | None = None,
     opportunities: OpportunityRecorder | None = None,
+    attempts: Sequence[ExecutionAttempt] | None = None,
 ) -> None:
     tty = sys.stdout.isatty()
     interval = interval_seconds if tty else max(interval_seconds, _UNATTENDED_INTERVAL_SECONDS)
     while True:
         rows = max(5, shutil.get_terminal_size().lines - FRAME_OVERHEAD) if tty else None
         panels = _strategy_panels(
-            runner, cost_summary, funding, episodes, opportunities, max_rows=rows
+            runner, cost_summary, funding, episodes, opportunities, attempts, max_rows=rows
         )
         if panels and rows is not None:
             # The strategy panel and the market table share one screen; give
@@ -352,6 +605,7 @@ def _strategy_panels(
     funding: FundingTracker | None,
     episodes: EpisodeTracker | None,
     opportunities: OpportunityRecorder | None,
+    attempts: Sequence[ExecutionAttempt] | None = None,
     *,
     max_rows: int | None,
 ) -> list[str]:
@@ -371,7 +625,7 @@ def _strategy_panels(
     )
     # A panel gets at most a third of the screen, so the market table survives.
     panel_rows = None if max_rows is None else max(3, max_rows // 3)
-    return [
+    panels = [
         render_evaluation(
             evaluation,
             cost_summary=cost_summary,
@@ -381,6 +635,9 @@ def _strategy_panels(
         )
         for evaluation in runner.evaluations()
     ]
+    if attempts:
+        panels.append(render_execution(attempts, max_rows=panel_rows))
+    return panels
 
 
 def _stop_on_signals() -> asyncio.Event:

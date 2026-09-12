@@ -116,6 +116,10 @@ class ExchangeAdapter(ABC):
         """
         raise NotSupportedError(f"{self.venue} does not expose bulk 24h statistics")
 
+    async def get_average_price(self, ref: MarketRef) -> Decimal:
+        """Venue reference used by rolling-average order filters."""
+        raise NotSupportedError(f"{self.venue} does not expose an average price for {ref}")
+
     # --- execution (disabled until Phase 17) ------------------------------
 
     async def place_order(self, *args: object, **kwargs: object) -> object:

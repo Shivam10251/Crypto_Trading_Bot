@@ -73,6 +73,8 @@ def snapshot(ref: MarketRef, q: Quote | None) -> MarketSnapshot:
         latency_ms=None,
         last_update_at=NOW,
         age_ms=0,
+        quote_age_ms=0 if q else None,
+        book_age_ms=None,
         updates=1,
         gaps=0,
         resyncs=0,

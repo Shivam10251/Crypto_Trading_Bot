@@ -170,6 +170,31 @@ class LocalOrderBook:
             local_timestamp=self.local_timestamp,
             exchange_timestamp=self.exchange_timestamp,
             sequence=self._last_update_id,
+            bids_complete=False,
+            asks_complete=False,
+        )
+
+    def all_known(self) -> OrderBook:
+        """Every synchronised level inside the REST snapshot's known range.
+
+        Neither side is marked complete: Binance snapshots are capped, so
+        exhausting the range proves only that more depth is unknown.
+        """
+        if self._last_update_id is None or self.local_timestamp is None:
+            raise BookSyncError(f"{self.ref}: no snapshot loaded")
+        bids = sorted(self._bids.items(), reverse=True)
+        asks = sorted(self._asks.items())
+        if not bids or not asks or bids[0][0] >= asks[0][0]:
+            raise BookSyncError(f"{self.ref}: local book is empty or crossed")
+        return OrderBook(
+            ref=self.ref,
+            bids=tuple(BookLevel(price, size) for price, size in bids),
+            asks=tuple(BookLevel(price, size) for price, size in asks),
+            local_timestamp=self.local_timestamp,
+            exchange_timestamp=self.exchange_timestamp,
+            sequence=self._last_update_id,
+            bids_complete=False,
+            asks_complete=False,
         )
 
     def liquidity(self, band_bps: Decimal, reference_notional: Decimal) -> BookLiquidity:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -24,8 +25,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_bot.db.base import Base, RecordMixin
@@ -54,7 +56,17 @@ class Opportunity(Base, RecordMixin):
 
     # Stable public identifier, safe to put in logs and dashboards.
     uid: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, default=uuid.uuid4)
+    # When the discrepancy was first observed - the episode's opening.
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # When the observation the economics below describe was taken. An episode
+    # keeps its *best* moment, which is almost never its first, and writing
+    # the opening time into both loses the only record of when the peak was.
+    # NULL on rows written before this column existed.
+    best_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Last observation of the episode; with detected_at it bounds the run.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Evaluations absorbed. One means the episode was seen exactly once.
+    samples: Mapped[int | None] = mapped_column(Integer)
     strategy: Mapped[str] = mapped_column(String(STRATEGY_NAME_LENGTH), nullable=False)
     # THEORETICAL here: detection is independent of how it would be executed.
     mode: Mapped[ExecutionMode] = mapped_column(EXECUTION_MODE, nullable=False)
@@ -69,33 +81,65 @@ class Opportunity(Base, RecordMixin):
     direction: Mapped[Side] = mapped_column(SIDE, nullable=False)
 
     # --- provenance: the quotes this decision was based on ----------------
+    # These two were designed to point at the ``market_data`` rows behind a
+    # decision and have never been populated, because they cannot be: quotes
+    # are *sampled* every 5 s rather than stored per evaluation, so no row
+    # holds the quote a decision actually used, and retention deletes them
+    # after 7 days while opportunities are kept forever. The decision's own
+    # quotes and books live in ``evidence`` instead, which survives both.
     market_data_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("market_data.id", ondelete="SET NULL")
     )
     secondary_market_data_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("market_data.id", ondelete="SET NULL")
     )
+    # Quotes, books, fills, venue filters, fee rates, the funding observation
+    # and the cost model's assumptions - everything needed to re-derive this
+    # row after retention has emptied the raw tables. NULL means the row
+    # predates provenance and is not reproducible; it is never invented.
+    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     # --- economics --------------------------------------------------------
+    # The leg that was BOUGHT, at the average price walking its book gave.
     entry_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
-    exit_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
+    # Legacy. This held the *sold* leg's entry price under a name that says
+    # exit, which is a different thing entirely - the modelled unwind prices
+    # below are the exits. No longer written; kept so old rows stay readable.
+    exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    # The leg that was SOLD, at the average price walking its book gave. This
+    # is what ``exit_price`` was really holding.
+    sell_entry_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    # What closing each leg would have fetched against the opposite side of
+    # its own book at detection - modelled exits, priced, not assumed.
+    buy_unwind_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    sell_unwind_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    # Rounded down to an increment both venues accept.
     quantity: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
     notional_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    # What the strategy asked for before the venues' lot filters cut it down.
+    requested_notional_usd: Mapped[Decimal | None] = mapped_column(MONEY)
 
+    # Theoretical convergence edge, mid to mid. Not profit: realised price P&L
+    # on a basis position is signed_quantity x (entry basis - exit basis), and
+    # only an actual exit can supply the second term.
     gross_edge_bps: Mapped[Decimal] = mapped_column(BPS, nullable=False)
     gross_edge_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
 
-    # Cost breakdown, itemised so research can attribute lost edge.
-    estimated_fees_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
-    estimated_slippage_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
-    funding_cost_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
-    borrow_cost_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
-    other_costs_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
-    safety_buffer_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
+    # Cost breakdown, itemised so research can attribute lost edge. NULL - not
+    # zero - when the opportunity could not be priced at all: a fabricated
+    # zero would pollute every query asking what survived costs.
+    estimated_fees_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    estimated_slippage_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    funding_cost_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    borrow_cost_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    other_costs_usd: Mapped[Decimal | None] = mapped_column(MONEY)
+    safety_buffer_usd: Mapped[Decimal | None] = mapped_column(MONEY)
 
     # NET = GROSS - fees - slippage - funding - borrow - other - buffer.
-    net_edge_bps: Mapped[Decimal] = mapped_column(BPS, nullable=False)
-    net_edge_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    # NULL for an UNPRICEABLE row, which is how "nobody could price this"
+    # stays distinguishable from "priced, and it came to nothing".
+    net_edge_bps: Mapped[Decimal | None] = mapped_column(BPS)
+    net_edge_usd: Mapped[Decimal | None] = mapped_column(MONEY)
 
     # --- feasibility ------------------------------------------------------
     # Size actually available at the quoted levels.
@@ -133,10 +177,26 @@ class Opportunity(Base, RecordMixin):
         # "Which opportunities survived costs?" - the central research question.
         Index("ix_opportunities_net_edge", "net_edge_bps"),
         CheckConstraint("quantity > 0", name="quantity_positive"),
-        CheckConstraint("entry_price > 0 AND exit_price > 0", name="prices_positive"),
         CheckConstraint(
-            "estimated_fees_usd >= 0 AND estimated_slippage_usd >= 0 AND safety_buffer_usd >= 0",
+            "entry_price > 0 "
+            "AND (exit_price IS NULL OR exit_price > 0) "
+            "AND (sell_entry_price IS NULL OR sell_entry_price > 0) "
+            "AND (buy_unwind_price IS NULL OR buy_unwind_price > 0) "
+            "AND (sell_unwind_price IS NULL OR sell_unwind_price > 0)",
+            name="prices_positive",
+        ),
+        CheckConstraint(
+            "COALESCE(estimated_fees_usd, 0) >= 0 "
+            "AND COALESCE(estimated_slippage_usd, 0) >= 0 "
+            "AND COALESCE(safety_buffer_usd, 0) >= 0",
             name="costs_non_negative",
+        ),
+        # An unpriceable opportunity has no net edge, and a priced one always
+        # has. The database enforces the distinction the research queries
+        # depend on rather than trusting the writer to keep it.
+        CheckConstraint(
+            "(status = 'UNPRICEABLE') = (net_edge_bps IS NULL)",
+            name="unpriceable_has_no_net_edge",
         ),
         CheckConstraint(
             "secondary_market_id IS NULL OR secondary_market_id <> market_id",
@@ -170,6 +230,9 @@ class Signal(Base, RecordMixin):
 
     quantity: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
     target_entry_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
+    # Where THIS leg would be closed: the modelled unwind against the other
+    # side of its own book. Rows written before 2026-09-12 hold the *other
+    # leg's entry* price here instead, which was never an exit of anything.
     target_exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
     expected_net_edge_bps: Mapped[Decimal] = mapped_column(BPS, nullable=False)
 
@@ -184,6 +247,7 @@ class Signal(Base, RecordMixin):
     market: Mapped[Market] = relationship(lazy="raise")
 
     __table_args__ = (
+        UniqueConstraint("opportunity_id", "market_id", "side", name="opportunity_market_side"),
         Index("ix_signals_generated_at", "generated_at"),
         Index("ix_signals_opportunity", "opportunity_id"),
         Index("ix_signals_status_generated", "status", "generated_at"),

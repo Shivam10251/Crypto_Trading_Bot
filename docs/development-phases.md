@@ -18,8 +18,9 @@ was never recorded is gone for good.
 | 5 | Strategy framework + spot/perp basis strategy | **Complete** |
 | 6 | Transaction cost model | **Complete** |
 | 7 | Opportunity engine | **Complete** |
-| 8 | Paper execution engine | Next |
-| 9 | Risk engine | Not started |
+| 7.5 | Correctness remediation before Phase 8 | **Complete** |
+| 8 | Paper execution engine | **Complete** |
+| 9 | Risk engine | Next |
 | 10 | Portfolio and P&L | Not started |
 | 11 | Backtest / replay engine | Not started |
 | 12 | Real-time dashboard | Not started |
@@ -632,9 +633,253 @@ pairs in one frame had the perpetual at a discount.
   deletes after three days, and funding needed the schedule as it was; both are
   carried through unchanged.
 
-## Phase 8 — next
+## Phase 7.5 — correctness remediation, delivered
 
-Paper execution: the simulator that turns a signal into fills, modelling
-spread, depth, latency, partial fills and rejection. It is also what settles
-the two assumptions Phase 6 had to leave open - whether a maker order fills,
-and what a round trip really costs. See [execution.md](execution.md).
+Not a new phase in the plan: a prerequisite. An audit of Phases 2-7 found nine
+defects that would have made Phase 8's paper fills measure the wrong thing.
+Every one was reproduced against the existing code before it was touched.
+
+- **Futures minimum notional was never read.** USD-M `exchangeInfo` publishes
+  `{"filterType": "MIN_NOTIONAL", "notional": "50"}`; the parser looked only
+  for the spot NOTIONAL filter's `minNotional` key, so every perpetual's
+  minimum was `None` and an order under it passed validation. Checked against
+  the live venue: all 897 USD-M perpetuals use `notional`, not one publishes
+  `minNotional`, and all 3,698 spot symbols use the other shape. The fixtures
+  had invented the futures shape, so the tests confirmed the bug
+- **`LOT_SIZE` and `MARKET_LOT_SIZE` are now both represented.** A market
+  order has to satisfy both, and on every one of the 897 perpetuals
+  `MARKET_LOT_SIZE.maxQty` is the tighter cap (BTCUSDT: 120 against 1000). On
+  spot the same filter publishes `stepSize: 0` - meaning no constraint - which
+  read as a real step would invalidate every quantity
+- **The traded quantity is now valid on both legs.** BTC spot steps in
+  0.00001 and its perpetual in 0.001, so the shared size was routinely invalid
+  on one of them. It is rounded *down* to the two steps' common multiple, and
+  both books are re-walked at the rounded size: fills, unwinds, notionals,
+  slippage, fees and the edge all follow it down. The requested notional is
+  kept alongside so the row shows how much of the intent survived
+- **Freshness is per input, not per market.** A 24h ticker arriving refreshed
+  a market's aggregate age while the quote and the book being priced against
+  went on ageing, so a stale basis could pass a freshness check. Quote age and
+  book age are now measured and gated separately, and a funding observation
+  older than `max_funding_age_ms` is refused rather than kept indefinitely
+- **An unwind the book cannot fill has no price.** The cost model used to fall
+  back to charging the entry's slippage twice, which reads as conservative and
+  is not: missing exit liquidity is precisely the case where the exit costs
+  more than the entry. The opportunity is now refused with
+  `UNWIND_NOT_FILLABLE` and stored as an observation, without a manufactured
+  exit price
+- **Funding is charged on the mark notional.** The venue settles
+  `mark x size x rate`; the model was using the perpetual's entry notional,
+  which includes the spread we crossed. **And the settlement window is now
+  half-open**: `nextFundingTime = T`, `T - 8h` and `T - 24h` describe the same
+  8-hourly grid and gave 2, 1 and 1 settlements over twelve hours. They now
+  give the same answer, and a settlement count above one is stored flagged as
+  an assumption, since the venue announces only the next rate
+- **Venue fee overrides reach the calculation.** `FeeSchedule.rate_bps` could
+  always prefer a venue-reported rate; nothing ever passed it the `MarketSpec`
+  that carries one, so the override was unreachable outside its own unit test
+- **A row records when its numbers happened.** An episode keeps its *best*
+  moment, and `detected_at` held the *opening* one - so the economics and the
+  timestamp on the same row described different instants. `best_observed_at`,
+  `last_seen_at` and `samples` are now stored, along with an `evidence` JSONB
+  document holding both quotes, both books' sequences and timestamps, the
+  levels consumed on entry and unwind, the venue filters applied, the fee
+  roles and rates, the funding observation and the cost model's assumptions
+- **No column calls an entry price an exit price.** `exit_price` held the
+  *sold leg's entry price*. It is no longer written; `sell_entry_price` holds
+  that value under its real name and `buy_unwind_price` / `sell_unwind_price`
+  hold the modelled exits. A signal's `target_exit_price` is now that leg's
+  own unwind rather than the other leg's entry
+- **An unpriceable opportunity is stored, not dropped.** It used to be counted
+  and discarded, which removed observations from the count of how many
+  opportunities existed. It is now a row with NULL costs, a NULL net edge and
+  status `UNPRICEABLE`, so research can separate *no opportunity*, *detected
+  but unpriceable*, *priced and rejected* and *validated*
+
+**Gross edge is labelled as what it is.** It is a theoretical convergence
+edge - what the trade is worth if the two mids meet - not realised profit.
+Realised price P&L on a basis position is
+`signed_quantity x (entry basis - exit basis)`, and only Phase 8's fills can
+supply the second term. The convergence assumption is now an explicit,
+auditable setting (`costs.assumed_terminal_basis_bps`, default 0 - unchanged
+behaviour, never tuned to flatter the record) and is stored with every row.
+
+**Nothing historical was rewritten.** The 447 opportunities already recorded
+keep their values and their meanings; they are told apart from new rows by
+`evidence IS NULL`, and `trading-bot-recost` skips and counts rows it cannot
+re-price rather than treating their missing costs as zero.
+
+- **Migration**: `c3a7f21b8d46`, additive - five quantity columns on
+  `markets`, the provenance and correctly named price columns on
+  `opportunities`, cost and net-edge columns relaxed to nullable, and
+  `UNPRICEABLE` added to the status vocabulary. **Created but not applied to
+  the developer database**, which is still at `b7d41e2a9c3f` pending review
+- **Tests**: 659 backend (from 604), 14 opt-in live; 10 frontend
+
+### What checking reality changed
+
+1. **The futures fixture was wrong, so the test agreed with the bug.** Probing
+   `fapi/v1/exchangeInfo` on 2026-09-12 showed the real filter shape and also
+   that BTCUSDT's perpetual minimum is **50 USDT**, not the 5 the fixture had
+   invented - ten times the figure the strategy would have validated against.
+2. **The two lot filters are not redundant.** `MARKET_LOT_SIZE.maxQty` differs
+   from `LOT_SIZE.maxQty` on all 897 perpetuals and matches on none, while its
+   `stepSize` and `minQty` match on all of them. On spot the reverse: the step
+   is a disabled `0` on every symbol that has the filter, but the maximum is
+   real. Reading either filter alone gets a market order rejected.
+3. **The settlement-window bug was worse than it looked.** A twelve-hour hold
+   on an 8-hourly market crossed 2 settlements on a fresh poll and 1 on a
+   stale one describing the same schedule - so the cost of a position depended
+   on how recently funding had been fetched.
+
+## Phase 8 — delivered
+
+`make market-data` can now simulate what the strategy validates, against the
+live book, and store every order and fill it produces.
+
+- **`PaperExecutionAdapter`** (`execution/paper.py`) behind a three-method
+  `ExecutionAdapter` protocol. The strategy never chooses an adapter; the
+  runtime injects one, which is the entire difference between paper and the
+  live adapter Phase 17 will add
+- **Nothing in it is random.** Every way an order fails to become a complete
+  fill comes from something observed: the venue's own filters, depth that was
+  not there, or a book that had gone stale. A simulator whose rejections come
+  from a coin flip measures its own seed, and there is deliberately no "fill
+  probability" setting
+- **The book is read at fill time, not decision time.** The configured
+  latency elapses first, so the market moves before the order arrives -
+  handing the simulator the decision's book would model a market that
+  politely waits
+- **Leg risk is a measured outcome** (`execution/coordinator.py`), not the
+  footnote it was in Phases 5 and 6. Both legs are submitted concurrently and
+  the attempt reports what exposure it actually left: hedged, naked by a
+  stated quantity, or nothing filled. Nothing unwinds a half-filled pair -
+  that is Phase 9's decision, and inventing a remedy now would hide how often
+  it happens
+- **Shadow probes** (`execution/shadow.py`), off by default: once per interval
+  the best *reachable* rejected opportunity is simulated anyway. Without it
+  the simulator would never execute anything, because nothing has ever passed
+  validation on this account. A probe is flagged `orders.is_shadow` and must
+  be excluded from any question about what the strategy would have earned
+- **Every attempt is stored** (`execution/recorder.py`), including the ones
+  that filled nothing, with the reason. `orders.opportunity_uid` closes a link
+  the traceability chain promised and could not deliver: `signal_id` only
+  exists once the episode closes, which is after the order was placed
+- **The API reports it honestly**: "no orders" is the normal state of this
+  strategy, so the panel reads OFFLINE with the reason rather than as a fault
+  - and never HEALTHY on no evidence
+- **Migrations** `d8b1c04e7f52`, `f1e2a93c7b10` and `a4c9e8126f30`, additive:
+  provenance, stable intent identity, fill evidence, retry-safe indexes, open
+  positions and explicit separation of hypothetical shadow exposure
+
+### Correctness remediation before Phase 9
+
+The first Phase 8 implementation was not safe to use as research evidence.
+The remediation makes these behavioural changes:
+
+- strategy evaluation only enqueues work; bounded workers execute it, re-check
+  signal expiry, and drain accepted work on shutdown
+- a stable episode UUID produces deterministic intent, attempt and leg IDs;
+  repeated one-second evaluations cannot repeatedly open the same episode
+- shadow selection excludes actionable opportunities, so a validated signal
+  cannot also execute as a probe in the same cycle
+- shadow probes reserve against the same feasibility limits but release the
+  reservation after measurement; their tagged positions are never restored
+  into the strategy paper account
+- IOC is immediate and `PARTIALLY_FILLED` is terminal because its remainder is
+  cancelled. GTC is refused: book movement alone proves neither a trade nor
+  this order's queue position, so no maker fill is inferred
+- execution walks every locally known level. Exhausting Binance's capped
+  snapshot is `DEPTH_TRUNCATED` (unknown), not invented zero liquidity
+- each leg's adapter exception is recorded without discarding the other leg;
+  database retry upserts by stable order/fill identity after uncertain commits
+- fill-time book sequence/timestamp, consumed levels, fee rate, expected price,
+  intent and attempt provenance are durable; signals are linked after an
+  episode closes
+- paper cash, inventory, borrow, perpetual margin, per-market position and
+  gross exposure are reserved before submission. Open non-shadow paper
+  positions are durable and restored on restart. Borrow is never priced as
+  zero when its account rate is unknown
+- latency supports per-market-type baselines plus deterministic per-order
+  jitter, and cross-leg fill-time skew is measured
+
+### What checking reality changed
+
+Three live runs of 110 s each, 50 pairs, shadow probing every 5 s. Two
+defects only the live book exposed:
+
+1. **A limit at the strategy's own price is not a maker order.** The
+   strategy's executable price is the VWAP of *walking the book*, so it sits
+   at or through the far touch by construction. The simulator was resting
+   such orders and filling them at their own price as maker fills - awarding
+   the cheaper rate to an order that behaved exactly like a market order.
+   Corrected: an immediately marketable limit crosses as a **taker** at the
+   book's prices. GTC is now refused until trade prints and queue-position
+   evidence exist; displayed depth is not treated as a maker fill.
+2. **A VWAP is almost never a multiple of the tick.** 10 of 40 limit orders
+   were rejected `INVALID_TICK_SIZE`, and because the rejection hit one leg
+   and not the other it left **8 attempts half-filled and naked**. The
+   coordinator now rounds a limit to the venue's tick, against us - down for
+   a buy, up for a sell - so the adjustment never invents a price the book
+   did not show.
+
+### First live observation
+
+> Historical exploratory observation only. The raw run artifacts are not
+> checked in, and the execution semantics have since been remediated as
+> described above. These figures must not be used as regression or acceptance
+> evidence; new calibrated runs must persist their configuration and samples.
+
+80 paper orders across the corrected runs, every one a shadow probe, **none
+from a validated signal** - the strategy validated nothing in 480, 533 and
+480 opportunities respectively, which is exactly what Phases 5 to 7 predicted.
+
+```
+entry    orders  filled  partial  maker fills  mean slip vs model  fees
+MARKET      38      38       0         0            -0.014 bps    28.47 USD
+LIMIT       42      38       4         0            -0.229 bps    29.77 USD
+
+attempts   MARKET 19, 0 unhedged      LIMIT 21, 3 UNHEDGED
+```
+
+**The maker rate is not available to this strategy, at all.** Not "rarely" -
+never. Zero maker fills out of 42 limit orders, because the price the
+strategy wants is by construction a price that crosses the spread. Phase 6
+computed an 18.6 bps floor assuming maker on both legs and called it an
+assumption; the measurement says the reachable floor is the taker one, 30 bps.
+Capturing maker rates would require a different strategy, resting inside or
+away from the spread, with a fill rate nobody has measured.
+
+**The cost model's slippage estimate is honest.** Realised slippage against
+what the strategy expected averaged **-0.014 bps** on market entries
+(sd 0.236, range -0.95 to +0.95 over 42 fills in the first run). Walking the
+book for the real size, over a 100 ms latency, is essentially unbiased at
+this size on liquid pairs. That validates the Phase 6 entry model and leaves
+the *exit* estimate still unmeasured.
+
+**Leg risk is real and it is caused by the limit.** Market entries left
+nothing naked in 19 attempts; limit entries left 3 of 21 naked, by 0.32,
+0.67 and 1,572 units, because a limit fills only the depth inside its price
+and the two legs run out at different points. The safer-looking order type
+is the one that breaks the hedge.
+
+### Limits
+
+- **P&L and exits are not computed.** Entry fills now create durable open
+  positions and `fills.position_id` is populated. Realised P&L, equity and an
+  exit policy remain Phase 10. No number here claims a profit.
+- **Nothing closes a position.** `OrderIntent.CLOSE` exists and the adapter
+  will simulate one, but no round trip is opened and closed automatically, so
+  the *exit* half of the cost model is still an estimate. That is the largest
+  remaining gap.
+- **A half-filled pair is left naked.** Deliberately: unwinding it is a risk
+  decision, and Phase 9 owns it.
+- **All 80 orders are probes.** The strategy validated nothing, so the gated
+  path has executed exactly zero orders in production. It is covered by
+  tests, not by live evidence.
+- **Latency is configuration, not a measurement.** Market-type baselines and
+  deterministic jitter prevent identical legs, but the distribution still
+  needs account-specific empirical calibration.
+- **One pair dominates.** The probe picks the best reachable opportunity each
+  interval, which was BNBUSDT almost every time, so the fill statistics
+  describe a liquid mid-cap and not the universe.

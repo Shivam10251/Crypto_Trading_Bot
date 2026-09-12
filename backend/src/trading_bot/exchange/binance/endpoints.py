@@ -28,6 +28,8 @@ class VenueRoutes:
     server_time: str
     # Rolling 24h statistics for every symbol, in one request.
     ticker_24hr: str
+    # Spot rolling average used by PERCENT_PRICE / NOTIONAL filters.
+    average_price: str | None = None
     # Futures only; spot has no funding.
     premium_index: str | None = None
     # Funding interval per symbol. Separate from premiumIndex, and it does not
@@ -46,6 +48,7 @@ SPOT_ROUTES = VenueRoutes(
     trades="/api/v3/trades",
     server_time="/api/v3/time",
     ticker_24hr="/api/v3/ticker/24hr",
+    average_price="/api/v3/avgPrice",
 )
 
 FUTURES_ROUTES = VenueRoutes(

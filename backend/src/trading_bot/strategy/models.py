@@ -21,6 +21,7 @@ from enum import StrEnum
 
 from trading_bot.db.models.enums import Side
 from trading_bot.exchange.models import BPS_SCALE, MarketRef
+from trading_bot.strategy.evidence import MarketEvidence, PricingEvidence
 
 
 def to_bps(value: Decimal, reference: Decimal) -> Decimal:
@@ -44,19 +45,20 @@ class Leg:
     reference_price: Decimal
     executable_price: Decimal
     quantity: Decimal
-    # What unwinding this leg would cost against the book we can see now: a leg
-    # bought is sold back into the bids, a leg sold is bought back from the
-    # asks. None when the book could not fill the unwind, and the cost model
-    # then falls back to charging the entry again.
-    exit_price: Decimal | None = None
+    # What unwinding this leg would fetch against the book we can see now: a
+    # leg bought is sold back into the bids, a leg sold is bought back from the
+    # asks. ``None`` when that book could not fill the whole quantity - an
+    # unpriceable unwind, which the cost model refuses rather than substituting
+    # a number for. It is a *modelled* exit, never an entry price.
+    unwind_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError(f"leg quantity must be positive for {self.ref}")
         if self.reference_price <= 0 or self.executable_price <= 0:
             raise ValueError(f"leg prices must be positive for {self.ref}")
-        if self.exit_price is not None and self.exit_price <= 0:
-            raise ValueError(f"leg exit price must be positive for {self.ref}")
+        if self.unwind_price is not None and self.unwind_price <= 0:
+            raise ValueError(f"leg unwind price must be positive for {self.ref}")
 
     @property
     def notional(self) -> Decimal:
@@ -85,27 +87,31 @@ class Leg:
         return to_bps(self.slippage, self.reference_price)
 
     @property
-    def exit_slippage(self) -> Decimal | None:
+    def unwind_slippage(self) -> Decimal | None:
         """Per-unit cost of unwinding, measured rather than assumed.
 
-        The exit crosses the spread the other way - a bought leg is sold into
-        the bids - so it is a different walk of the same book, not a copy of
-        the entry. ``None`` when the book could not fill the unwind.
+        The unwind crosses the spread the other way - a bought leg is sold
+        into the bids - so it is a different walk of the same book, not a copy
+        of the entry. ``None`` when the book could not fill it.
         """
-        if self.exit_price is None:
+        if self.unwind_price is None:
             return None
         # Unwinding reverses the side: a BUY leg exits by selling.
         signed = (
-            self.reference_price - self.exit_price
+            self.reference_price - self.unwind_price
             if self.side is Side.BUY
-            else self.exit_price - self.reference_price
+            else self.unwind_price - self.reference_price
         )
         return max(signed, Decimal(0))
 
     @property
-    def exit_slippage_usd(self) -> Decimal | None:
-        exit_slippage = self.exit_slippage
-        return None if exit_slippage is None else exit_slippage * self.quantity
+    def unwind_slippage_usd(self) -> Decimal | None:
+        unwind_slippage = self.unwind_slippage
+        return None if unwind_slippage is None else unwind_slippage * self.quantity
+
+    @property
+    def unwind_notional(self) -> Decimal | None:
+        return None if self.unwind_price is None else self.unwind_price * self.quantity
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +121,12 @@ class Opportunity:
     ``gross_edge`` is measured mid-to-mid: the cost of crossing to executable
     prices belongs in ``CostBreakdown.slippage_usd`` so that research can
     attribute lost edge to spreads rather than having it silently netted away.
+
+    It is a **theoretical convergence edge**, not profit: it is what the trade
+    is worth if the two mids meet, which is an assumption about the future and
+    is recorded as one (``CostsConfig.assumed_terminal_basis_bps``). Realised
+    price P&L on a basis position is ``signed_quantity x (entry basis - exit
+    basis)``, and only Phase 8's fills can say what the exit basis was.
     """
 
     strategy: str
@@ -123,10 +135,14 @@ class Opportunity:
     sell: Leg
     # The price everything is expressed against - the spot leg's mid.
     reference_price: Decimal
+    # The executable quantity: rounded down to an increment valid on BOTH legs.
     quantity: Decimal
     notional_usd: Decimal
     gross_edge_bps: Decimal
     gross_edge_usd: Decimal
+    # What the strategy asked for before venue lot filters cut it down. Kept so
+    # a stored row can show how much of the intended size actually survived.
+    requested_notional_usd: Decimal | None = None
     # Size the thinner leg could actually absorb near the mid.
     liquidity_usd: Decimal | None = None
     # Age of the oldest data behind this decision.
@@ -134,6 +150,9 @@ class Opportunity:
     # How long this discrepancy has persisted in the same direction. Shorter
     # than round-trip latency means it was never executable by this system.
     duration_ms: int | None = None
+    # Everything needed to re-derive this decision once retention has deleted
+    # the raw feed it came from. None only for opportunities built by tests.
+    evidence: MarketEvidence | None = None
 
     @property
     def direction(self) -> Side:
@@ -160,17 +179,28 @@ class CostBreakdown:
     funding_usd: Decimal
     buffer_usd: Decimal
     other_usd: Decimal = Decimal(0)
+    borrow_usd: Decimal = Decimal(0)
 
     @property
     def total_usd(self) -> Decimal:
         return (
-            self.fees_usd + self.slippage_usd + self.funding_usd + self.buffer_usd + self.other_usd
+            self.fees_usd
+            + self.slippage_usd
+            + self.funding_usd
+            + self.buffer_usd
+            + self.other_usd
+            + self.borrow_usd
         )
 
 
 @dataclass(frozen=True, slots=True)
 class Edge:
-    """Gross edge, the costs against it, and what survives."""
+    """Gross edge, the costs against it, and what survives.
+
+    ``net_edge`` is what the *theoretical convergence* edge is worth after
+    costs, under the assumptions in ``pricing``. It is not realised profit and
+    nothing here claims it is.
+    """
 
     opportunity: Opportunity
     costs: CostBreakdown
@@ -178,6 +208,9 @@ class Edge:
     net_edge_bps: Decimal
     # What the cost model assumed about the perpetual leg's holding period.
     funding_horizon: timedelta | None = None
+    # Rates, roles, funding observation and the assumption snapshot behind the
+    # numbers above - stored, so a row explains itself years later.
+    pricing: PricingEvidence | None = None
 
     @property
     def gross_edge_usd(self) -> Decimal:
@@ -219,16 +252,45 @@ class RejectionReason(StrEnum):
     """
 
     NOT_LIVE = "NOT_LIVE"
+    # Kept for the market-wide case; the three below say which input was old,
+    # because a fresh message of one kind does not make another kind fresh.
     STALE_DATA = "STALE_DATA"
+    STALE_QUOTE = "STALE_QUOTE"
+    STALE_BOOK = "STALE_BOOK"
+    STALE_FUNDING = "STALE_FUNDING"
     BOOK_NOT_SYNCED = "BOOK_NOT_SYNCED"
     LATENCY_EXCEEDED = "LATENCY_EXCEEDED"
     INSUFFICIENT_LIQUIDITY = "INSUFFICIENT_LIQUIDITY"
     BELOW_MIN_NOTIONAL = "BELOW_MIN_NOTIONAL"
+    # Rounding to a valid lot left less than the venue's minimum order size.
+    BELOW_MIN_QUANTITY = "BELOW_MIN_QUANTITY"
+    # The book could not fill the modelled unwind, so the exit has no price.
+    # Doubling the entry instead would be a guess, not a conservative estimate.
+    UNWIND_NOT_FILLABLE = "UNWIND_NOT_FILLABLE"
     # The trade needs spot sold short, which needs inventory or a margin borrow.
     SPOT_SHORT_UNAVAILABLE = "SPOT_SHORT_UNAVAILABLE"
+    BORROW_COST_UNKNOWN = "BORROW_COST_UNKNOWN"
     FUNDING_UNKNOWN = "FUNDING_UNKNOWN"
     BELOW_MIN_EDGE = "BELOW_MIN_EDGE"
     SIGNAL_EXPIRED = "SIGNAL_EXPIRED"
+
+
+@dataclass(frozen=True, slots=True)
+class PricingRefusal:
+    """The cost model declining to price, and saying which cost it could not.
+
+    Returned instead of an ``Edge`` so the reason survives into the research
+    record. A refusal is not a zero edge: an opportunity nobody could price is
+    a different fact from one priced at nothing, and conflating them would
+    corrupt every query asking what survived costs.
+    """
+
+    reason: RejectionReason
+    detail: str
+
+
+#: What ``CostModel.estimate`` returns: a priced edge, or why it refused.
+PricingResult = Edge | PricingRefusal
 
 
 @dataclass

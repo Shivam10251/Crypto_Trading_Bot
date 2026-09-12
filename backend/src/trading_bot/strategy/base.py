@@ -34,6 +34,7 @@ from trading_bot.strategy.models import (
     DetectionStats,
     Edge,
     Opportunity,
+    PricingResult,
     Signal,
     ValidationResult,
 )
@@ -93,8 +94,14 @@ class Strategy(ABC):
         """
 
     @abstractmethod
-    def calculate_edge(self, opportunity: Opportunity) -> Edge | None:
-        """Apply the cost model. ``None`` when a cost cannot be estimated."""
+    def calculate_edge(self, opportunity: Opportunity) -> PricingResult:
+        """Apply the cost model.
+
+        Returns a priced ``Edge``, or a ``PricingRefusal`` naming the cost it
+        could not estimate. A refusal is not a zero edge, and the difference
+        is what keeps "nobody could price this" out of the population of
+        "priced, and it did not survive costs".
+        """
 
     @abstractmethod
     def generate_signal(self, opportunity: Opportunity, edge: Edge) -> Signal | None:

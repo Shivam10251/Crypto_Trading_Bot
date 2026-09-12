@@ -29,6 +29,7 @@ from trading_bot.strategy.models import (
     DetectionStats,
     Edge,
     Opportunity,
+    PricingRefusal,
     RejectionReason,
     Signal,
     ValidationResult,
@@ -180,16 +181,20 @@ class StrategyRunner:
 
     def _walk(self, strategy: Strategy, opportunity: Opportunity) -> EvaluatedOpportunity:
         """detect -> price -> generate -> validate, recording where it stopped."""
-        edge = strategy.calculate_edge(opportunity)
-        if edge is None:
+        priced = strategy.calculate_edge(opportunity)
+        if isinstance(priced, PricingRefusal):
+            # The cost model said which cost it could not estimate. Keeping its
+            # own reason beats the runner guessing one: "no funding interval"
+            # and "no depth to unwind" are different findings.
             return EvaluatedOpportunity(
                 opportunity=opportunity,
                 edge=None,
                 signal=None,
                 validation=None,
-                rejection=RejectionReason.FUNDING_UNKNOWN,
-                detail="no funding interval published for the perpetual leg",
+                rejection=priced.reason,
+                detail=priced.detail,
             )
+        edge = priced
         signal = strategy.generate_signal(opportunity, edge)
         if signal is None:
             return EvaluatedOpportunity(

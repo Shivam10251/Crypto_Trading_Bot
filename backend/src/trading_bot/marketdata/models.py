@@ -79,7 +79,15 @@ class MarketSnapshot:
     latency_ms: int | None
     # Local receipt time of the most recent message of any kind.
     last_update_at: datetime | None
+    # Age of that most recent message, whatever kind it was. Deliberately NOT
+    # the age of any one input: a 24h ticker arriving keeps this small while
+    # the quote and the book go on ageing, so a consumer deciding whether it
+    # may act must look at the component it is about to use, not at this.
     age_ms: int | None
+    # Age of the top-of-book quote, and of the synchronised book, measured
+    # from their own local receipt times. None when that component is absent.
+    quote_age_ms: int | None
+    book_age_ms: int | None
     updates: int
     # Order-book integrity failures (sequence gaps, crossed books) and rebuilds.
     gaps: int

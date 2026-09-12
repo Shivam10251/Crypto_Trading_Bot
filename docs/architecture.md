@@ -40,20 +40,25 @@ Binance WebSocket / REST        (Phase 3)
    Opportunity Engine           (Phase 7)  every opportunity, as an episode
             │
             ▼
-   Risk Engine                  (Phase 9)  APPROVED / REJECTED / PAUSED
+   Paper Account Safety Gate    (Phase 8)  cash, inventory, margin, exposure
             │
             ▼
    Execution Adapter            (Phase 8)  Paper today, Live behind a flag (17)
             │
             ▼
-   Portfolio & P&L              (Phase 10) positions, equity, drawdown
+   Risk Engine                  (Phase 9)  APPROVED / REJECTED / PAUSED
+            │
+            ▼
+   Portfolio & P&L              (Phase 10) exits, equity, drawdown
             │
             ▼
    API + WebSocket  →  Dashboard (Phases 12-13)
 ```
 
-The Risk Engine sits *between* strategy and execution deliberately: a strategy
-can never reach an execution adapter without a risk decision.
+Phase 8 now has a narrow safety gate before paper execution so even the
+simulator cannot assume infinite cash, inventory, margin, or exposure. Phase 9
+replaces that minimum boundary with durable policy decisions and kill-switch
+state before any live adapter exists.
 
 ## Backend layout
 
@@ -69,6 +74,7 @@ can never reach an execution adapter without a risk decision.
 | `trading_bot.monitoring` | Market selection, per-market statistics, terminal view | marketdata, exchange, config, strategy |
 | `trading_bot.strategy` | Strategy contract, domain types, cost model, basis strategy, runner | exchange + marketdata models only |
 | `trading_bot.opportunities` | Episode tracking and the research record | strategy, db |
+| `trading_bot.execution` | Bounded dispatcher, account reservations, adapter contract, paper simulator, leg coordination, order/fill/position record | strategy + marketdata models, db |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -112,10 +118,12 @@ model and migrations, retention, the exchange abstraction with a Binance
 market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
 service, configurable market selection and per-market monitoring, the strategy
 framework with the spot/perpetual basis strategy, the transaction cost model,
-the opportunity engine recording every detection to PostgreSQL, API skeleton,
-health and system-status endpoints, frontend shell, test tooling.
+the opportunity engine recording every detection to PostgreSQL with the
+evidence behind it, the paper execution engine and its order/fill record,
+API skeleton, health and system-status endpoints, frontend shell, test
+tooling.
 
-Not built: execution (Phase 8), risk engine, portfolio, dashboard. The system-status endpoint reports those subsystems as `OFFLINE`
+Not built: full risk engine, exits/P&L portfolio service, dashboard. The system-status endpoint reports those subsystems as `OFFLINE`
 with the phase that will implement them.
 
 ### The exchange boundary
@@ -215,6 +223,39 @@ OpportunityRecorder ──▶ opportunities  (status + every gate it failed)
                     ──▶ signals        (one row per leg)
 ```
 
-An episode that could never be priced is counted and logged, never stored with
-an invented net edge. Opportunities and signals are never purged - unlike raw
-market data, they are the point of the exercise.
+### The execution boundary
+
+`trading_bot.execution` sits where the risk engine will be inserted in Phase
+9. A strategy's validated signal becomes two `OrderRequest`s - one per leg,
+never a bundle - because that is the only shape in which leg risk is
+expressible: one can fill while the other does not.
+
+```
+Signal ──▶ bounded dispatcher ──▶ paper account gate ──▶ ExecutionCoordinator
+                                                            │ both legs at once
+                                                            ▼
+                                      ExecutionAdapter ──▶ ExecutionResult
+                                      PaperExecutionAdapter (Phase 8)
+                                      LiveExecutionAdapter  (Phase 17, off)
+             │
+             ▼
+        ExecutionAttempt  - hedged, naked by N, or nothing filled
+             │
+             ▼
+        ExecutionRecorder ──▶ orders + fills + open positions
+```
+
+The simulator reads the book **at fill time**, after the configured latency
+has elapsed, so the market moves before the order lands. Nothing in it is
+random: rejections come from venue filters and account constraints, while
+partial fills come from observed depth. IOC/FOK are evaluated once at arrival;
+GTC is refused until trades and queue position can support it. There is no
+fill-probability knob, because a simulator whose disappointments are drawn
+from a seed measures the seed.
+
+An episode that could never be priced is stored as `UNPRICEABLE` with no costs
+on it: it happened, so it is counted, and an invented zero would corrupt every
+query asking what survived costs. Each row carries the quotes, books, fills,
+filters, rates and assumptions behind it, because the raw tables it came from
+are purged in days and opportunities never are. Opportunities and signals are
+never purged - unlike raw market data, they are the point of the exercise.

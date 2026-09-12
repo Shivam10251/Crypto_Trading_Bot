@@ -13,6 +13,7 @@ from fastapi import APIRouter, Response, status
 
 from trading_bot import __version__
 from trading_bot.api.deps import SettingsDep
+from trading_bot.api.execution_status import execution_status
 from trading_bot.api.market_status import market_data_status
 from trading_bot.api.schemas import (
     ComponentHealth,
@@ -30,7 +31,6 @@ router = APIRouter(tags=["system"])
 # each phase lands, and so nothing reports a status it cannot substantiate.
 _PENDING_COMPONENTS: tuple[tuple[str, str], ...] = (
     ("Risk Engine", "not implemented until Phase 9"),
-    ("Paper Execution", "not implemented until Phase 8"),
 )
 
 
@@ -98,6 +98,10 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
         # Judged by the opportunities it recorded, the same way the feed is
         # judged by its quotes - the strategy runs in another process.
         await strategy_status(settings, now),
+        # Judged by the orders it wrote. "No orders" is the normal state of
+        # this strategy, so it reads OFFLINE with the reason rather than as a
+        # fault - and never as HEALTHY on no evidence.
+        await execution_status(settings, now),
         *_pending_components(),
     ]
     return SystemStatusResponse(

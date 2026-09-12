@@ -17,12 +17,14 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from fractions import Fraction
 from typing import Self
 
-from trading_bot.db.models.enums import MarketType, Side
+from trading_bot.db.models.enums import MarketType, OrderType, Side
 from trading_bot.exchange.errors import ExchangeDataError
 
 BPS_SCALE = Decimal(10_000)
@@ -33,6 +35,44 @@ def _latency_ms(local: datetime, exchange: datetime | None) -> int | None:
     if exchange is None:
         return None
     return int((local - exchange).total_seconds() * 1000)
+
+
+def combined_step(first: Decimal | None, second: Decimal | None) -> Decimal | None:
+    """Smallest increment satisfying both step sizes - their lowest common multiple.
+
+    ``None`` and zero both mean "this filter constrains nothing": Binance
+    publishes ``stepSize: "0.00000000"`` on spot ``MARKET_LOT_SIZE`` for every
+    symbol that has the filter at all (measured: 3,624 of 3,698).
+
+    The result is always exact. A Decimal's denominator is a power of ten, so
+    the gcd of two of them is too, and dividing by it terminates - there is no
+    case where two venue step sizes have no representable common increment.
+    """
+    steps = [value for value in (first, second) if value is not None and value > 0]
+    if not steps:
+        return None
+    if len(steps) == 1:
+        return steps[0]
+    left, right = Fraction(steps[0]), Fraction(steps[1])
+    # lcm(a/b, c/d) for fractions in lowest terms is lcm(a, c) / gcd(b, d).
+    numerator = math.lcm(left.numerator, right.numerator)
+    denominator = math.gcd(left.denominator, right.denominator)
+    with localcontext() as context:
+        context.prec = 60
+        return Decimal(numerator) / Decimal(denominator)
+
+
+def floor_to_step(quantity: Decimal, step: Decimal | None) -> Decimal:
+    """Largest multiple of ``step`` not exceeding ``quantity``.
+
+    Always rounds *down*: rounding a size up is an order the book was never
+    shown to support.
+    """
+    if step is None or step <= 0:
+        return quantity
+    if quantity <= 0:
+        return Decimal(0)
+    return (quantity // step) * step
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +94,19 @@ class MarketSpec:
     Fees are ``None`` when the venue only exposes them behind an authenticated
     endpoint (Binance spot). The cost model falls back to configuration rather
     than guessing - see Phase 6.
+
+    Quantity constraints come from two filters that both apply to a market
+    order, and they are not the same filter on the two venues (measured on
+    binance.com, 2026-09-12):
+
+    - ``LOT_SIZE`` - minQty / maxQty / stepSize, on every symbol of both venues.
+    - ``MARKET_LOT_SIZE`` - the market-order cap. On all 897 USD-M perpetuals
+      its ``maxQty`` is *tighter* than ``LOT_SIZE``'s (BTCUSDT: 120 against
+      1000) while its step and minimum match. On spot its ``stepSize`` and
+      ``minQty`` are published as ``0`` - meaning no constraint - but its
+      ``maxQty`` is real.
+
+    ``order_*`` combine the two, which is what an order actually has to satisfy.
     """
 
     ref: MarketRef
@@ -61,16 +114,87 @@ class MarketSpec:
     quote_asset: str
     is_active: bool
     tick_size: Decimal | None = None
+    min_price: Decimal | None = None
+    max_price: Decimal | None = None
+    percent_price_up: Decimal | None = None
+    percent_price_down: Decimal | None = None
+    bid_percent_price_up: Decimal | None = None
+    bid_percent_price_down: Decimal | None = None
+    ask_percent_price_up: Decimal | None = None
+    ask_percent_price_down: Decimal | None = None
+    percent_price_avg_mins: int = 0
     step_size: Decimal | None = None
     min_notional: Decimal | None = None
+    max_notional: Decimal | None = None
+    min_notional_apply_to_market: bool = True
+    max_notional_apply_to_market: bool = False
+    notional_avg_price_mins: int = 0
+    # Binance USD-M evaluates MARKET notional against mark price rather than
+    # the visible order-book price.  A simulator must not silently substitute
+    # its strategy price for that venue reference.
+    market_notional_uses_mark_price: bool = False
     maker_fee_bps: Decimal | None = None
     taker_fee_bps: Decimal | None = None
     contract_size: Decimal | None = None
     settlement_asset: str | None = None
+    # LOT_SIZE bounds; step_size above is the same filter's stepSize.
+    min_qty: Decimal | None = None
+    max_qty: Decimal | None = None
+    # MARKET_LOT_SIZE: a separate, usually tighter cap on market orders.
+    market_min_qty: Decimal | None = None
+    market_max_qty: Decimal | None = None
+    market_step_size: Decimal | None = None
 
     @property
     def symbol(self) -> str:
         return self.ref.symbol
+
+    @property
+    def order_step_size(self) -> Decimal | None:
+        """Increment a market order's quantity must be a multiple of."""
+        return combined_step(self.step_size, self.market_step_size)
+
+    @property
+    def order_min_qty(self) -> Decimal | None:
+        """Smallest quantity both lot filters admit."""
+        bounds = [value for value in (self.min_qty, self.market_min_qty) if value and value > 0]
+        return max(bounds) if bounds else None
+
+    @property
+    def order_max_qty(self) -> Decimal | None:
+        """Largest quantity both lot filters admit."""
+        bounds = [value for value in (self.max_qty, self.market_max_qty) if value and value > 0]
+        return min(bounds) if bounds else None
+
+    def quantity_step(self, order_type: OrderType) -> Decimal | None:
+        """The quantity increment that applies to ``order_type``."""
+        if order_type is OrderType.MARKET:
+            return combined_step(self.step_size, self.market_step_size)
+        return self.step_size
+
+    def minimum_quantity(self, order_type: OrderType) -> Decimal | None:
+        """The lower quantity bound that applies to ``order_type``."""
+        if order_type is not OrderType.MARKET:
+            return self.min_qty
+        bounds = [value for value in (self.min_qty, self.market_min_qty) if value and value > 0]
+        return max(bounds) if bounds else None
+
+    def maximum_quantity(self, order_type: OrderType) -> Decimal | None:
+        """The upper quantity bound that applies to ``order_type``."""
+        if order_type is not OrderType.MARKET:
+            return self.max_qty
+        bounds = [value for value in (self.max_qty, self.market_max_qty) if value and value > 0]
+        return min(bounds) if bounds else None
+
+    def minimum_notional(self, order_type: OrderType) -> Decimal | None:
+        if order_type is OrderType.MARKET and not self.min_notional_apply_to_market:
+            return None
+        return self.min_notional
+
+    def maximum_notional(self, order_type: OrderType) -> Decimal | None:
+        if order_type is OrderType.MARKET and not self.max_notional_apply_to_market:
+            return None
+        return self.max_notional
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +263,33 @@ class BookLevel:
 
 
 @dataclass(frozen=True, slots=True)
+class Fill:
+    """The result of walking a book for a quantity, and the levels it consumed.
+
+    ``levels`` is exactly what was taken - the last one trimmed to the part
+    actually used - so the average price can be re-derived from the record
+    long after retention has deleted the book it came from.
+    """
+
+    side: Side
+    requested: Decimal
+    filled: Decimal
+    levels: tuple[BookLevel, ...]
+
+    @property
+    def is_complete(self) -> bool:
+        return self.filled >= self.requested
+
+    @property
+    def average_price(self) -> Decimal | None:
+        """``None`` when nothing filled - there is no price for zero size."""
+        if self.filled <= 0:
+            return None
+        cost = sum((level.notional for level in self.levels), Decimal(0))
+        return cost / self.filled
+
+
+@dataclass(frozen=True, slots=True)
 class OrderBook:
     """Depth snapshot, best price first on both sides."""
 
@@ -148,10 +299,25 @@ class OrderBook:
     local_timestamp: datetime
     exchange_timestamp: datetime | None = None
     sequence: int | None = None
+    # A REST depth snapshot is a bounded view.  Exhausting it means the rest
+    # is unknown, not that the venue has no more liquidity.  Synthetic books
+    # default to complete so existing fixtures state exactly what they contain.
+    bids_complete: bool = True
+    asks_complete: bool = True
 
     def __post_init__(self) -> None:
         if not self.bids or not self.asks:
             raise ExchangeDataError(f"empty book side for {self.ref}")
+        if any(
+            not level.price.is_finite()
+            or not level.size.is_finite()
+            or level.price <= 0
+            or level.size <= 0
+            for level in (*self.bids, *self.asks)
+        ):
+            raise ExchangeDataError(
+                f"book levels must have positive finite price and size: {self.ref}"
+            )
         if self.best_bid > self.best_ask:
             raise ExchangeDataError(f"crossed book for {self.ref}")
         # Ordering matters: fills walk these lists in order.
@@ -191,28 +357,31 @@ class OrderBook:
             return Decimal(0)
         return (bid_side - ask_side) / total
 
-    def fill_price(self, side: Side, quantity: Decimal) -> tuple[Decimal, Decimal]:
-        """Walk the book for ``quantity``; return (average price, filled size).
+    def walk(self, side: Side, quantity: Decimal) -> Fill:
+        """Consume ``quantity`` from one side, keeping the levels it took.
 
         This is how slippage stops being a guess: a market buy consumes asks
-        from the top down. Returns the partial fill when depth runs out, so
-        callers can see they cannot get the size they wanted.
+        from the top down. A partial fill is reported as one, so callers can
+        see they cannot get the size they wanted rather than being handed an
+        average price for a trade that could not happen.
         """
         if quantity <= 0:
             raise ValueError("quantity must be positive")
         book = self.asks if side is Side.BUY else self.bids
         remaining = quantity
-        cost = Decimal(0)
+        taken: list[BookLevel] = []
         for level in book:
             if remaining <= 0:
                 break
             take = min(remaining, level.size)
-            cost += take * level.price
+            taken.append(BookLevel(price=level.price, size=take))
             remaining -= take
-        filled = quantity - remaining
-        if filled == 0:
-            return Decimal(0), Decimal(0)
-        return cost / filled, filled
+        return Fill(side=side, requested=quantity, filled=quantity - remaining, levels=tuple(taken))
+
+    def fill_price(self, side: Side, quantity: Decimal) -> tuple[Decimal, Decimal]:
+        """``(average price, filled size)`` - ``walk`` without the level detail."""
+        fill = self.walk(side, quantity)
+        return fill.average_price or Decimal(0), fill.filled
 
 
 @dataclass(frozen=True, slots=True)

@@ -155,8 +155,14 @@ class TestMarketSpecParsing:
         assert spec.symbol == "BTCUSDT"
         assert spec.base_asset == "BTC"
         assert spec.tick_size == Decimal("0.01000000")
+        assert spec.min_price == Decimal("0.01000000")
+        assert spec.max_price == Decimal("1000000.00000000")
         assert spec.step_size == Decimal("0.00001000")
         assert spec.min_notional == Decimal("5.00000000")
+        assert spec.max_notional == Decimal("9000000.00000000")
+        assert spec.min_notional_apply_to_market is True
+        assert spec.max_notional_apply_to_market is False
+        assert spec.notional_avg_price_mins == 5
         assert spec.is_active is True
 
     def test_fees_are_left_unknown(self) -> None:
@@ -167,11 +173,47 @@ class TestMarketSpecParsing:
         assert spec.maker_fee_bps is None
         assert spec.taker_fee_bps is None
 
+    def test_futures_market_notional_uses_mark_price(self) -> None:
+        spec = parse_market_spec(
+            load("futures_exchange_info")["symbols"][0],
+            "binance",
+            MarketType.PERPETUAL,
+        )
+        assert spec.market_notional_uses_mark_price is True
+        assert spec.min_notional == Decimal("50")
+        assert spec.percent_price_up == Decimal("1.0500")
+        assert spec.percent_price_down == Decimal("0.9500")
+
     def test_non_trading_symbol_is_inactive(self) -> None:
         spec = parse_market_spec(
             load("spot_exchange_info")["symbols"][2], "binance", MarketType.SPOT
         )
         assert spec.is_active is False
+
+    def test_spot_lot_bounds_are_extracted(self) -> None:
+        spec = parse_market_spec(
+            load("spot_exchange_info")["symbols"][0], "binance", MarketType.SPOT
+        )
+        assert spec.min_qty == Decimal("0.00001000")
+        assert spec.max_qty == Decimal("9000.00000000")
+
+    def test_spot_market_lot_size_publishes_zero_for_no_constraint(self) -> None:
+        """Spot MARKET_LOT_SIZE has stepSize 0 on every symbol that has it.
+
+        Zero means "this filter constrains nothing". Reading it as a real step
+        would make every quantity invalid. Its maxQty is real, though - a cap
+        on market orders that LOT_SIZE does not impose.
+        """
+        spec = parse_market_spec(
+            load("spot_exchange_info")["symbols"][0], "binance", MarketType.SPOT
+        )
+        assert spec.market_step_size is None
+        assert spec.market_min_qty is None
+        assert spec.market_max_qty == Decimal("121.45828266")
+        # So the increment an order must respect comes from LOT_SIZE alone...
+        assert spec.order_step_size == Decimal("0.00001000")
+        # ...and the cap is the tighter of the two filters.
+        assert spec.order_max_qty == Decimal("121.45828266")
 
     def test_futures_margin_asset_becomes_settlement_asset(self) -> None:
         spec = parse_market_spec(
@@ -179,6 +221,43 @@ class TestMarketSpecParsing:
         )
         assert spec.settlement_asset == "USDT"
         assert spec.tick_size == Decimal("0.10")
+
+    def test_futures_min_notional_uses_the_notional_key(self) -> None:
+        """USD-M futures publish {"filterType": "MIN_NOTIONAL", "notional": ...}.
+
+        Not ``minNotional``, which is the spot NOTIONAL filter's key. Checked
+        against the live venue on 2026-09-12: all 897 USD-M perpetuals use
+        ``notional`` and not one publishes ``minNotional``, so reading only
+        the spot key left every perpetual's minimum as None - and an order
+        below the venue minimum passing validation.
+        """
+        spec = parse_market_spec(
+            load("futures_exchange_info")["symbols"][0], "binance", MarketType.PERPETUAL
+        )
+        assert spec.min_notional == Decimal(50)
+
+    def test_futures_market_lot_size_is_the_binding_maximum(self) -> None:
+        """On BTCUSDT perp, LOT_SIZE allows 1000 and MARKET_LOT_SIZE 120."""
+        spec = parse_market_spec(
+            load("futures_exchange_info")["symbols"][0], "binance", MarketType.PERPETUAL
+        )
+        assert spec.max_qty == Decimal(1000)
+        assert spec.market_max_qty == Decimal(120)
+        assert spec.order_max_qty == Decimal(120)
+        assert spec.order_min_qty == Decimal("0.001")
+        assert spec.order_step_size == Decimal("0.001")
+
+    def test_the_two_legs_of_a_pair_do_not_share_a_step_size(self) -> None:
+        """The reason a shared quantity has to be rounded to suit both."""
+        spot = parse_market_spec(
+            load("spot_exchange_info")["symbols"][0], "binance", MarketType.SPOT
+        )
+        perp = parse_market_spec(
+            load("futures_exchange_info")["symbols"][0], "binance", MarketType.PERPETUAL
+        )
+        assert spot.order_step_size == Decimal("0.00001")
+        assert perp.order_step_size == Decimal("0.001")
+        assert spot.order_step_size != perp.order_step_size
 
     def test_missing_base_asset_raises(self) -> None:
         with pytest.raises(ExchangeDataError, match="baseAsset"):

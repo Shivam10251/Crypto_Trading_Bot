@@ -402,6 +402,51 @@ class TestFreshness:
         # Reported once on the way down and once on the way up, not on every check.
         assert [e.severity for e in stale] == [Severity.WARNING, Severity.INFO]
 
+    async def test_a_fresh_ticker_does_not_make_a_stale_quote_look_fresh(self) -> None:
+        """The aggregate age is the newest message of ANY kind.
+
+        Binance pushes the 24h ticker on its own cadence, so it keeps a market
+        looking current while the quote a strategy would price against goes on
+        ageing. The per-component ages are what a consumer must judge by.
+        """
+        subscription = MarketDataSubscription(refs=(SPOT,), include_ticker=True)
+        async with running(subscription) as h:
+            await h.venue.wait_connected("spot")
+            h.venue.send("spot", book_ticker(SPOT, 1, "100", "101"))
+            await eventually(lambda: h.engine.snapshot(SPOT).is_live)
+            h.clock.advance(1500)
+            h.venue.send("spot", fixture("ws_spot_ticker")[0])
+            await eventually(lambda: h.engine.snapshot(SPOT).volume_24h is not None)
+            snapshot = h.engine.snapshot(SPOT)
+        # The ticker arrived just now, so the market as a whole looks current...
+        assert snapshot.age_ms == 0
+        # ...while the quote behind any price decision is a second and a half old.
+        assert snapshot.quote_age_ms == 1500
+
+    async def test_the_book_ages_on_its_own_clock(self) -> None:
+        """Depth and quotes arrive on different streams and age separately."""
+        subscription = MarketDataSubscription(refs=(SPOT,), include_depth=True, depth_levels=2)
+        async with running(subscription, snapshots={SPOT: [ladder(SPOT, 100)]}) as h:
+            await h.venue.wait_connected("spot")
+            h.venue.send("spot", depth_update(SPOT, 101, 101, bids=(("99", "2"),)))
+            await eventually(lambda: h.engine.snapshot(SPOT).book_status is BookStatus.SYNCED)
+            # Three seconds later only a quote arrives; the book is untouched.
+            h.clock.advance(3000)
+            h.venue.send("spot", book_ticker(SPOT, 10_000_000, "100", "101"))
+            await eventually(lambda: h.engine.snapshot(SPOT).quote is not None)
+            snapshot = h.engine.snapshot(SPOT)
+        assert snapshot.quote_age_ms == 0
+        assert snapshot.book_age_ms is not None and snapshot.book_age_ms >= 3000
+
+    async def test_a_market_with_no_book_reports_no_book_age(self) -> None:
+        async with running(MarketDataSubscription.top_of_book(SPOT)) as h:
+            await h.venue.wait_connected("spot")
+            h.venue.send("spot", book_ticker(SPOT, 1, "100", "101"))
+            await eventually(lambda: h.engine.snapshot(SPOT).is_live)
+            snapshot = h.engine.snapshot(SPOT)
+        assert snapshot.book_age_ms is None
+        assert snapshot.quote_age_ms == 0
+
     async def test_a_connected_market_that_never_delivers_goes_stale(self) -> None:
         async with running(MarketDataSubscription.top_of_book(SPOT)) as h:
             await h.venue.wait_connected("spot")

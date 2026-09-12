@@ -48,10 +48,18 @@ class Market(Base, RecordMixin):
     base_asset: Mapped[str] = mapped_column(String(16), nullable=False)
     quote_asset: Mapped[str] = mapped_column(String(16), nullable=False)
 
-    # Exchange trading filters.
+    # Exchange trading filters. LOT_SIZE gives step/min/max quantity and
+    # MARKET_LOT_SIZE a separate, usually tighter cap on market orders - on
+    # every USD-M perpetual measured, its maxQty is the binding one. Both are
+    # stored because an order has to satisfy both.
     tick_size: Mapped[Decimal | None] = mapped_column(PRICE)
     step_size: Mapped[Decimal | None] = mapped_column(QUANTITY)
     min_notional: Mapped[Decimal | None] = mapped_column(MONEY)
+    min_qty: Mapped[Decimal | None] = mapped_column(QUANTITY)
+    max_qty: Mapped[Decimal | None] = mapped_column(QUANTITY)
+    market_min_qty: Mapped[Decimal | None] = mapped_column(QUANTITY)
+    market_max_qty: Mapped[Decimal | None] = mapped_column(QUANTITY)
+    market_step_size: Mapped[Decimal | None] = mapped_column(QUANTITY)
 
     # Venue fees for this market, in basis points.
     maker_fee_bps: Mapped[Decimal | None] = mapped_column(BPS)
@@ -75,6 +83,17 @@ class Market(Base, RecordMixin):
         Index("ix_markets_active", "is_active", "market_type"),
         CheckConstraint("tick_size IS NULL OR tick_size > 0", name="tick_size_positive"),
         CheckConstraint("step_size IS NULL OR step_size > 0", name="step_size_positive"),
+        CheckConstraint(
+            "market_step_size IS NULL OR market_step_size > 0", name="market_step_size_positive"
+        ),
+        CheckConstraint("min_qty IS NULL OR min_qty > 0", name="min_qty_positive"),
+        CheckConstraint("max_qty IS NULL OR max_qty > 0", name="max_qty_positive"),
+        CheckConstraint(
+            "market_min_qty IS NULL OR market_min_qty > 0", name="market_min_qty_positive"
+        ),
+        CheckConstraint(
+            "market_max_qty IS NULL OR market_max_qty > 0", name="market_max_qty_positive"
+        ),
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

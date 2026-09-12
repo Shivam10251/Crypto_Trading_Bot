@@ -5,34 +5,44 @@ trades we would have taken cannot say how many chances existed, how many
 survived fees, or what killed the rest. Rows here are never purged - unlike
 raw market data, they are the point of the exercise.
 
-A row captures the episode at its **best** moment, with ``detected_at`` and
-``duration_ms`` bounding when that was. Prices, quantity and the itemised costs
-are all on the row, so a better fee model in a later phase can re-derive net
-edge from what is stored. Slippage cannot be re-derived that way - it came from
-a book that retention will delete - so it is kept as its own column rather than
-folded into the price.
+A row captures the episode at its **best** moment. ``detected_at`` is when the
+episode opened, ``best_observed_at`` is when the moment the economics describe
+actually happened, and ``last_seen_at`` closes the run - three different facts
+that one column cannot hold.
+
+Prices, quantity and the itemised costs are on the row, and ``evidence`` holds
+the quotes, books, fills, venue filters, fee rates, funding observation and
+cost-model assumptions behind them. That is what makes a row re-derivable
+after retention empties ``market_data`` and ``order_books``; a foreign key
+into those tables would point at a sampled quote the decision never saw, and
+then at nothing.
+
+An episode nobody could price is stored too, with NULL costs, a NULL net edge
+and status ``UNPRICEABLE``. It used to be dropped, which silently removed
+observations from the count of how many opportunities there were.
 """
 
 from __future__ import annotations
 
 import asyncio
-import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import insert
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trading_bot.core.logging import get_logger
 from trading_bot.db.models import Opportunity as OpportunityRow
+from trading_bot.db.models import Order as OrderRow
+from trading_bot.db.models import Position as PositionRow
 from trading_bot.db.models import Signal as SignalRow
 from trading_bot.db.models.enums import ExecutionMode, OpportunityStatus, SignalStatus
 from trading_bot.exchange.models import MarketRef
 from trading_bot.opportunities.episodes import OpportunityEpisode
-from trading_bot.strategy.models import Leg, RejectionReason
+from trading_bot.strategy.models import RejectionReason
 
 logger = get_logger(__name__)
 
@@ -42,6 +52,11 @@ SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 # dropped, with a warning, rather than growing without bound.
 MAX_PENDING_EPISODES = 5000
 
+# Stamped on every evidence document. A reader that does not recognise the
+# version knows to stop rather than to misread it; a row with no evidence at
+# all predates provenance and is not reproducible.
+EVIDENCE_SCHEMA = 1
+
 
 def _status(episode: OpportunityEpisode) -> OpportunityStatus:
     """What became of this opportunity, in the schema's vocabulary."""
@@ -49,6 +64,12 @@ def _status(episode: OpportunityEpisode) -> OpportunityStatus:
         # It passed every gate the strategy applies. Nothing executed it -
         # that is Phase 8 - so VALIDATED, never EXECUTED.
         return OpportunityStatus.VALIDATED
+    if episode.best.edge is None:
+        # Detected, real, and never priceable. Not REJECTED: it never reached
+        # a cost to be rejected by, and filing it with the priced rejections
+        # would answer "how many survived costs?" with a population that was
+        # never costed.
+        return OpportunityStatus.UNPRICEABLE
     if episode.rejections:
         return OpportunityStatus.REJECTED
     return OpportunityStatus.DETECTED
@@ -66,28 +87,65 @@ def _rejection_reason(episode: OpportunityEpisode) -> str | None:
     return ", ".join(sorted({reason.value for reason in episode.rejections}))
 
 
+def _evidence(episode: OpportunityEpisode) -> dict[str, Any] | None:
+    """The decision's own inputs and assumptions, as one JSON document.
+
+    Not a foreign key into ``market_data``: those rows are sampled every 5 s
+    rather than written per evaluation, so none of them is the quote this
+    decision used, and retention deletes them after 7 days while the
+    opportunity is kept forever. Carrying the evidence keeps the row
+    reproducible after the raw feed behind it is gone.
+    """
+    item = episode.best
+    market = item.opportunity.evidence
+    pricing = item.edge.pricing if item.edge is not None else None
+    if market is None and pricing is None:
+        return None
+    document: dict[str, Any] = {
+        "schema": EVIDENCE_SCHEMA,
+        "episode": {
+            "opened_at": episode.opened_at.isoformat(),
+            "best_observed_at": episode.best_at.isoformat(),
+            "last_seen_at": episode.last_seen_at.isoformat(),
+            "samples": episode.samples,
+            "rejections": sorted({reason.value for reason in episode.rejections}),
+        },
+    }
+    if market is not None:
+        document["market"] = market.as_dict()
+    if pricing is not None:
+        document["pricing"] = pricing.as_dict()
+    return document
+
+
 def opportunity_row(
     episode: OpportunityEpisode, market_ids: dict[MarketRef, int]
 ) -> dict[str, Any] | None:
-    """The episode as a row, or ``None`` when it cannot be stored honestly.
+    """The episode as a row, or ``None`` when its legs are not registered.
 
-    An episode whose costs were never estimable has no net edge, and the column
-    is NOT NULL for good reason - a fabricated zero would pollute every query
-    that asks what survived costs. Those episodes are counted instead.
+    An episode whose costs were never estimable is still stored - it is an
+    observation, and dropping it made "how many opportunities were there?"
+    unanswerable. What is *not* stored is an invented cost: its cost columns
+    and its net edge are NULL and its status is ``UNPRICEABLE``, so the three
+    populations - unpriceable, priced and rejected, validated - stay apart.
     """
     item = episode.best
     edge = item.edge
-    if edge is None:
-        return None
     opportunity = item.opportunity
     buy_id = market_ids.get(opportunity.buy.ref)
     sell_id = market_ids.get(opportunity.sell.ref)
     if buy_id is None or sell_id is None:
         return None
-    costs = edge.costs
+    costs = edge.costs if edge is not None else None
     return {
-        "uid": uuid.uuid4(),
+        # Fixed when the episode opened, so a retried flush presents the same
+        # row rather than a second observation of the same moment.
+        "uid": episode.uid,
         "detected_at": episode.opened_at,
+        # The economics below describe this instant, not the opening one.
+        "best_observed_at": episode.best_at,
+        "last_seen_at": episode.last_seen_at,
+        "samples": episode.samples,
         "strategy": episode.strategy,
         # Detection is independent of how it would be executed.
         "mode": ExecutionMode.THEORETICAL,
@@ -95,25 +153,31 @@ def opportunity_row(
         "secondary_market_id": sell_id,
         "direction": opportunity.direction,
         "entry_price": opportunity.buy.executable_price,
-        "exit_price": opportunity.sell.executable_price,
+        # exit_price is deliberately not written: it used to hold the sold
+        # leg's *entry* price, which is not an exit of anything.
+        "sell_entry_price": opportunity.sell.executable_price,
+        "buy_unwind_price": opportunity.buy.unwind_price,
+        "sell_unwind_price": opportunity.sell.unwind_price,
         "quantity": opportunity.quantity,
         "notional_usd": opportunity.notional_usd,
+        "requested_notional_usd": opportunity.requested_notional_usd,
         "gross_edge_bps": opportunity.gross_edge_bps,
         "gross_edge_usd": opportunity.gross_edge_usd,
-        "estimated_fees_usd": costs.fees_usd,
-        "estimated_slippage_usd": costs.slippage_usd,
+        "estimated_fees_usd": costs.fees_usd if costs else None,
+        "estimated_slippage_usd": costs.slippage_usd if costs else None,
         # Signed: a short perpetual receives funding when the rate is positive.
-        "funding_cost_usd": costs.funding_usd,
-        "borrow_cost_usd": Decimal(0),
-        "other_costs_usd": costs.other_usd,
-        "safety_buffer_usd": costs.buffer_usd,
-        "net_edge_bps": edge.net_edge_bps,
-        "net_edge_usd": edge.net_edge_usd,
+        "funding_cost_usd": costs.funding_usd if costs else None,
+        "borrow_cost_usd": costs.borrow_usd if costs else None,
+        "other_costs_usd": costs.other_usd if costs else None,
+        "safety_buffer_usd": costs.buffer_usd if costs else None,
+        "net_edge_bps": edge.net_edge_bps if edge else None,
+        "net_edge_usd": edge.net_edge_usd if edge else None,
         "liquidity_usd": opportunity.liquidity_usd,
         "latency_ms": opportunity.latency_ms,
         "duration_ms": episode.duration_ms,
         "status": _status(episode),
         "rejection_reason": _rejection_reason(episode),
+        "evidence": _evidence(episode),
     }
 
 
@@ -121,7 +185,9 @@ def signal_rows(
     episode: OpportunityEpisode, opportunity_id: int, market_ids: dict[MarketRef, int]
 ) -> list[dict[str, Any]]:
     """One row per leg - the signals table describes a single market each."""
-    signal = episode.best.signal
+    signal = episode.executed_signal
+    if signal is None and episode.best_actionable is not None:
+        signal = episode.best_actionable.signal
     if signal is None:
         return []
     rows: list[dict[str, Any]] = []
@@ -138,7 +204,10 @@ def signal_rows(
                 "side": leg.side,
                 "quantity": leg.quantity,
                 "target_entry_price": leg.executable_price,
-                "target_exit_price": _counterpart(signal.legs, leg),
+                # Where THIS leg is closed: its own modelled unwind, against
+                # the other side of its own book. The counterpart leg's entry
+                # price used to go here, which described no exit at all.
+                "target_exit_price": leg.unwind_price,
                 "expected_net_edge_bps": signal.expected_net_edge_bps,
                 "status": SignalStatus.GENERATED,
                 "expires_at": signal.expires_at,
@@ -146,11 +215,6 @@ def signal_rows(
             }
         )
     return rows
-
-
-def _counterpart(legs: Sequence[Leg], leg: Leg) -> Decimal | None:
-    """The other leg's price - where this position is closed against."""
-    return next((other.executable_price for other in legs if other.ref != leg.ref), None)
 
 
 class OpportunityRecorder:
@@ -175,50 +239,64 @@ class OpportunityRecorder:
         self.failures = 0
 
     def record(self, episodes: Sequence[OpportunityEpisode]) -> None:
-        """Queue closed episodes; written with the next flush."""
+        """Queue closed episodes; written with the next flush.
+
+        Queuing the same episode twice - a shutdown closing one already
+        recorded, say - must not write it twice, so the queue is keyed by the
+        episode's uid. The unique index on that column is the backstop if a
+        duplicate ever reaches the database anyway.
+        """
+        queued = {episode.uid for episode in self._pending}
         for episode in episodes:
             if episode.duration_ms < self._min_duration_ms:
+                continue
+            if episode.uid in queued:
                 continue
             if len(self._pending) >= MAX_PENDING_EPISODES:
                 logger.warning("opportunities.episode_dropped", strategy=episode.strategy)
                 self._pending.pop(0)
             self._pending.append(episode)
+            queued.add(episode.uid)
 
     async def flush(self) -> int:
         """Write queued episodes; returns opportunity rows written.
 
         A database failure keeps the queue and retries next interval: it must
-        never stop the strategy that the rest of the platform depends on.
+        never stop the strategy that the rest of the platform depends on. The
+        retry is safe because each episode's uid was fixed when it opened.
         """
         if not self._pending:
             return 0
-        batch = list(self._pending)
+        batch, self._pending = self._pending, []
         rows: list[tuple[OpportunityEpisode, dict[str, Any]]] = []
+        unregistered = 0
         unpriced = 0
         for episode in batch:
             row = opportunity_row(episode, self._market_ids)
             if row is None:
-                unpriced += 1
+                # Neither leg is in ``markets``; nothing can reference it.
+                unregistered += 1
                 continue
+            if row["net_edge_bps"] is None:
+                unpriced += 1
             rows.append((episode, row))
         if not rows:
-            del self._pending[: len(batch)]
-            self.unpriced += unpriced
-            _log_unpriced(unpriced, batch)
             return 0
 
         try:
             async with self._session_factory() as session:
                 written = await self._write(session, rows)
         except Exception as exc:
+            self._pending = (batch + self._pending)[-MAX_PENDING_EPISODES:]
             self.failures += 1
             logger.warning("opportunities.write_failed", error=str(exc), pending=len(batch))
             return 0
 
-        del self._pending[: len(batch)]
         self.opportunities_written += len(rows)
         self.signals_written += written
         self.unpriced += unpriced
+        if unregistered:
+            logger.warning("opportunities.market_not_registered", episodes=unregistered)
         _log_unpriced(unpriced, batch)
         return len(rows)
 
@@ -229,16 +307,71 @@ class OpportunityRecorder:
         # sort_by_parameter_order is not optional here: without it PostgreSQL
         # may return the generated ids in any order, and every signal would be
         # attached to the wrong opportunity - silently, and only under batches.
-        result = await session.execute(
-            insert(OpportunityRow).returning(OpportunityRow.id, sort_by_parameter_order=True),
-            [row for _, row in rows],
+        values = [row for _, row in rows]
+        statement = insert(OpportunityRow).values(values)
+        await session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[OpportunityRow.uid],
+                set_={key: getattr(statement.excluded, key) for key in values[0] if key != "uid"},
+            )
         )
-        ids = [row_id for (row_id,) in result]
+        result = await session.execute(
+            select(OpportunityRow.id, OpportunityRow.uid).where(
+                OpportunityRow.uid.in_([episode.uid for episode, _ in rows])
+            )
+        )
+        ids = {uid: row_id for row_id, uid in result}
         signals: list[dict[str, Any]] = []
-        for (episode, _), opportunity_id in zip(rows, ids, strict=True):
-            signals.extend(signal_rows(episode, opportunity_id, self._market_ids))
+        signal_episodes: list[tuple[OpportunityEpisode, dict[str, Any]]] = []
+        for episode, _ in rows:
+            for signal in signal_rows(episode, ids[episode.uid], self._market_ids):
+                signals.append(signal)
+                signal_episodes.append((episode, signal))
         if signals:
-            await session.execute(insert(SignalRow), signals)
+            signal_statement = insert(SignalRow).values(signals)
+            await session.execute(
+                signal_statement.on_conflict_do_update(
+                    constraint="opportunity_market_side",
+                    set_={
+                        key: getattr(signal_statement.excluded, key)
+                        for key in signals[0]
+                        if key not in {"opportunity_id", "market_id", "side"}
+                    },
+                )
+            )
+            stored = await session.execute(
+                select(
+                    SignalRow.id,
+                    SignalRow.opportunity_id,
+                    SignalRow.market_id,
+                    SignalRow.side,
+                ).where(SignalRow.opportunity_id.in_(list(ids.values())))
+            )
+            signal_ids = {
+                (opportunity_id, market_id, side): signal_id
+                for signal_id, opportunity_id, market_id, side in stored
+            }
+            for episode, signal in signal_episodes:
+                signal_id = signal_ids[
+                    (signal["opportunity_id"], signal["market_id"], signal["side"])
+                ]
+                await session.execute(
+                    update(OrderRow)
+                    .where(
+                        OrderRow.opportunity_uid == episode.uid,
+                        OrderRow.market_id == signal["market_id"],
+                        OrderRow.is_shadow.is_(False),
+                    )
+                    .values(signal_id=signal_id)
+                )
+                await session.execute(
+                    update(PositionRow)
+                    .where(
+                        PositionRow.opportunity_uid == episode.uid,
+                        PositionRow.market_id == signal["market_id"],
+                    )
+                    .values(opportunity_id=signal["opportunity_id"])
+                )
         return len(signals)
 
     async def run(self) -> None:
@@ -248,7 +381,7 @@ class OpportunityRecorder:
 
 
 def _log_unpriced(count: int, batch: Sequence[OpportunityEpisode]) -> None:
-    """An episode that could never be priced is dropped, so say so out loud."""
+    """Unpriceable episodes are stored now, but still worth saying out loud."""
     if not count:
         return
     reasons: Counter[str] = Counter(
@@ -257,4 +390,4 @@ def _log_unpriced(count: int, batch: Sequence[OpportunityEpisode]) -> None:
         if episode.best.edge is None
         for reason in episode.rejections or [RejectionReason.FUNDING_UNKNOWN]
     )
-    logger.warning("opportunities.unpriced_not_stored", episodes=count, reasons=dict(reasons))
+    logger.info("opportunities.unpriceable_stored", episodes=count, reasons=dict(reasons))

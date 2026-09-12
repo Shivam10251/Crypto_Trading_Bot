@@ -63,9 +63,21 @@ class TestSystemStatus:
         statuses = {c["name"]: c for c in body["components"]}
         assert statuses["API"]["status"] == "HEALTHY"
         assert statuses["Database"]["status"] == "HEALTHY"
-        for pending in ("Risk Engine", "Paper Execution"):
+        for pending in ("Risk Engine",):
             assert statuses[pending]["status"] == "OFFLINE"
             assert "Phase" in statuses[pending]["detail"]
+
+    async def test_execution_is_offline_while_it_is_switched_off(self, client: AsyncClient) -> None:
+        """Built in Phase 8, but off by default - and it says which.
+
+        "Not implemented" and "implemented and disarmed" are different facts,
+        and the panel must not keep claiming the first once the second is true.
+        """
+        body = (await client.get(f"{API_PREFIX}/system-status")).json()
+        execution = {c["name"]: c for c in body["components"]}["Paper Execution"]
+        assert execution["status"] == "OFFLINE"
+        assert "switched off" in execution["detail"]
+        assert "Phase" not in execution["detail"]
 
     async def test_strategy_is_offline_without_recorded_opportunities(
         self, client: AsyncClient

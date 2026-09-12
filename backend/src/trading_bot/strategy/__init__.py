@@ -9,7 +9,18 @@ until Phase 8.
 from trading_bot.strategy.base import MarketView, Strategy, StrategyContext
 from trading_bot.strategy.basis import STRATEGY_NAME as SPOT_PERP_BASIS
 from trading_bot.strategy.basis import BasisPair, SpotPerpBasisStrategy
-from trading_bot.strategy.costs import CostModel, TransactionCostModel, settlements_crossed
+from trading_bot.strategy.costs import (
+    COST_MODEL_VERSION,
+    CostModel,
+    TransactionCostModel,
+    settlements_crossed,
+)
+from trading_bot.strategy.evidence import (
+    FundingEvidence,
+    LegEvidence,
+    MarketEvidence,
+    PricingEvidence,
+)
 from trading_bot.strategy.fees import FeeSchedule, InstrumentFees, OrderRole
 from trading_bot.strategy.models import (
     CostBreakdown,
@@ -17,6 +28,8 @@ from trading_bot.strategy.models import (
     Edge,
     Leg,
     Opportunity,
+    PricingRefusal,
+    PricingResult,
     RejectionReason,
     Signal,
     ValidationResult,
@@ -29,6 +42,7 @@ from trading_bot.strategy.runner import (
 )
 
 __all__ = [
+    "COST_MODEL_VERSION",
     "SPOT_PERP_BASIS",
     "BasisPair",
     "CostBreakdown",
@@ -37,11 +51,17 @@ __all__ = [
     "Edge",
     "EvaluatedOpportunity",
     "FeeSchedule",
+    "FundingEvidence",
     "InstrumentFees",
     "Leg",
+    "LegEvidence",
+    "MarketEvidence",
     "MarketView",
     "Opportunity",
     "OrderRole",
+    "PricingEvidence",
+    "PricingRefusal",
+    "PricingResult",
     "RejectionReason",
     "Signal",
     "SpotPerpBasisStrategy",

@@ -73,6 +73,9 @@ class RecostedOpportunity:
 class RecostReport:
     rows: tuple[RecostedOpportunity, ...]
     schedule: str
+    # Stored opportunities that were never priced, so there is nothing to
+    # re-price. Reported rather than silently missing from the denominator.
+    skipped_unpriceable: int = 0
 
     @property
     def total(self) -> int:
@@ -115,6 +118,11 @@ class RecostReport:
             )
         else:
             lines.append("  no verdict changed: the fee schedule is not what decides this")
+        if self.skipped_unpriceable:
+            lines.append(
+                f"  {self.skipped_unpriceable} unpriceable opportunities skipped: "
+                "a fee schedule cannot change a verdict never reached"
+            )
         lines.append(
             "  slippage and funding are carried through unchanged - "
             "neither can be re-derived from a stored row"
@@ -130,24 +138,38 @@ def recost_row(
     *,
     entry_role: OrderRole,
     exit_role: OrderRole,
-) -> RecostedOpportunity:
+) -> RecostedOpportunity | None:
     """Re-derive fees for one row; every other cost is carried through.
 
     Both legs traded the same notional, so the fee is that notional at each
     leg's rate, charged on entry and on exit.
+
+    ``None`` for an UNPRICEABLE row. Re-costing compares a stored net edge
+    against a re-derived one, and a row that was never priced has no stored
+    figure to compare with - treating its missing costs as zero would invent
+    exactly the number it was stored to avoid inventing.
     """
+    if opportunity.net_edge_bps is None or opportunity.estimated_fees_usd is None:
+        return None
     notional = opportunity.notional_usd
     fees = Decimal(0)
     for market_type in market_types:
         instrument = schedule.spot if market_type is MarketType.SPOT else schedule.perpetual
         rate = instrument.rate(entry_role) + instrument.rate(exit_role)
         fees += notional * rate / BPS_SCALE
-    other_costs = (
-        opportunity.estimated_slippage_usd
-        + opportunity.funding_cost_usd
-        + opportunity.borrow_cost_usd
-        + opportunity.other_costs_usd
-        + opportunity.safety_buffer_usd
+    other_costs = sum(
+        (
+            cost
+            for cost in (
+                opportunity.estimated_slippage_usd,
+                opportunity.funding_cost_usd,
+                opportunity.borrow_cost_usd,
+                opportunity.other_costs_usd,
+                opportunity.safety_buffer_usd,
+            )
+            if cost is not None
+        ),
+        Decimal(0),
     )
     recosted_net_usd = opportunity.gross_edge_usd - fees - other_costs
     return RecostedOpportunity(
@@ -171,7 +193,11 @@ async def recost(
     exit_role: OrderRole = OrderRole.TAKER,
     limit: int | None = None,
 ) -> RecostReport:
-    """Re-cost every stored opportunity, newest first."""
+    """Re-cost every *priced* stored opportunity, newest first.
+
+    Rows stored as UNPRICEABLE are counted and skipped: a fee schedule cannot
+    change a verdict that was never reached.
+    """
     primary = select(Market.id, Market.symbol, Market.market_type).subquery()
     statement = (
         select(Opportunity, primary.c.symbol, primary.c.market_type)
@@ -181,8 +207,10 @@ async def recost(
     if limit is not None:
         statement = statement.limit(limit)
     result = await session.execute(statement)
-    rows = [
-        recost_row(
+    rows: list[RecostedOpportunity] = []
+    skipped = 0
+    for opportunity, symbol, market_type in result.all():
+        recosted = recost_row(
             opportunity,
             symbol,
             # Both legs of a spot/perp basis: the stored leg and its opposite.
@@ -191,9 +219,11 @@ async def recost(
             entry_role=entry_role,
             exit_role=exit_role,
         )
-        for opportunity, symbol, market_type in result.all()
-    ]
-    return RecostReport(rows=tuple(rows), schedule=schedule.describe())
+        if recosted is None:
+            skipped += 1
+            continue
+        rows.append(recosted)
+    return RecostReport(rows=tuple(rows), schedule=schedule.describe(), skipped_unpriceable=skipped)
 
 
 def _other(market_type: MarketType) -> MarketType:

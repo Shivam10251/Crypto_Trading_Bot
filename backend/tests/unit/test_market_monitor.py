@@ -64,6 +64,8 @@ def snapshot(
         latency_ms=latency,
         last_update_at=NOW,
         age_ms=5,
+        quote_age_ms=5,
+        book_age_ms=5 if book else None,
         updates=1,
         gaps=0,
         resyncs=0,

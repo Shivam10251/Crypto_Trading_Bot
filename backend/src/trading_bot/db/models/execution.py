@@ -11,6 +11,7 @@ silently.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 
@@ -25,7 +26,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_bot.db.base import Base, RecordMixin
@@ -56,9 +59,27 @@ class Order(Base, RecordMixin):
     __tablename__ = "orders"
 
     # Provenance: which signal asked for this, and which risk decision allowed it.
+    # ``signal_id`` is NULL while an episode is still open: signals are
+    # written when the episode closes, which is after the order was placed.
+    # ``opportunity_uid`` carries the link in the meantime - the episode's id
+    # is fixed the moment it opens, so an order can name the opportunity it
+    # came from before that opportunity has a row.
     signal_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("signals.id", ondelete="SET NULL")
     )
+    opportunity_uid: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # A probe, not a trade the strategy asked for. Measured live, no
+    # opportunity on this account has ever passed validation, so the only way
+    # to find out what a round trip costs is to simulate one deliberately -
+    # and then keep it out of every question about what the strategy earned.
+    is_shadow: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    execution_intent_id: Mapped[str | None] = mapped_column(String(80))
+    attempt_id: Mapped[str | None] = mapped_column(String(64))
+    signal_leg: Mapped[int | None] = mapped_column(Integer)
+    intent: Mapped[str | None] = mapped_column(String(16))
+    strategy: Mapped[str | None] = mapped_column(String(STRATEGY_NAME_LENGTH))
     risk_event_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("risk_events.id", ondelete="SET NULL")
     )
@@ -79,6 +100,7 @@ class Order(Base, RecordMixin):
     quantity: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
     # NULL for market orders.
     price: Mapped[Decimal | None] = mapped_column(PRICE)
+    expected_price: Mapped[Decimal | None] = mapped_column(PRICE)
 
     filled_quantity: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False, default=0)
     average_fill_price: Mapped[Decimal | None] = mapped_column(PRICE)
@@ -94,6 +116,10 @@ class Order(Base, RecordMixin):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Submission to acknowledgement; the number the risk engine limits.
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+    terminal_latency_ms: Mapped[int | None] = mapped_column(Integer)
+    book_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    book_local_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    evidence: Mapped[dict[str, object] | None] = mapped_column(JSONB)
 
     signal: Mapped[Signal | None] = relationship(lazy="raise")
     market: Mapped[Market] = relationship(lazy="raise")
@@ -104,10 +130,18 @@ class Order(Base, RecordMixin):
     __table_args__ = (
         # Duplicate-order protection: a retry cannot create a second order.
         UniqueConstraint("mode", "client_order_id", name="mode_client_order_id"),
+        UniqueConstraint(
+            "mode",
+            "execution_intent_id",
+            "signal_leg",
+            name="mode_execution_intent_leg",
+        ),
         Index("ix_orders_status_created", "status", "created_at"),
         Index("ix_orders_market_created", "market_id", "created_at"),
         Index("ix_orders_mode_created", "mode", "created_at"),
         Index("ix_orders_exchange_order_id", "exchange_order_id"),
+        # "What did we actually do about this opportunity?"
+        Index("ix_orders_opportunity_uid", "opportunity_uid"),
         CheckConstraint("quantity > 0", name="quantity_positive"),
         CheckConstraint("price IS NULL OR price > 0", name="price_positive"),
         CheckConstraint("filled_quantity >= 0", name="filled_non_negative"),
@@ -139,6 +173,7 @@ class Fill(Base, RecordMixin):
 
     fee_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=0)
     fee_asset: Mapped[str | None] = mapped_column(String(16))
+    fee_rate_bps: Mapped[Decimal | None] = mapped_column(BPS)
     # Realised slippage against the price the strategy expected - the number
     # that decides whether the paper simulation was honest.
     slippage_bps: Mapped[Decimal | None] = mapped_column(BPS)
@@ -146,6 +181,10 @@ class Fill(Base, RecordMixin):
 
     filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+    fill_index: Mapped[int | None] = mapped_column(Integer)
+    book_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    book_local_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    levels: Mapped[list[dict[str, str]] | None] = mapped_column(JSONB)
 
     order: Mapped[Order] = relationship(back_populates="fills", lazy="raise")
     position: Mapped[Position | None] = relationship(back_populates="fills", lazy="raise")
@@ -153,6 +192,7 @@ class Fill(Base, RecordMixin):
     __table_args__ = (
         # Duplicate-message protection for live fill streams.
         UniqueConstraint("order_id", "exchange_fill_id", name="order_exchange_fill_id"),
+        UniqueConstraint("order_id", "fill_index", name="order_fill_index"),
         Index("ix_fills_order", "order_id"),
         Index("ix_fills_filled_at", "filled_at"),
         Index("ix_fills_position", "position_id"),
@@ -177,6 +217,13 @@ class Position(Base, RecordMixin):
     # Which opportunity this exposure came from; NULL for manual interventions.
     opportunity_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("opportunities.id", ondelete="SET NULL")
+    )
+    opportunity_uid: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    attempt_id: Mapped[str | None] = mapped_column(String(64))
+    # Hypothetical probes are persisted for execution research but must never
+    # be restored into, or reported as, the strategy's paper portfolio.
+    is_shadow: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
     )
     mode: Mapped[ExecutionMode] = mapped_column(EXECUTION_MODE, nullable=False)
     strategy: Mapped[str] = mapped_column(String(STRATEGY_NAME_LENGTH), nullable=False)
@@ -205,6 +252,7 @@ class Position(Base, RecordMixin):
         Index("ix_positions_status_opened", "status", "opened_at"),
         Index("ix_positions_market_opened", "market_id", "opened_at"),
         Index("ix_positions_mode_strategy", "mode", "strategy"),
+        UniqueConstraint("mode", "attempt_id", "market_id", name="mode_attempt_market"),
         CheckConstraint("quantity > 0", name="quantity_positive"),
         CheckConstraint("entry_price > 0", name="entry_price_positive"),
         CheckConstraint("exit_price IS NULL OR exit_price > 0", name="exit_price_positive"),

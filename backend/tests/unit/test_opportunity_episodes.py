@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from tests.unit.test_spot_perp_basis import PERP, SPOT, funding_info, view
 from trading_bot.core.config import CostsConfig, SpotPerpBasisConfig
 from trading_bot.exchange.models import MarketRef
-from trading_bot.opportunities.episodes import EpisodeTracker
+from trading_bot.opportunities.episodes import EpisodeTracker, episode_key
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.basis import SpotPerpBasisStrategy
 from trading_bot.strategy.costs import TransactionCostModel
@@ -131,7 +131,7 @@ def test_every_rejection_reason_is_remembered() -> None:
     tracker = EpisodeTracker()
     tracker.update(runner.evaluate(CHEAP), clock.now)
     (episode,) = tracker.open_episodes()
-    assert RejectionReason.SPOT_SHORT_UNAVAILABLE in episode.rejections
+    assert RejectionReason.BORROW_COST_UNKNOWN in episode.rejections
 
 
 def test_an_actionable_evaluation_marks_the_episode() -> None:
@@ -140,6 +140,23 @@ def test_an_actionable_evaluation_marks_the_episode() -> None:
     tracker.update(runner.evaluate(RICH), clock.now)
     (episode,) = tracker.open_episodes()
     assert episode.ever_actionable
+
+
+def test_the_exact_enqueued_signal_is_kept_even_if_a_later_observation_is_better() -> None:
+    runner, clock = make_runner()
+    tracker = EpisodeTracker()
+    first_evaluation = runner.evaluate(RICH)
+    tracker.update(first_evaluation, clock.now)
+    first_item = first_evaluation[0].actionable[0]
+    assert first_item.signal is not None
+    tracker.mark_executed(episode_key(first_evaluation[0].strategy, first_item), first_item.signal)
+
+    clock.advance(1)
+    tracker.update(runner.evaluate(WIDER), clock.now)
+    (episode,) = tracker.open_episodes()
+
+    assert episode.best_at == clock.now
+    assert episode.executed_signal is first_item.signal
 
 
 def test_a_priced_evaluation_beats_an_unpriced_one() -> None:

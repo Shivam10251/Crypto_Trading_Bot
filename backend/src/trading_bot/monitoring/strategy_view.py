@@ -134,7 +134,7 @@ class RecordingStatus:
             f"{self.signals_written} signals stored"
         )
         if self.unpriced:
-            text += f", {self.unpriced} unpriced and not stored"
+            text += f", {self.unpriced} of them unpriceable"
         return text
 
 
