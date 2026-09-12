@@ -40,13 +40,11 @@ Binance WebSocket / REST        (Phase 3)
    Opportunity Engine           (Phase 7)  every opportunity, as an episode
             │
             ▼
-   Paper Account Safety Gate    (Phase 8)  cash, inventory, margin, exposure
-            │
+   Risk Engine                  (Phase 9)  APPROVED / REJECTED / PAUSED,
+            │                              reserving atomically against the
+            │                              same account Phase 8 built
             ▼
    Execution Adapter            (Phase 8)  Paper today, Live behind a flag (17)
-            │
-            ▼
-   Risk Engine                  (Phase 9)  APPROVED / REJECTED / PAUSED
             │
             ▼
    Portfolio & P&L              (Phase 10) exits, equity, drawdown
@@ -55,10 +53,16 @@ Binance WebSocket / REST        (Phase 3)
    API + WebSocket  →  Dashboard (Phases 12-13)
 ```
 
-Phase 8 now has a narrow safety gate before paper execution so even the
-simulator cannot assume infinite cash, inventory, margin, or exposure. Phase 9
-replaces that minimum boundary with durable policy decisions and kill-switch
-state before any live adapter exists.
+Phase 8's paper account gate - cash, inventory, margin, exposure - is no
+longer a separate stage between the opportunity engine and the adapter.
+Phase 9 sits in front of the adapter and reserves against that same account
+atomically, so there is exactly one place that accounts for paper exposure
+rather than two that could disagree. On top of that reservation it adds what
+Phase 8 could not: a durable `RiskDecision` (`APPROVED`/`REJECTED`/`PAUSED`)
+written to `risk_events` *before* an order may be submitted, independent
+data-quality and timing checks the strategy's own thresholds do not gate on,
+a durable kill switch, and a post-trade review of what execution actually
+did. See [risk-management.md](risk-management.md) for the full account.
 
 ## Backend layout
 
@@ -119,11 +123,15 @@ market-data adapter (spot + USDⓈ-M), the real-time market-data engine and its
 service, configurable market selection and per-market monitoring, the strategy
 framework with the spot/perpetual basis strategy, the transaction cost model,
 the opportunity engine recording every detection to PostgreSQL with the
-evidence behind it, the paper execution engine and its order/fill record,
+evidence behind it, the paper execution engine and its order/fill record, the
+risk engine gating every order behind a durable decision and a kill switch,
 API skeleton, health and system-status endpoints, frontend shell, test
 tooling.
 
-Not built: full risk engine, exits/P&L portfolio service, dashboard. The system-status endpoint reports those subsystems as `OFFLINE`
+Not built: exits/P&L portfolio service, dashboard. Daily-loss and
+consecutive-loss limits exist as configuration and policy but are honestly
+reported as deferred - they need Phase 10's realised P&L to mean anything.
+The system-status endpoint reports the not-yet-built subsystems as `OFFLINE`
 with the phase that will implement them.
 
 ### The exchange boundary
@@ -225,25 +233,50 @@ OpportunityRecorder ──▶ opportunities  (status + every gate it failed)
 
 ### The execution boundary
 
-`trading_bot.execution` sits where the risk engine will be inserted in Phase
-9. A strategy's validated signal becomes two `OrderRequest`s - one per leg,
-never a bundle - because that is the only shape in which leg risk is
-expressible: one can fill while the other does not.
+`trading_bot.execution` is where `trading_bot.risk` (Phase 9) sits in front
+of the adapter. A strategy's validated signal becomes two `OrderRequest`s -
+one per leg, never a bundle - because that is the only shape in which leg
+risk is expressible: one can fill while the other does not.
 
 ```
-Signal ──▶ bounded dispatcher ──▶ paper account gate ──▶ ExecutionCoordinator
-                                                            │ both legs at once
-                                                            ▼
-                                      ExecutionAdapter ──▶ ExecutionResult
-                                      PaperExecutionAdapter (Phase 8)
-                                      LiveExecutionAdapter  (Phase 17, off)
-             │
-             ▼
-        ExecutionAttempt  - hedged, naked by N, or nothing filled
-             │
-             ▼
-        ExecutionRecorder ──▶ orders + fills + open positions
+Signal ──▶ bounded dispatcher ──▶ RiskEngine.evaluate ──▶ APPROVED ──▶ ExecutionCoordinator
+                                        │                                  │ both legs at once
+                                        ▼                                  ▼
+                              REJECTED / PAUSED               ExecutionAdapter ──▶ ExecutionResult
+                              durable risk_events row,         PaperExecutionAdapter (Phase 8)
+                              no order                         LiveExecutionAdapter  (Phase 17, off)
+                                                                    │
+                                                                    ▼
+                                                          ExecutionAttempt  - hedged, naked by N, or nothing filled
+                                                                    │
+                                        ┌───────────────────────────┴───────────────────────────┐
+                                        ▼                                                        ▼
+                          RiskEngine.evaluate_post_trade                              ExecutionRecorder
+                          (naked exposure, slippage, latency,                         ──▶ orders + fills + open
+                          skew, actual exposure limits)                                   positions, orders.risk_event_id
 ```
+
+`RiskEngine.evaluate` reserves against the same `PaperAccount` Phase 8 built
+- order, position and gross-exposure limits, cash, spot inventory, perpetual
+margin and borrow capacity all come from that one reservation, checked
+atomically against a durable kill-switch guard so a switch flip cannot race
+a concurrent approval. Only once that reservation succeeds *and* the
+`APPROVED` decision is durably written to `risk_events` does the dispatcher
+call the coordinator; a `REJECTED` or `PAUSED` verdict never reaches it, so
+no order row is ever created for a risk refusal.
+
+Approval is not the last word. `RiskEngine.admit` runs inside the
+coordinator, in the instant before the adapter is handed anything, and
+re-checks everything that can change in the meantime - the kill switch,
+signal expiry, and every staleness and latency limit, recomputed from
+timestamps against the current clock. A refusal there releases the
+reservation and produces no order. Shadow probes reserve against a second,
+isolated `PaperAccount`, so research can neither consume nor be blocked by
+trading capacity. Aborted reservations remain retryable and must pass every
+limit again; after a real settlement, actual notionals are checked for adverse
+fill-price breaches. See [risk-management.md](risk-management.md) for the full
+set of checks, the kill switch's precise guarantees, and what is honestly
+deferred to Phase 10.
 
 The simulator reads the book **at fill time**, after the configured latency
 has elapsed, so the market moves before the order lands. Nothing in it is

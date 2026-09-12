@@ -21,11 +21,14 @@ from an order, which is the most common way a real fill disappoints.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from trading_bot.exchange.models import MarketRef, MarketSpec
 from trading_bot.execution.models import CancelAck, ExecutionResult, OrderRequest
 from trading_bot.marketdata.models import MarketSnapshot
+
+if TYPE_CHECKING:
+    from trading_bot.execution.account import AccountRejection
 
 
 class MarketFeed(Protocol):
@@ -43,6 +46,17 @@ class SpecSource(Protocol):
     """Instrument reference data: the filters an order has to satisfy."""
 
     def __call__(self, ref: MarketRef) -> MarketSpec | None: ...
+
+
+class AdmissionCheck(Protocol):
+    """The risk engine's last word, called in the instant before submission.
+
+    Stated as a protocol so the coordinator never imports the risk engine:
+    execution knows only that something may refuse admission, and what a
+    refusal looks like. Returning ``None`` admits the order.
+    """
+
+    async def __call__(self) -> AccountRejection | None: ...
 
 
 @runtime_checkable

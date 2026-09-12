@@ -21,9 +21,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tests.integration.factories import make_market
 from tests.unit.test_spot_perp_basis import PERP, SPOT, funding_info, view
 from trading_bot.core.config import CostsConfig, SpotPerpBasisConfig
-from trading_bot.db.models import ExecutionMode, Opportunity, OpportunityStatus, Order, Signal
+from trading_bot.db.models import (
+    ExecutionMode,
+    Opportunity,
+    OpportunityStatus,
+    Order,
+    RiskEvent,
+    Signal,
+)
 from trading_bot.db.models import Opportunity as OpportunityRow
-from trading_bot.db.models.enums import MarketType, OrderStatus, OrderType, Side, SignalStatus
+from trading_bot.db.models.enums import (
+    MarketType,
+    OrderStatus,
+    OrderType,
+    RiskDecision,
+    RiskEventType,
+    Side,
+    SignalStatus,
+)
 from trading_bot.exchange.models import MarketRef
 from trading_bot.opportunities.episodes import EpisodeTracker, episode_key
 from trading_bot.opportunities.recorder import OpportunityRecorder, opportunity_row
@@ -341,6 +356,50 @@ class TestSignals:
 
         orders = (await db.execute(select(Order).order_by(Order.is_shadow))).scalars().all()
         real, shadow = orders
+        assert real.signal_id is not None
+        assert shadow.signal_id is None
+
+    async def test_risk_decisions_are_linked_to_the_signal_they_gated(
+        self, db: AsyncSession, market_ids: dict[MarketRef, int]
+    ) -> None:
+        """A risk decision is made before its signal row exists.
+
+        It carries ``opportunity_uid`` in the meantime, exactly as an order
+        does, and is linked back once the episode closes and the signals are
+        written. A probe's decision is deliberately left unlinked.
+        """
+        runner, clock = make_runner()
+        tracker = EpisodeTracker()
+        evaluation = runner.evaluate(RICH)[0]
+        tracker.update([evaluation], clock.now)
+        item = evaluation.actionable[0]
+        assert item.signal is not None
+        key = episode_key(evaluation.strategy, item)
+        uid = tracker.uid_for(key)
+        assert uid is not None
+        tracker.mark_executed(key, item.signal)
+
+        for is_shadow in (False, True):
+            db.add(
+                RiskEvent(
+                    occurred_at=clock.now,
+                    event_type=RiskEventType.PRE_TRADE_CHECK,
+                    decision=RiskDecision.APPROVED,
+                    mode=ExecutionMode.PAPER,
+                    intent_id=f"{'shadow' if is_shadow else 'signal'}:{uid}",
+                    opportunity_uid=uid,
+                    is_shadow=is_shadow,
+                    reason="within every configured limit",
+                )
+            )
+        await db.flush()
+
+        recorder = OpportunityRecorder(market_ids, session_factory(db), interval_seconds=1)
+        recorder.record(tracker.close_all())
+        await recorder.flush()
+
+        events = (await db.execute(select(RiskEvent).order_by(RiskEvent.is_shadow))).scalars().all()
+        real, shadow = events
         assert real.signal_id is not None
         assert shadow.signal_id is None
 

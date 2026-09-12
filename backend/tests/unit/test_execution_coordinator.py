@@ -7,6 +7,7 @@ than a caveat, so most of them are about the pair failing to agree.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -16,6 +17,7 @@ from trading_bot.exchange.models import FundingInfo, MarketRef
 from trading_bot.execution.account import PaperAccount
 from trading_bot.execution.coordinator import ExecutionCoordinator
 from trading_bot.execution.models import (
+    CancelAck,
     ExecutionResult,
     OrderIntent,
     OrderRequest,
@@ -84,6 +86,13 @@ def priced_edge(opp: Opportunity) -> Edge:
 
 
 def signal(opp: Opportunity | None = None) -> Signal:
+    """A live signal for tests that run the coordinator on the real clock.
+
+    ``expires_at`` is relative to *now*, not to the fixed ``NOW`` the prices
+    are pinned to. A fixture that expires at a hard-coded instant silently
+    rots the moment the wall clock passes it, turning every default-clock
+    coordinator test into an expired-signal test.
+    """
     opp = opp or opportunity()
     priced = priced_edge(opp)
     return Signal(
@@ -92,7 +101,7 @@ def signal(opp: Opportunity | None = None) -> Signal:
         opportunity=opp,
         edge=priced,
         expected_net_edge_bps=priced.net_edge_bps,
-        expires_at=NOW + timedelta(seconds=1),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
 
 
@@ -196,6 +205,40 @@ class TestPlacement:
         assert {r.ref for r in adapter.submitted} == {SPOT, PERP}
         assert all(r.intent is OrderIntent.OPEN for r in adapter.submitted)
 
+    async def test_kill_cancellation_tracks_every_concurrent_attempt(self) -> None:
+        """One worker finishing must not erase another worker's open orders."""
+
+        class BlockingAdapter(Adapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started: list[str] = []
+                self.cancelled: list[str] = []
+                self.all_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def submit(self, request: OrderRequest) -> ExecutionResult:
+                self.started.append(request.client_order_id)
+                if len(self.started) == 4:
+                    self.all_started.set()
+                await self.release.wait()
+                return await super().submit(request)
+
+            async def cancel(self, client_order_id: str) -> CancelAck:
+                self.cancelled.append(client_order_id)
+                return CancelAck(client_order_id, True, NOW)
+
+        adapter = BlockingAdapter()
+        coordinator = ExecutionCoordinator(adapter)
+        first = asyncio.create_task(coordinator.execute(signal(), execution_intent_id="first"))
+        second = asyncio.create_task(coordinator.execute(signal(), execution_intent_id="second"))
+        await adapter.all_started.wait()
+
+        assert await coordinator.cancel_in_flight("kill") == 4
+        assert set(adapter.cancelled) == set(adapter.started)
+
+        adapter.release.set()
+        await asyncio.gather(first, second)
+
     async def test_each_leg_carries_the_price_the_strategy_expected(self) -> None:
         """Realised slippage is measured against this, so it has to be there."""
         adapter = Adapter()
@@ -224,7 +267,10 @@ class TestPlacement:
 
     async def test_expired_signal_is_audited_without_reaching_the_adapter(self) -> None:
         adapter = Adapter()
-        coordinator = ExecutionCoordinator(adapter, clock=lambda: NOW + timedelta(seconds=2))
+        # Past the fixture's real-clock-relative TTL, whenever this runs.
+        coordinator = ExecutionCoordinator(
+            adapter, clock=lambda: datetime.now(UTC) + timedelta(hours=2)
+        )
         attempt = await coordinator.execute(signal())
         assert attempt is not None
         assert adapter.submitted == []

@@ -97,6 +97,12 @@ class RejectionCode(StrEnum):
     INSUFFICIENT_MARGIN = "INSUFFICIENT_MARGIN"
     EXPOSURE_LIMIT = "EXPOSURE_LIMIT"
     BORROW_UNAVAILABLE = "BORROW_UNAVAILABLE"
+    # Trading is halted: the kill switch is active or the account is paused.
+    RISK_PAUSED = "RISK_PAUSED"
+    # Approved, then withdrawn before submission: a limit that passed at
+    # decision time no longer passed at the moment the order would have been
+    # sent. No order was placed.
+    RISK_WITHDRAWN = "RISK_WITHDRAWN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +136,10 @@ class OrderRequest:
     expected_net_edge_bps: Decimal | None = None
     # Which signal asked for this; carried through to the stored row.
     signal_leg: int | None = None
+    # The risk decision that approved this order. Set only once the Phase 9
+    # risk engine has durably stored an APPROVED ``RiskEvent`` - an order
+    # built without one was never supposed to reach an adapter.
+    risk_event_id: int | None = None
 
     def __post_init__(self) -> None:
         if not self.quantity.is_finite() or self.quantity <= 0:

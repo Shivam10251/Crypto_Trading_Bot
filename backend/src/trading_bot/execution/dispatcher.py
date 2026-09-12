@@ -6,12 +6,16 @@ import asyncio
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Final
+from functools import partial
+from typing import TYPE_CHECKING, Final
 
 from trading_bot.core.logging import get_logger
 from trading_bot.execution.coordinator import ExecutionAttempt, ExecutionCoordinator
 from trading_bot.execution.recorder import ExecutionRecorder
 from trading_bot.strategy.models import Signal
+
+if TYPE_CHECKING:
+    from trading_bot.risk.engine import RiskEngine
 
 logger = get_logger(__name__)
 
@@ -45,9 +49,11 @@ class ExecutionDispatcher:
         workers: int,
         recent_attempts: int,
         timeout_ms: int,
+        risk_engine: RiskEngine,
     ) -> None:
         self._coordinator = coordinator
         self._recorder = recorder
+        self._risk_engine = risk_engine
         self._queue: asyncio.Queue[ExecutionWork] = asyncio.Queue(maxsize=queue_size)
         self._worker_count = workers
         self._timeout_seconds = timeout_ms / 1000
@@ -58,6 +64,11 @@ class ExecutionDispatcher:
         self.enqueued = 0
         self.duplicates = 0
         self.overflow = 0
+        self.halted = 0
+        self.purged = 0
+        # Cancellation runs on the event loop after a synchronous purge; held
+        # so the task cannot be garbage collected mid-flight.
+        self._cancellations: set[asyncio.Task[int]] = set()
 
     def start(self) -> None:
         if self._tasks:
@@ -79,6 +90,21 @@ class ExecutionDispatcher:
         if intent_id in self._claimed:
             self.duplicates += 1
             return False
+        # Refuse actionable work outright while trading is halted, rather than
+        # queueing something a worker would only reject. Probes are research
+        # and are governed separately.
+        if not is_shadow:
+            halted = self._risk_engine.halted_reason()
+            if halted is not None:
+                self.halted += 1
+                self._risk_engine.record_discarded(
+                    intent_id=intent_id,
+                    opportunity_uid=opportunity_uid,
+                    is_shadow=is_shadow,
+                    strategy=signal.strategy,
+                    reason=f"not accepted while trading is halted: {halted}",
+                )
+                return False
         work = ExecutionWork(signal, opportunity_uid, intent_id, is_shadow)
         try:
             self._queue.put_nowait(work)
@@ -87,6 +113,17 @@ class ExecutionDispatcher:
             logger.error(
                 "execution.queue_full",
                 intent_id=intent_id,
+                queue_size=self._queue.maxsize,
+            )
+            # Best-effort, not durable-before-return: nothing was ever queued
+            # for this intent, so there is no order for the audit trail to
+            # gate - unlike an approval, a late or lost write here risks
+            # nothing except an incomplete research record.
+            self._risk_engine.record_queue_overload(
+                intent_id=intent_id,
+                opportunity_uid=opportunity_uid,
+                is_shadow=is_shadow,
+                strategy=signal.strategy,
                 queue_size=self._queue.maxsize,
             )
             return False
@@ -100,6 +137,60 @@ class ExecutionDispatcher:
         for opportunity_uid in opportunity_uids:
             for intent_id in self._episode_intents.pop(opportunity_uid, ()):
                 self._claimed.discard(intent_id)
+
+    def purge(self, reason: str) -> int:
+        """Drop accepted-but-unsubmitted actionable work. Called on a kill.
+
+        Synchronous on purpose: it is a kill-switch listener, and the queue
+        operations it needs are all synchronous, so the work is gone before
+        the next event-loop turn can hand any of it to a worker. Shadow
+        probes stay queued - they are isolated from the actionable halt - and
+        are put back in the order they were taken.
+
+        Anything already submitted is handled separately, by asking the
+        adapter to cancel it. Paper orders do not rest after ``submit``
+        returns, but they are tracked during simulated latency and can still
+        be cancelled in that interval.
+        """
+        kept: list[ExecutionWork] = []
+        dropped = 0
+        while True:
+            try:
+                work = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if work.is_shadow:
+                kept.append(work)
+                self._queue.task_done()
+                continue
+            dropped += 1
+            self._claimed.discard(work.intent_id)
+            self._risk_engine.record_discarded(
+                intent_id=work.intent_id,
+                opportunity_uid=work.opportunity_uid,
+                is_shadow=False,
+                strategy=work.signal.strategy,
+                reason=f"dropped from the execution queue: {reason}",
+            )
+            self._queue.task_done()
+        for work in kept:
+            self._queue.put_nowait(work)
+        self.purged += dropped
+        if dropped:
+            logger.warning("execution.queue_purged", dropped=dropped, reason=reason)
+        self._cancel_in_flight(reason)
+        return dropped
+
+    def _cancel_in_flight(self, reason: str) -> None:
+        """Ask the adapter to withdraw anything submitted and still open."""
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._coordinator.cancel_in_flight(reason)
+            )
+        except RuntimeError:  # no loop: nothing can be in flight either
+            return
+        self._cancellations.add(task)
+        task.add_done_callback(self._cancellations.discard)
 
     async def stop(self) -> None:
         """Drain accepted work before cancelling idle workers."""
@@ -117,19 +208,28 @@ class ExecutionDispatcher:
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks.clear()
+            # A kill listener schedules adapter cancellation because the
+            # listener itself must stay synchronous. Do not tear the service
+            # down while those best-effort withdrawals are still in flight,
+            # but keep shutdown bounded if an adapter never answers.
+            cancellations = tuple(self._cancellations)
+            if cancellations:
+                try:
+                    async with asyncio.timeout(max(1.0, self._timeout_seconds)):
+                        await asyncio.gather(*cancellations, return_exceptions=True)
+                except TimeoutError:
+                    logger.error(
+                        "execution.shutdown_cancel_timeout", pending=len(self._cancellations)
+                    )
+                    for cancellation in cancellations:
+                        cancellation.cancel()
+                    await asyncio.gather(*cancellations, return_exceptions=True)
 
     async def _worker(self) -> None:
         while True:
             work = await self._queue.get()
             try:
-                attempt = await self._coordinator.execute(
-                    work.signal,
-                    is_shadow=work.is_shadow,
-                    execution_intent_id=work.intent_id,
-                )
-                if attempt is not None:
-                    self.attempts.append(attempt)
-                    self._recorder.record(attempt, work.opportunity_uid)
+                await self._process(work)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # a worker must survive one malformed signal
@@ -138,3 +238,48 @@ class ExecutionDispatcher:
                 )
             finally:
                 self._queue.task_done()
+
+    async def _process(self, work: ExecutionWork) -> None:
+        """Risk approval, then execution, then post-trade review.
+
+        Off the strategy loop by construction - this runs inside a worker -
+        so a slow, durable risk-event write here never delays the next
+        evaluation cycle. An order is never submitted unless the risk engine
+        returns an approval whose ``risk_event_id`` proves it was stored.
+        """
+        verdict = await self._risk_engine.evaluate(
+            work.signal,
+            intent_id=work.intent_id,
+            opportunity_uid=work.opportunity_uid,
+            is_shadow=work.is_shadow,
+        )
+        if not verdict.is_approved:
+            return
+        risk_event_id = verdict.risk_event_id
+        # Checked again inside the coordinator, immediately before the
+        # adapter is handed anything: approval and submission are not the
+        # same instant, and a kill can land between them.
+        admission = partial(
+            self._risk_engine.admit,
+            work.signal,
+            intent_id=work.intent_id,
+            opportunity_uid=work.opportunity_uid,
+            is_shadow=work.is_shadow,
+        )
+        attempt = await self._coordinator.execute(
+            work.signal,
+            is_shadow=work.is_shadow,
+            execution_intent_id=work.intent_id,
+            risk_event_id=risk_event_id,
+            admission=admission,
+        )
+        if attempt is None:
+            return
+        self.attempts.append(attempt)
+        self._recorder.record(attempt, work.opportunity_uid)
+        await self._risk_engine.evaluate_post_trade(
+            attempt,
+            work.signal,
+            intent_id=work.intent_id,
+            opportunity_uid=work.opportunity_uid,
+        )

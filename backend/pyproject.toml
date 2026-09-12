@@ -36,6 +36,7 @@ trading-bot-api = "trading_bot.cli:run_api"
 trading-bot-market-data = "trading_bot.cli:run_market_data"
 trading-bot-purge = "trading_bot.cli:run_retention_purge"
 trading-bot-recost = "trading_bot.cli:run_recost"
+trading-bot-risk = "trading_bot.cli:run_risk_control"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,7 +1,7 @@
 # Execution
 
-Status: **paper execution implemented in Phase 8.** Phase 17 builds the live
-path and leaves it disabled.
+Status: **paper execution implemented in Phase 8; gated by the risk engine
+since Phase 9.** Phase 17 builds the live path and leaves it disabled.
 
 ## Adapter boundary
 
@@ -25,7 +25,21 @@ not have. The live adapter can fill the same type in as it learns more.
 
 The strategy never chooses an adapter; the runtime injects one based on
 configuration. The bounded dispatcher keeps adapter latency off the strategy
-cadence and admits each opportunity episode once.
+cadence and admits each opportunity episode once. Since Phase 9, the
+dispatcher's workers call `RiskEngine.evaluate` before ever calling the
+coordinator: a `REJECTED` or `PAUSED` verdict returns before the adapter is
+reached, so nothing is submitted and no order row is written for it. An
+`APPROVED` order carries the `risk_events.id` that authorised it on
+`orders.risk_event_id`.
+
+The coordinator then calls back into the risk engine one last time -
+`ExecutionCoordinator.execute(..., admission=...)` - in the instant before
+`adapter.submit`. A refusal there releases the reservation and returns
+`None`: no order, no order row, and a durable risk event explaining it. The
+dispatcher also drops queued work and asks the adapter to cancel anything
+still open when the kill switch trips. See [risk-management.md](risk-management.md) for the
+full set of checks, the kill switch, and the atomic reservation this shares
+with the paper account below.
 
 ## Paper execution must not be optimistic
 
@@ -53,7 +67,17 @@ Execution is fail-closed when PostgreSQL is unavailable. The paper account
 reserves cash and perpetual margin before concurrent leg submission, requires
 spot inventory or an explicitly capped margin borrow, applies configured
 gross-exposure limits, and restores open positions after restart. BNB-discounted
-fees require a configured paper BNB balance.
+fees require a configured paper BNB balance. Since Phase 9 that reservation is
+made by the risk engine, not the coordinator: `RiskEngine.evaluate` calls
+`PaperAccount.reserve` (the coordinator calls it again with the same
+`intent_id` and gets the same reservation back, unchanged), so risk policy and
+account state share one lock-protected ledger instead of two that could
+disagree. Releasing a reservation before submission leaves the intent
+retryable, so every account limit is checked again; only an attempt that
+reached settlement enters the completed-intent cache. After settlement, risk
+also checks actual order, position and gross notionals because adverse fill
+prices can cross a limit that expected notional passed. See
+[risk-management.md](risk-management.md).
 
 ## What Phase 8 measured
 

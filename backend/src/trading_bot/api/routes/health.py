@@ -1,8 +1,10 @@
 """Health, readiness and system-status endpoints.
 
-These are the only endpoints Phase 0 exposes. Subsystems that later phases build
-(risk, execution) are reported OFFLINE with the phase
-that will implement them - the dashboard must never show invented values.
+Every subsystem here is judged by evidence it actually wrote - quotes,
+opportunities, orders, risk decisions - because each runs in the market-data
+process and the API cannot ask any of them anything. Subsystems no phase has
+built yet are reported OFFLINE with the phase that will implement them; the
+dashboard must never show an invented value.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from trading_bot import __version__
 from trading_bot.api.deps import SettingsDep
 from trading_bot.api.execution_status import execution_status
 from trading_bot.api.market_status import market_data_status
+from trading_bot.api.risk_status import risk_status
 from trading_bot.api.schemas import (
     ComponentHealth,
     ComponentStatus,
@@ -29,9 +32,9 @@ router = APIRouter(tags=["system"])
 
 # Subsystems not yet built. Kept here so exactly one place needs editing as
 # each phase lands, and so nothing reports a status it cannot substantiate.
-_PENDING_COMPONENTS: tuple[tuple[str, str], ...] = (
-    ("Risk Engine", "not implemented until Phase 9"),
-)
+# Empty since Phase 9: Portfolio & P&L (Phase 10) has no component row of its
+# own yet, and will add one when it does.
+_PENDING_COMPONENTS: tuple[tuple[str, str], ...] = ()
 
 
 def _now() -> datetime:
@@ -98,6 +101,10 @@ async def system_status(settings: SettingsDep) -> SystemStatusResponse:
         # Judged by the opportunities it recorded, the same way the feed is
         # judged by its quotes - the strategy runs in another process.
         await strategy_status(settings, now),
+        # Judged by the decisions it wrote, and by the durable kill switch -
+        # which is reported even when execution is off, because a halted
+        # switch is what a restart would restore.
+        await risk_status(settings, now),
         # Judged by the orders it wrote. "No orders" is the normal state of
         # this strategy, so it reads OFFLINE with the reason rather than as a
         # fault - and never as HEALTHY on no evidence.

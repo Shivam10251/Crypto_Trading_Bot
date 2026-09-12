@@ -8,19 +8,23 @@ should always be explainable by a row in one of them.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
     String,
     Text,
+    UniqueConstraint,
+    false,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_bot.db.base import Base, RecordMixin
@@ -62,6 +66,19 @@ class RiskEvent(Base, RecordMixin):
     signal_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("signals.id", ondelete="SET NULL")
     )
+    # The opportunity this decision concerned, carried directly rather than by
+    # foreign key: a signal/opportunity row may not exist yet when the
+    # decision is made, the same reason ``orders.opportunity_uid`` exists.
+    opportunity_uid: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # Stable identity of the decision itself - the same execution-intent id
+    # carried by the order it approves or the work item it rejects. Makes a
+    # retried evaluation idempotent instead of writing a second row.
+    intent_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    # A shadow probe's decision, kept queryable but never mistaken for one
+    # that governed real portfolio exposure.
+    is_shadow: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     strategy: Mapped[str | None] = mapped_column(String(STRATEGY_NAME_LENGTH))
 
     # Which limit applied, and what was actually observed.
@@ -80,6 +97,10 @@ class RiskEvent(Base, RecordMixin):
         Index("ix_risk_events_decision_occurred", "decision", "occurred_at"),
         Index("ix_risk_events_type_occurred", "event_type", "occurred_at"),
         Index("ix_risk_events_signal", "signal_id"),
+        Index("ix_risk_events_opportunity_uid", "opportunity_uid"),
+        # A retried evaluation of the same intent converges on one row per
+        # gate rather than writing a duplicate every time it is retried.
+        UniqueConstraint("mode", "intent_id", "event_type", name="mode_intent_event_type"),
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

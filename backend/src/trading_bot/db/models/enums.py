@@ -88,10 +88,19 @@ class RiskEventType(StrEnum):
     ORDER_SIZE_EXCEEDED = "ORDER_SIZE_EXCEEDED"
     POSITION_LIMIT_EXCEEDED = "POSITION_LIMIT_EXCEEDED"
     EXPOSURE_LIMIT_EXCEEDED = "EXPOSURE_LIMIT_EXCEEDED"
+    # Cash, spot inventory, perpetual margin or borrow capacity fell short.
+    INSUFFICIENT_RESOURCES = "INSUFFICIENT_RESOURCES"
+    # Required evidence (a leg's quote, book or the funding observation) is
+    # missing or the book has not synced - distinct from merely being old.
+    INCOMPLETE_MARKET_DATA = "INCOMPLETE_MARKET_DATA"
+    SIGNAL_EXPIRED = "SIGNAL_EXPIRED"
+    QUEUE_OVERLOAD = "QUEUE_OVERLOAD"
     DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
     CONSECUTIVE_LOSSES = "CONSECUTIVE_LOSSES"
     ABNORMAL_EXECUTION = "ABNORMAL_EXECUTION"
     KILL_SWITCH = "KILL_SWITCH"
+    # Database or risk-state uncertainty: refused rather than guessed.
+    FAIL_CLOSED = "FAIL_CLOSED"
 
 
 class PositionStatus(StrEnum):

@@ -38,6 +38,7 @@ from trading_bot.core.logging import get_logger
 from trading_bot.db.models import Opportunity as OpportunityRow
 from trading_bot.db.models import Order as OrderRow
 from trading_bot.db.models import Position as PositionRow
+from trading_bot.db.models import RiskEvent as RiskEventRow
 from trading_bot.db.models import Signal as SignalRow
 from trading_bot.db.models.enums import ExecutionMode, OpportunityStatus, SignalStatus
 from trading_bot.exchange.models import MarketRef
@@ -351,6 +352,7 @@ class OpportunityRecorder:
                 (opportunity_id, market_id, side): signal_id
                 for signal_id, opportunity_id, market_id, side in stored
             }
+            primary_signal: dict[Any, int] = {}
             for episode, signal in signal_episodes:
                 signal_id = signal_ids[
                     (signal["opportunity_id"], signal["market_id"], signal["side"])
@@ -364,6 +366,7 @@ class OpportunityRecorder:
                     )
                     .values(signal_id=signal_id)
                 )
+                primary_signal.setdefault(episode.uid, signal_id)
                 await session.execute(
                     update(PositionRow)
                     .where(
@@ -372,7 +375,31 @@ class OpportunityRecorder:
                     )
                     .values(opportunity_id=signal["opportunity_id"])
                 )
+            await self._link_risk_events(session, primary_signal)
         return len(signals)
+
+    async def _link_risk_events(
+        self, session: AsyncSession, primary_signal: dict[Any, int]
+    ) -> None:
+        """Point each episode's risk decisions at the signal they gated.
+
+        A risk decision covers the whole two-legged intent while a signal row
+        describes one leg, so the link names the episode's *first* leg and
+        ``opportunity_uid`` stays the complete join. Shadow decisions are left
+        unlinked on purpose: a probe's signal is one the strategy declined to
+        make, and attaching it to a real signal row would blur exactly the
+        line ``is_shadow`` exists to keep.
+        """
+        for uid, signal_id in primary_signal.items():
+            await session.execute(
+                update(RiskEventRow)
+                .where(
+                    RiskEventRow.opportunity_uid == uid,
+                    RiskEventRow.is_shadow.is_(False),
+                    RiskEventRow.signal_id.is_(None),
+                )
+                .values(signal_id=signal_id)
+            )
 
     async def run(self) -> None:
         while True:

@@ -200,6 +200,17 @@ risk:
   max_slippage_bps: 15.0
   max_latency_ms: 500
   max_stale_data_ms: 2000
+  # Funding is polled every 60 s and changes slowly; it needs a distinct age
+  # bound rather than the 2 s quote/book bound.
+  max_funding_age_ms: 600000
+  kill_switch_poll_ms: 1000
+  # Phase 10 supplies realised P&L. Until then these controls are explicitly
+  # recorded as deferred instead of evaluated against a fabricated zero.
+  daily_loss_policy: "deferred"
+  consecutive_loss_policy: "deferred"
+  daily_loss_halt_minutes: 1440
+  pause_on_unhedged: true
+  pause_on_abnormal_execution: true
 
 retention:
   # Raw market data is high volume and low long-term value: keep a working

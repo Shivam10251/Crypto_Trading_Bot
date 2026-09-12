@@ -56,16 +56,29 @@ class TestSystemStatus:
         assert body["monitored_spot_markets"] is None
         assert body["monitored_perpetual_markets"] is None
 
-    async def test_unbuilt_components_report_offline_not_fake_health(
-        self, client: AsyncClient
-    ) -> None:
+    async def test_built_components_report_their_own_state(self, client: AsyncClient) -> None:
         body = (await client.get(f"{API_PREFIX}/system-status")).json()
         statuses = {c["name"]: c for c in body["components"]}
         assert statuses["API"]["status"] == "HEALTHY"
         assert statuses["Database"]["status"] == "HEALTHY"
-        for pending in ("Risk Engine",):
-            assert statuses[pending]["status"] == "OFFLINE"
-            assert "Phase" in statuses[pending]["detail"]
+        # Every subsystem in the panel is built, so none of them may still be
+        # reporting a phase number instead of a status.
+        assert all("not implemented until" not in c["detail"] for c in body["components"])
+
+    async def test_risk_engine_reports_a_real_state_not_a_phase_number(
+        self, client: AsyncClient
+    ) -> None:
+        """Built in Phase 9: it reports why it is quiet, not that it is missing.
+
+        This SQLite database has no risk tables, so the honest answer is that
+        the decisions cannot be read - not that there are none, and not that
+        the engine does not exist.
+        """
+        body = (await client.get(f"{API_PREFIX}/system-status")).json()
+        risk = {c["name"]: c for c in body["components"]}["Risk Engine"]
+        assert risk["status"] == "OFFLINE"
+        assert "cannot read risk events" in risk["detail"]
+        assert "Phase" not in risk["detail"]
 
     async def test_execution_is_offline_while_it_is_switched_off(self, client: AsyncClient) -> None:
         """Built in Phase 8, but off by default - and it says which.

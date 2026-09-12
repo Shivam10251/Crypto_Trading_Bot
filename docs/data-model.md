@@ -1,6 +1,6 @@
 # Data Model
 
-Status: **implemented.** 13 tables, seven migrations. Phase 1 built the
+Status: **implemented.** 13 tables, eight migrations. Phase 1 built the
 schema; Phase 2 corrected the exchange-timestamp assumption after checking the
 live Binance API; Phase 3's market-data service is the first writer of
 `markets`, `market_data` and `system_events`; Phase 4 added
@@ -12,7 +12,12 @@ fifth added paper-order provenance; the sixth (`f1e2a93c7b10`) adds stable
 execution-intent/attempt identity, fill-time book evidence, idempotent fill
 indexes, signal linkage, and durable open paper positions. The seventh
 (`a4c9e8126f30`) marks hypothetical shadow positions so account restoration
-and portfolio research cannot silently mix them with strategy exposure.
+and portfolio research cannot silently mix them with strategy exposure. The
+eighth (`7e6346f5153d`, Phase 9) gives `risk_events` the stable decision
+identity (`intent_id`) a retried evaluation converges on, the same
+provenance-without-a-foreign-key pattern as `orders.opportunity_uid`
+(`opportunity_uid`), and a shadow flag (`is_shadow`) - `risk_events` had
+existed since Phase 1 but had never had a writer until Phase 9.
 
 ## Traceability requirement
 
@@ -43,7 +48,7 @@ records the limit, the observed value and the reason.
 | `trades_market` | Public trade prints, for slippage calibration | unique `exchange_trade_id` |
 | `opportunities` | Every detected discrepancy, with full cost breakdown | `net_edge_bps`, `status`, `uid` |
 | `signals` | Intent to trade a validated opportunity | `expires_at` |
-| `risk_events` | Every risk decision: approve, reject, pause | `limit_value` vs `observed_value` |
+| `risk_events` | Every risk decision: approve, reject, pause | `intent_id`, `limit_value` vs `observed_value` |
 | `orders` | Intended and submitted orders | `client_order_id` (idempotency) |
 | `fills` | Executions, including partials | `slippage_bps`, fee rate, consumed levels, fill-time book sequence |
 | `positions` | Open and closed exposure | realized/unrealized P&L, `is_shadow` |

@@ -32,7 +32,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from trading_bot.core.logging import get_logger
 from trading_bot.db.models.enums import OrderStatus, OrderType, Side, TimeInForce
 from trading_bot.execution.account import AccountRejection, AccountReservation, PaperAccount
-from trading_bot.execution.base import ExecutionAdapter, SpecSource
+from trading_bot.execution.base import AdmissionCheck, ExecutionAdapter, SpecSource
 from trading_bot.execution.models import ExecutionResult, OrderIntent, OrderRequest, RejectionCode
 from trading_bot.strategy.models import Leg, Signal
 
@@ -113,6 +113,7 @@ class ExecutionCoordinator:
         max_leg_skew_ms: int = 250,
         clock: Callable[[], datetime] | None = None,
         account: PaperAccount | None = None,
+        shadow_account: PaperAccount | None = None,
     ) -> None:
         self._adapter = adapter
         self._order_type = order_type
@@ -130,6 +131,42 @@ class ExecutionCoordinator:
         self._max_leg_skew_ms = max_leg_skew_ms
         self._clock = clock or (lambda: datetime.now(UTC))
         self._account = account
+        # Probes reserve against their own ledger, so research can never
+        # consume - or be blocked by - the capacity a real signal needs.
+        self._shadow_account = shadow_account
+        # Orders handed to the adapter and not yet answered for. Only ever
+        # non-empty while a submission is in flight; a kill arriving during
+        # that window can ask the adapter to cancel them.
+        self._in_flight: dict[str, OrderRequest] = {}
+
+    def _account_for(self, is_shadow: bool) -> PaperAccount | None:
+        return self._shadow_account if is_shadow else self._account
+
+    async def cancel_in_flight(self, reason: str) -> int:
+        """Ask the adapter to cancel anything submitted and not yet terminal.
+
+        Paper orders reach a terminal state inside ``submit`` itself, so this
+        finds something to cancel only in the window where a submission is
+        still awaiting - by design there is nothing resting. The live adapter
+        (Phase 17) is where this becomes load-bearing.
+        """
+        cancelled = 0
+        for client_order_id in list(self._in_flight):
+            try:
+                ack = await self._adapter.cancel(client_order_id)
+            except Exception as exc:  # an adapter that cannot cancel must say so
+                logger.error(
+                    "execution.cancel_failed",
+                    client_order_id=client_order_id,
+                    reason=reason,
+                    error=str(exc),
+                )
+                continue
+            if ack.cancelled:
+                cancelled += 1
+        if cancelled:
+            logger.warning("execution.cancelled_in_flight", count=cancelled, reason=reason)
+        return cancelled
 
     async def execute(
         self,
@@ -137,23 +174,51 @@ class ExecutionCoordinator:
         *,
         is_shadow: bool = False,
         execution_intent_id: str | None = None,
+        risk_event_id: int | None = None,
+        admission: AdmissionCheck | None = None,
     ) -> ExecutionAttempt | None:
-        """Place both legs at once. ``None`` when the pair is not placeable."""
+        """Place both legs at once. ``None`` when the pair is not placeable.
+
+        ``risk_event_id`` names the durably-stored ``APPROVED`` decision that
+        authorised this call - the Phase 9 risk engine has already reserved
+        against every resource limit by the time this runs, using the same
+        ``intent_id`` and therefore the same idempotent reservation looked up
+        again below. Reservation happens *before* the spot-short and expiry
+        checks so that any early return below can release it: a reservation
+        made upstream and never released here would leak capacity forever.
+
+        ``admission`` is the risk engine's final say, called in the instant
+        before the adapter is handed anything. A refusal there releases the
+        reservation and returns ``None``: no order exists, so no order row is
+        written, and the durable risk event the engine wrote is the record.
+        """
         opportunity = signal.opportunity
         intent_id = execution_intent_id or uuid.uuid4().hex
         attempt_id = _attempt_id(intent_id)
+        account = self._account_for(is_shadow)
         requests = [
-            self._request(leg, intent_id, attempt_id, index, signal)
+            self._request(leg, intent_id, attempt_id, index, signal, risk_event_id)
             for index, leg in enumerate(opportunity.legs)
         ]
+        reservation: AccountReservation | None = None
+        if account is not None:
+            reserved = await account.reserve(signal, intent_id)
+            if isinstance(reserved, AccountRejection):
+                results = [self._refused(request, reserved) for request in requests]
+                return self._attempt(
+                    attempt_id, opportunity.buy, opportunity.sell, results, is_shadow
+                )
+            reservation = reserved
         if opportunity.sell.ref.market_type.value == "SPOT" and (
-            not self._allow_spot_short or self._account is None
+            not self._allow_spot_short or account is None
         ):
             logger.info(
                 "execution.spot_short_refused",
                 symbol=opportunity.sell.ref.symbol,
                 shadow=is_shadow,
             )
+            if reservation is not None and account is not None:
+                await account.release(reservation)
             refused = AccountRejection(
                 RejectionCode.BORROW_UNAVAILABLE,
                 "spot shorting is disabled or no paper account can reserve the borrow",
@@ -166,36 +231,50 @@ class ExecutionCoordinator:
                 is_shadow,
             )
         if signal.is_expired(self._clock()):
+            if reservation is not None and account is not None:
+                await account.release(reservation)
             results = [self._expired(request) for request in requests]
             return self._attempt(attempt_id, opportunity.buy, opportunity.sell, results, is_shadow)
-        reservation: AccountReservation | None = None
-        if self._account is not None:
-            reserved = await self._account.reserve(signal, intent_id)
-            if isinstance(reserved, AccountRejection):
-                results = [self._refused(request, reserved) for request in requests]
-                return self._attempt(
-                    attempt_id, opportunity.buy, opportunity.sell, results, is_shadow
+        if admission is not None:
+            refusal = await admission()
+            if refusal is not None:
+                if reservation is not None and account is not None:
+                    await account.release(reservation)
+                logger.warning(
+                    "execution.admission_refused",
+                    intent_id=intent_id,
+                    code=refusal.code.value,
+                    detail=refusal.detail,
                 )
-            reservation = reserved
+                return None
         # Concurrently: sending one and waiting would give the second leg a
         # head start the real system would not have.
-        raw = await asyncio.gather(
-            *(self._adapter.submit(request) for request in requests), return_exceptions=True
-        )
+        # Add and remove only this attempt's ids. Multiple dispatcher workers
+        # share one coordinator, so replacing/clearing the whole dictionary
+        # would make concurrent attempts disappear from kill-switch cleanup.
+        for request in requests:
+            self._in_flight[request.client_order_id] = request
+        try:
+            raw = await asyncio.gather(
+                *(self._adapter.submit(request) for request in requests), return_exceptions=True
+            )
+        finally:
+            for request in requests:
+                self._in_flight.pop(request.client_order_id, None)
         results = [
             value if isinstance(value, ExecutionResult) else self._failed(request, value)
             for request, value in zip(requests, raw, strict=True)
         ]
         attempt = self._attempt(attempt_id, opportunity.buy, opportunity.sell, results, is_shadow)
-        if reservation is not None:
-            assert self._account is not None
+        if reservation is not None and account is not None:
             if is_shadow:
                 # A probe asks whether this one attempt was feasible from the
-                # current baseline. It must not consume the real paper
-                # portfolio or poison later strategy decisions.
-                await self._account.release(reservation)
+                # configured shadow baseline. It is released rather than
+                # settled, and on its own ledger either way, so it leaves no
+                # trace in the portfolio the strategy trades from.
+                await account.release(reservation)
             else:
-                await self._account.settle(reservation, attempt)
+                await account.settle(reservation, attempt)
         _log(attempt, signal)
         return attempt
 
@@ -223,7 +302,13 @@ class ExecutionCoordinator:
         )
 
     def _request(
-        self, leg: Leg, intent_id: str, attempt_id: str, index: int, signal: Signal
+        self,
+        leg: Leg,
+        intent_id: str,
+        attempt_id: str,
+        index: int,
+        signal: Signal,
+        risk_event_id: int | None = None,
     ) -> OrderRequest:
         """One leg as an order. The limit price is the strategy's own.
 
@@ -251,6 +336,7 @@ class ExecutionCoordinator:
             signal_expires_at=signal.expires_at,
             expected_net_edge_bps=signal.expected_net_edge_bps,
             signal_leg=index,
+            risk_event_id=risk_event_id,
         )
 
     def _expired(self, request: OrderRequest) -> ExecutionResult:

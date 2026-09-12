@@ -60,6 +60,7 @@ def order_row(
         "mode": result.mode,
         "opportunity_uid": opportunity_uid,
         "is_shadow": is_shadow,
+        "risk_event_id": request.risk_event_id,
         "execution_intent_id": request.execution_intent_id,
         "attempt_id": request.attempt_id,
         "signal_leg": request.signal_leg,

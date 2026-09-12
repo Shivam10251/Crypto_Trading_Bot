@@ -5,6 +5,7 @@ Kept separate from ``main`` so importing the app never starts a server.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 
 import uvicorn
@@ -16,6 +17,8 @@ from trading_bot.db.session import dispose_engine, init_engine, session_scope
 from trading_bot.exchange.errors import ExchangeError
 from trading_bot.marketdata.service import run_service
 from trading_bot.opportunities.recost import recost
+from trading_bot.risk.kill_switch import KillSwitchState
+from trading_bot.risk.store import RiskEventStore
 from trading_bot.strategy.fees import FeeSchedule, OrderRole
 
 
@@ -92,6 +95,65 @@ def run_retention_purge() -> None:
             await dispose_engine()
 
     asyncio.run(_purge())
+
+
+def run_risk_control() -> None:
+    """Inspect or flip the durable kill switch (``uv run trading-bot-risk``).
+
+    Deliberately a CLI, not an HTTP endpoint: nothing in this codebase
+    authenticates a caller yet, and an unauthenticated public re-arm endpoint
+    is explicitly out of bounds. The dashboard (Phase 12) can wrap this once
+    an authenticated API surface exists; until then, re-arming requires shell
+    access to the machine the bot runs on, and every action is still written
+    to ``risk_events`` with who triggered it and why.
+    """
+    parser = argparse.ArgumentParser(prog="trading-bot-risk")
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    subparsers.add_parser("status", help="show whether trading is currently halted")
+    for name in ("kill", "rearm"):
+        sub = subparsers.add_parser(name, help=f"{name} the kill switch")
+        sub.add_argument("--who", required=True, help="operator or system identity")
+        sub.add_argument("--reason", required=True, help="why, for the audit trail")
+    args = parser.parse_args()
+
+    settings = get_settings()
+    configure_logging(settings.logging)
+    logger = get_logger(__name__)
+
+    async def _run() -> None:
+        init_engine(settings.database)
+        try:
+            store = RiskEventStore(session_scope)
+            switch = KillSwitchState(store, session_scope)
+            await switch.load()
+            if args.action == "status":
+                state = "HALTED" if switch.is_active else "clear"
+                print(f"{state}: {switch.blocked_reason() or 'trading is not halted'}")
+                return
+            if args.action == "kill":
+                verdict = await switch.trigger(who=args.who, reason=args.reason)
+            else:
+                verdict = await switch.rearm(who=args.who, reason=args.reason)
+            if verdict.risk_event_id is None:
+                # Either direction is a failure worth a nonzero exit. A kill
+                # that was not written stops only *this* process's view of
+                # the world: a running service polling durable state will
+                # never see it, so the operator must know the command did not
+                # do what they asked.
+                logger.error("risk_control.not_durable", action=args.action, who=args.who)
+                print(f"{args.action} was NOT durably recorded; check logs before relying on it")
+                if args.action == "rearm":
+                    print("the switch remains engaged")
+                else:
+                    print(
+                        "running services will NOT observe this kill; retry once the database is up"
+                    )
+                raise SystemExit(1)
+            print(f"{args.action} recorded as risk_events.id={verdict.risk_event_id}")
+        finally:
+            await dispose_engine()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":  # pragma: no cover

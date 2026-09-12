@@ -388,9 +388,43 @@ class RiskConfig(ConfigSection):
     max_total_exposure_usd: float = Field(default=10000.0, gt=0)
     max_daily_loss_usd: float = Field(default=200.0, gt=0)
     max_consecutive_losses: int = Field(default=5, ge=1)
+    # Aggregate across the attempt's legs, counting only adverse slippage -
+    # the same definition before and after execution, so a pre-trade estimate
+    # and a realised measurement are comparable. See docs/risk-management.md.
     max_slippage_bps: float = Field(default=15.0, gt=0)
     max_latency_ms: int = Field(default=500, gt=0)
     max_stale_data_ms: int = Field(default=2000, gt=0)
+    # Funding arrives on a deliberately slower REST cadence than quotes and
+    # books. Giving it the market-data limit would reject valid signals for
+    # almost the entire interval between funding polls.
+    max_funding_age_ms: int = Field(default=600_000, gt=0)
+
+    # How often a running service re-reads durable kill-switch state, which
+    # bounds how long a kill written by another process (the CLI, a second
+    # service) takes to stop this one.
+    kill_switch_poll_ms: int = Field(default=1000, ge=100, le=60_000)
+
+    # Phase 10 does not exist yet, so there is no trustworthy realised P&L to
+    # gate on. "deferred" reports the limit as unavailable and does not gate;
+    # "fail_closed" refuses every signal while no P&L source is wired in,
+    # rather than ever evaluating the limit against a fabricated zero.
+    daily_loss_policy: Literal["deferred", "fail_closed"] = "deferred"
+    consecutive_loss_policy: Literal["deferred", "fail_closed"] = "deferred"
+    # How long a daily-loss breach halts trading for. It expires on its own
+    # terms - "disabled for the day" - unlike a consecutive-loss breach,
+    # which is a durable pause needing review and an explicit re-arm.
+    daily_loss_halt_minutes: int = Field(default=1440, gt=0)
+
+    # Whether a naked leg left behind by a real (non-shadow) attempt pauses
+    # further entries until explicitly re-armed. Measured in Phase 8: limit
+    # entries left 3 of 21 attempts unhedged, so this is not a rare case.
+    pause_on_unhedged: bool = True
+    # Whether realised slippage or latency past their limits, or an adapter
+    # failure/timeout, pauses further entries. All three mean execution is
+    # behaving differently from what was approved, which is the case the
+    # architecture's "fail safe" principle exists for. Cross-leg fill skew is
+    # deliberately *not* in this set - see docs/risk-management.md.
+    pause_on_abnormal_execution: bool = True
 
     @model_validator(mode="after")
     def _check_hierarchy(self) -> RiskConfig:

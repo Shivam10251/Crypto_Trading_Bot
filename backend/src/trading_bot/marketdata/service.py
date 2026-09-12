@@ -52,6 +52,9 @@ from trading_bot.monitoring.strategy_view import RecordingStatus, render_evaluat
 from trading_bot.monitoring.universe import select_universe
 from trading_bot.opportunities.episodes import EpisodeTracker, episode_key
 from trading_bot.opportunities.recorder import OpportunityRecorder
+from trading_bot.risk.engine import RiskEngine
+from trading_bot.risk.kill_switch import KillSwitchState
+from trading_bot.risk.store import RiskEventStore
 from trading_bot.strategy.base import StrategyContext
 from trading_bot.strategy.costs import TransactionCostModel
 from trading_bot.strategy.fees import FeeSchedule
@@ -138,6 +141,15 @@ async def run_service(
         paper_account = (
             await _restore_paper_account(settings) if market_ids and wants_execution else None
         )
+        # Probes measure against their own ledger. It is deliberately *not*
+        # restored from durable positions - shadow positions are hypothetical,
+        # and seeding a probe account from them would carry yesterday's
+        # hypotheses into today's measurements.
+        shadow_account = (
+            _paper_account(settings)
+            if market_ids and wants_execution and settings.execution.shadow
+            else None
+        )
         coordinator = (
             _build_execution_layer(
                 settings,
@@ -146,6 +158,7 @@ async def run_service(
                 list(universe.specs),
                 funding,
                 paper_account,
+                shadow_account,
             )
             if market_ids and wants_execution and funding is not None
             else None
@@ -159,6 +172,18 @@ async def run_service(
             if market_ids and coordinator is not None
             else None
         )
+        risk_events = (
+            RiskEventStore(session_scope) if market_ids and coordinator is not None else None
+        )
+        risk = (
+            await _build_risk_engine(settings, paper_account, shadow_account, risk_events)
+            if risk_events is not None and paper_account is not None
+            else None
+        )
+        risk_engine, kill_switch = risk if risk is not None else (None, None)
+        # The risk engine is mandatory, not optional wiring: an execution
+        # layer with a coordinator but no risk engine would place orders
+        # ungated, which is exactly the invariant this phase exists to close.
         dispatcher = (
             ExecutionDispatcher(
                 coordinator,
@@ -167,16 +192,22 @@ async def run_service(
                 workers=settings.execution.workers,
                 recent_attempts=settings.execution.recent_attempts,
                 timeout_ms=settings.execution.timeout_ms,
+                risk_engine=risk_engine,
             )
-            if coordinator is not None and executions is not None
+            if coordinator is not None and executions is not None and risk_engine is not None
             else None
         )
         attempts = dispatcher.attempts if dispatcher is not None else ()
         if wants_execution and dispatcher is None:
             logger.error(
                 "execution.disabled",
-                reason="durable database audit is unavailable",
+                reason="durable database audit or the risk engine is unavailable",
             )
+        if dispatcher is not None and kill_switch is not None:
+            # A kill - from here, from the CLI, from another service - drops
+            # work this process has accepted but not yet submitted, instead of
+            # letting a worker pick it up and reject it one at a time.
+            kill_switch.add_listener(dispatcher.purge)
         if recorder is not None:
             engine.add_listener(recorder.record_event)
             recorder.record_event(
@@ -219,6 +250,27 @@ async def run_service(
                     if executions is not None:
                         tasks.append(
                             asyncio.create_task(executions.run(), name="execution-recorder")
+                        )
+                    if risk_events is not None:
+                        tasks.append(
+                            asyncio.create_task(
+                                risk_events.run(
+                                    interval_seconds=settings.opportunities.flush_interval_ms / 1000
+                                ),
+                                name="risk-event-recorder",
+                            )
+                        )
+                    if kill_switch is not None:
+                        # Durable kill-switch state is re-read on this cadence,
+                        # which is what bounds how long a kill written by any
+                        # other process takes to stop this one.
+                        tasks.append(
+                            asyncio.create_task(
+                                kill_switch.run(
+                                    interval_seconds=settings.risk.kill_switch_poll_ms / 1000
+                                ),
+                                name="risk-kill-switch-poll",
+                            )
                         )
                     strategy_task = asyncio.create_task(
                         _strategy_loop(
@@ -280,6 +332,14 @@ async def run_service(
                     fills=executions.fills_written,
                     unhedged=executions.unhedged,
                 )
+            if risk_events is not None:
+                await risk_events.flush()
+                logger.info(
+                    "risk.events_recorded",
+                    persisted=risk_events.persisted,
+                    queued_written=risk_events.queued_written,
+                    persist_failures=risk_events.persist_failures,
+                )
             if opportunities is not None and episodes is not None:
                 # Episodes still running when the process stops are real
                 # observations; closing them is what keeps them in the record.
@@ -294,7 +354,12 @@ async def run_service(
             if recorder is not None:
                 recorder.record_event(_service_event(SystemEventType.SHUTDOWN, "stopped"))
                 await recorder.flush(engine.snapshots())
-            if recorder is not None or opportunities is not None or executions is not None:
+            if (
+                recorder is not None
+                or opportunities is not None
+                or executions is not None
+                or risk_events is not None
+            ):
                 await dispose_engine()
     logger.info("market_data.service_stopped")
 
@@ -377,6 +442,7 @@ def _build_execution_layer(
     specs: Sequence[MarketSpec],
     funding: FundingTracker,
     account: PaperAccount | None,
+    shadow_account: PaperAccount | None = None,
 ) -> ExecutionCoordinator | None:
     """The paper adapter behind a coordinator, or ``None`` when it is off.
 
@@ -411,12 +477,39 @@ def _build_execution_layer(
         allow_spot_short=settings.strategy.spot_perp_basis.allow_spot_short,
         max_leg_skew_ms=config.max_leg_skew_ms,
         account=account,
+        shadow_account=shadow_account,
     )
 
 
-async def _restore_paper_account(settings: Settings) -> PaperAccount:
-    """Seed the in-memory reservation model from durable open paper positions."""
-    account = PaperAccount(
+async def _build_risk_engine(
+    settings: Settings,
+    account: PaperAccount,
+    shadow_account: PaperAccount | None,
+    store: RiskEventStore,
+) -> tuple[RiskEngine, KillSwitchState]:
+    """The risk engine and the kill switch it reads, state already restored.
+
+    Loading the kill switch reads its own audit trail; a database it cannot
+    reach here fails closed (the switch loads as active), which then rejects
+    every signal until an operator can see why - never "assume clear". The
+    switch comes back too so the caller can poll it and subscribe to it.
+    """
+    kill_switch = KillSwitchState(store, session_scope, mode=ExecutionMode.PAPER)
+    await kill_switch.load()
+    engine = RiskEngine(
+        settings.risk,
+        account,
+        store,
+        kill_switch,
+        shadow_account=shadow_account,
+        mode=ExecutionMode.PAPER,
+    )
+    return engine, kill_switch
+
+
+def _paper_account(settings: Settings) -> PaperAccount:
+    """An empty paper ledger built from configuration."""
+    return PaperAccount(
         settings.execution,
         settings.risk,
         pays_fees_in_bnb=settings.costs.pay_fees_in_bnb,
@@ -424,6 +517,11 @@ async def _restore_paper_account(settings: Settings) -> PaperAccount:
             str(max(settings.costs.spot_taker_fee_bps, settings.costs.perp_taker_fee_bps))
         ),
     )
+
+
+async def _restore_paper_account(settings: Settings) -> PaperAccount:
+    """Seed the in-memory reservation model from durable open paper positions."""
+    account = _paper_account(settings)
     async with session_scope() as session:
         result = await session.execute(
             select(

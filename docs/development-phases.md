@@ -20,7 +20,7 @@ was never recorded is gone for good.
 | 7 | Opportunity engine | **Complete** |
 | 7.5 | Correctness remediation before Phase 8 | **Complete** |
 | 8 | Paper execution engine | **Complete** |
-| 9 | Risk engine | Next |
+| 9 | Risk engine | **Complete** |
 | 10 | Portfolio and P&L | Not started |
 | 11 | Backtest / replay engine | Not started |
 | 12 | Real-time dashboard | Not started |
@@ -883,3 +883,212 @@ is the one that breaks the hedge.
 - **One pair dominates.** The probe picks the best reachable opportunity each
   interval, which was BNBUSDT almost every time, so the fill statistics
   describe a liquid mid-cap and not the universe.
+
+## Phase 9 — delivered
+
+**Not signed off.** The first implementation passed its tests and was still
+unsafe in fourteen ways; the audit and the repairs are in
+[what the audit found](#what-the-audit-found) below. The phase stays in
+review until those repairs have been reviewed, not merely until they are
+green.
+
+The risk engine (`trading_bot.risk`) now sits in front of the execution
+adapter. Every signal - real or shadow - is evaluated; a `REJECTED` or
+`PAUSED` verdict never reaches the coordinator, so no order is ever created
+for a risk refusal, and an `APPROVED` verdict is never returned until its
+`risk_events` row is durably stored.
+
+- **`RiskEngine.evaluate`** (`risk/engine.py`) checks, in order: the durable
+  kill switch (actionable signals only), signal expiry, evidence
+  completeness, per-leg quote/book staleness, funding staleness, decision
+  latency, expected slippage, the deferred daily-loss/consecutive-loss gates,
+  and finally an atomic reservation against `PaperAccount` for order,
+  position, exposure, cash, margin and borrow limits. The first failure wins
+  and is persisted; nothing after it runs
+- **Reused, not reimplemented**: the account reservation Phase 8 already
+  built for concurrent execution workers is exactly what a risk engine
+  needs, so `RiskEngine.evaluate` calls `PaperAccount.reserve` rather than
+  keeping a second, competing ledger. The one new input it needed -
+  `KillSwitchState.guard` - is threaded into that same lock-protected
+  reservation, which is what makes a kill-switch flip unable to race a
+  concurrent approval
+- **The durable kill switch** (`risk/kill_switch.py`) derives its current
+  state from the most recent `risk_events` row of type `KILL_SWITCH`, so a
+  restart cannot disagree with its own audit trail. It fails closed (starts
+  active) if that state cannot be loaded, takes effect in-process
+  immediately on trigger regardless of whether the audit write has landed
+  yet, and only clears on re-arm once that write is confirmed. Controlled by
+  `trading-bot-risk kill|rearm|status` - a CLI, not an HTTP endpoint, because
+  nothing in this codebase authenticates a caller yet and an unauthenticated
+  public re-arm route is explicitly out of bounds
+- **Post-trade review** (`RiskEngine.evaluate_post_trade`) looks at what an
+  attempt actually did - naked exposure, realised slippage, execution
+  latency, cross-leg fill skew - and persists a row only when something
+  needs review, never a routine confirmation. Naked exposure trips the same
+  kill switch by default (`risk.pause_on_unhedged`), because Phase 8 measured
+  it happening in 3 of 21 limit-order attempts
+- **Daily-loss and consecutive-loss limits are honestly deferred.** Phase 10
+  does not exist yet, so there is no trustworthy realised P&L to gate on. A
+  `PnlSource` interface reports `None` until one exists (`NullPnlSource`
+  today); the configured policy (`daily_loss_policy`,
+  `consecutive_loss_policy`) either leaves the limit unenforced
+  (`"deferred"`, the default) or refuses every signal until a real P&L
+  source is wired in (`"fail_closed"`) - it is never evaluated against a
+  fabricated zero
+- **Shadow isolation**: a probe's decision is recorded and queryable
+  (`risk_events.is_shadow`), but it never consults the kill switch or the
+  loss gates, never receives post-trade review, and never durably mutates
+  exposure - it still reserves against `PaperAccount` (to measure real
+  feasibility), but the coordinator releases rather than settles it, exactly
+  as Phase 8 already did for shadow orders
+- **Idempotent by construction**: `PaperAccount.reserve` returns the existing
+  reservation for an in-progress repeated `intent_id` after rechecking the
+  kill guard, and
+  `risk_events` carries `UNIQUE (mode, intent_id, event_type)`, so a retried
+  evaluation converges on one row instead of duplicating it
+- **`orders.risk_event_id`** links an order back to the decision that allowed
+  it - the column existed since Phase 8 but had no writer until now
+- **Migration** `7e6346f5153d`, additive: `risk_events.intent_id` (a decision's
+  stable identity), `opportunity_uid` (the same provenance-without-a-foreign-key
+  pattern as `orders.opportunity_uid`), `is_shadow`, and the unique
+  constraint idempotency depends on
+- **Tests**: unit coverage for every gate, atomicity under concurrent
+  evaluation, fail-closed persistence failure, kill-switch races via
+  `PaperAccount`'s `guard` parameter, and post-trade pause; PostgreSQL
+  coverage for the idempotency constraint, kill-switch restart restoration,
+  and `orders.risk_event_id` linkage
+
+### What the audit found
+
+A green test suite is not evidence of a safe risk engine; it is evidence that
+the tests agreed with the code. An audit of the first implementation found
+fourteen defects, most of them in the space between "the check passed" and
+"the order was sent". Each is now fixed with a test that fails without the
+fix.
+
+1. **The kill switch did not reach a running service.** State was loaded once,
+   at startup, so a `trading-bot-risk kill` wrote a row that the process
+   placing orders would never read. `KillSwitchState.refresh` re-reads durable
+   state and the service polls it on `risk.kill_switch_poll_ms` (default 1 s),
+   which is what bounds how long a kill takes to take effect.
+2. **A kill during approval persistence could still place the order.** The
+   window between "reserved and approved" and "submitted" was unguarded.
+   There are now three checkpoints: at evaluation, again once the approval is
+   durable (which withdraws it and releases the reservation), and
+   `RiskEngine.admit` immediately before the adapter is handed anything.
+   `PaperAccount.reserve` also checks the guard **before** its idempotency
+   shortcuts, so a retried intent cannot ride in on a reservation made before
+   the halt.
+3. **A kill left accepted work in the queue.** The switch now notifies
+   listeners, and `ExecutionDispatcher.purge` drops queued actionable work
+   (auditing each item), refuses new actionable work at `enqueue`, and asks
+   the adapter to cancel anything submitted and still open. Paper orders are
+   cancellable during their simulated-latency window, although none remains
+   resting after `submit` returns - see the guarantees in
+   [risk-management.md](risk-management.md#kill-switch).
+4. **A failed flush lost risk events and reported success.** Every row in a
+   flush shares one transaction, so a failure anywhere rolls back all of
+   them; the old code requeued only the tail and counted rows before the
+   commit. The whole batch is requeued now, and no counter moves until the
+   session context manager has exited cleanly.
+5. **Ages were read off the row, not measured.** An opportunity records how
+   old its inputs were *at detection*; a signal that waited in a queue
+   presented those numbers as current. Ages are recomputed from the stored
+   timestamps against the current clock at all three checkpoints.
+6. **Evidence was checked for presence, not for consistency.** It is now
+   validated against the opportunity it claims to describe: same market,
+   side and quantity per leg, a quote that is neither non-positive nor
+   crossed, a book with a real sequence, no timestamp from the future, and a
+   funding observation whenever a perpetual leg is priced.
+7. **The loss limits lied in two directions.** An approval said "within every
+   configured limit" while two of them had not been evaluated at all;
+   approvals now name their `deferred_controls` explicitly. And a breach only
+   rejected one signal: a daily-loss breach now halts trading for
+   `risk.daily_loss_halt_minutes` and expires on its own terms, while a
+   consecutive-loss breach is a durable pause that needs an audited re-arm.
+8. **Abnormal execution was recorded but never acted on.** Realised slippage
+   or latency past their limits, and adapter failures or timeouts, now pause
+   trading under `risk.pause_on_abnormal_execution`, alongside naked
+   exposure. Cross-leg skew is the documented exception: recorded, never
+   halting on its own.
+9. **Shadow probes shared the trading ledger.** A probe in flight could
+   reject or delay a real signal competing for the same reservation. Probes
+   now reserve against their own `PaperAccount`, which is never restored from
+   durable positions and never settled.
+10. **The health endpoint still said "not implemented until Phase 9".** It
+    now reports what the engine wrote, and a halted kill switch as DEGRADED
+    with its reason - even when execution is switched off, because that halt
+    is what a restart would restore.
+11. **`risk_events.signal_id` was never populated.** Decisions are made
+    before their signal rows exist, so they are back-linked when the episode
+    closes, the same way orders and positions already were.
+12. **The execution queue had two sizes.** `risk.max_execution_queue_size`
+    duplicated `execution.queue_size` and could disagree with the queue
+    actually in use; it is gone, and the audit row reports the dispatcher's
+    own bound.
+13. **Slippage meant two different things.** The pre-trade gate summed both
+    legs while the post-trade review checked each leg separately. Both now
+    use one definition: adverse slippage, summed across the legs.
+14. **A failed kill exited zero**, telling an operator trading had stopped
+    when no service would ever see it. Both directions exit nonzero now. The
+    kill/re-arm writes serialize on a PostgreSQL advisory lock before
+    insertion, and restoration orders those transitions by `id`, so neither
+    clock skew nor concurrent sequence allocation decides which state is current.
+
+The repair review found and closed four further safety defects: polling could
+clear an in-process kill while its write was in flight; funding was incorrectly
+held to the two-second quote/book age despite its sixty-second polling cadence;
+aborted reservations were marked completed and could bypass resource limits on
+retry; and concurrent workers overwrote each other's in-flight cancellation
+entries. Evidence validation now also ties the signal's entry and unwind
+prices to complete book walks, rejects malformed/non-finite or timezone-naive
+inputs without dropping the audit decision, and actual settled notionals are
+rechecked after fills. Shutdown waits for kill-triggered adapter cancellation
+tasks instead of abandoning them with the event loop.
+
+### What checking reality changed
+
+1. **The account reservation had to move earlier in `ExecutionCoordinator.execute`.**
+   The risk engine now reserves before the coordinator's own spot-short and
+   signal-expiry checks run; those checks used to run first. Left in the old
+   order, a risk-engine reservation that reached one of them would never be
+   released - a real resource leak under the exact case this phase adds a
+   caller for. `execute` now reserves first and releases on every early
+   return.
+2. **A structured rejection reason was needed, not a rendered string.**
+   `PaperAccount.reserve` explained *why* it refused only in a free-text
+   `detail`. Mapping that back to a specific `RiskEventType` (order size vs.
+   position vs. gross exposure, all sharing one `RejectionCode`) would have
+   meant parsing prose. `AccountRejection` now carries `limit_name`,
+   `limit_value` and `observed_value` directly, and the risk engine reads
+   those instead.
+
+### Limits
+
+- **Daily-loss and consecutive-loss limits do not operate**, by design, until
+  Phase 10 supplies real realised P&L. Their *responses* are built and
+  tested - a daily-loss breach halts for a configured period, a
+  consecutive-loss breach needs an audited re-arm - but nothing can fire them
+  until a real `PnlSource` exists. `"fail_closed"` makes that gap loud rather
+  than trading blind through it; it is not the limit "working".
+- **A kill takes up to one poll interval to reach another process.** The
+  bound is `risk.kill_switch_poll_ms` (1 s by default), not zero. A kill
+  triggered inside the trading process itself is immediate; one written by
+  the CLI is not, and a service that cannot reach the database keeps its last
+  known state rather than inventing a new one.
+- **The kill switch has no dashboard yet.** It is controlled entirely by
+  `trading-bot-risk` on the host running the bot. Phase 12 can build an
+  authenticated route once one exists; there is deliberately no
+  unauthenticated one today.
+- **Paper orders never rest after `submit` returns**, but they are tracked and
+  cancellable while simulated latency is in progress. Phase 17 must preserve
+  this per-order registry for genuinely resting live orders. A kill never
+  unwinds exposure that has already filled.
+- **The risk engine is single-process.** Its reservations live in one
+  `PaperAccount` in one service. Two trading processes against one database
+  would share the kill switch but not the exposure ledger; nothing today runs
+  that way, and nothing here pretends it would be safe.
+- **Nothing here invents an unwind for a naked leg.** The post-trade review
+  reports naked exposure and can pause further entries; it never assumes a
+  remedy succeeded or attempts one. Deciding what to do about existing naked
+  exposure is Phase 10's, not this phase's.
