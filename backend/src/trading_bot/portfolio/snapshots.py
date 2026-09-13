@@ -241,7 +241,7 @@ class SnapshotWriter:
 
     # --- cash -----------------------------------------------------------
 
-    def _cash_query(self) -> Select[tuple[Any, Any, Any]]:
+    def _cash_query(self) -> Select[tuple[Any, Any, Any, Any]]:
         spot_flow = func.sum(
             case(
                 (
@@ -272,8 +272,22 @@ class SnapshotWriter:
                 else_=0,
             )
         )
+        # Fee asset is durable evidence. Current configuration is used only
+        # for legacy rows that predate fee-asset recording; changing the fee
+        # preference must not rewrite historical cash.
+        cash_fees = func.sum(
+            case(
+                (FillRow.fee_asset == "BNB", 0),
+                (FillRow.fee_asset.is_not(None), FillRow.fee_usd),
+                else_=FillRow.fee_usd if self._fees_in_cash else 0,
+            )
+        )
+        bnb_fee_cases: list[tuple[Any, Any]] = [(FillRow.fee_asset == "BNB", FillRow.fee_usd)]
+        if not self._fees_in_cash:
+            bnb_fee_cases.append((FillRow.fee_asset.is_(None), FillRow.fee_usd))
+        bnb_fees = func.sum(case(*bnb_fee_cases, else_=0))
         return (
-            select(spot_flow, perpetual_realized, func.sum(FillRow.fee_usd))
+            select(spot_flow, perpetual_realized, cash_fees, bnb_fees)
             .join(OrderRow, OrderRow.id == FillRow.order_id)
             .join(MarketRow, MarketRow.id == OrderRow.market_id)
             .outerjoin(PositionRow, PositionRow.id == FillRow.position_id)
@@ -288,16 +302,18 @@ class SnapshotWriter:
         """Replay cash from every durable fill.
 
         Perpetual entries move no cash: their margin is reserved against it.
-        Their signed price P&L settles into cash on close. The second return
-        value is total durable fees, used to restore the BNB fee wallet.
+        Their signed price P&L settles into cash on close. Fees follow each
+        fill's recorded asset, not today's configuration. The second return
+        value is durable BNB-denominated fee value, used to restore that
+        wallet.
         """
         async with self._session_factory() as session:
-            spot_flow, perpetual_realized, fees = (await session.execute(self._cash_query())).one()
-        total_fees = fees or Decimal(0)
+            spot_flow, perpetual_realized, cash_fees, bnb_fees = (
+                await session.execute(self._cash_query())
+            ).one()
         cash = self._initial_cash + (spot_flow or Decimal(0)) + (perpetual_realized or Decimal(0))
-        if self._fees_in_cash:
-            cash -= total_fees
-        return cash, total_fees
+        cash -= cash_fees or Decimal(0)
+        return cash, bnb_fees or Decimal(0)
 
     async def cash(self) -> Decimal:
         cash, _ = await self.balances()

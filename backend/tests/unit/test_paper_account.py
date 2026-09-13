@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from tests.unit.test_execution_coordinator import PERP, SPOT, Adapter, opportunity, signal
 from trading_bot.core.config import ExecutionConfig, RiskConfig
 from trading_bot.db.models.enums import MarketType, Side
@@ -413,3 +415,45 @@ class TestExitSettlement:
         )
 
         assert account.gross_exposure_usd == Decimal(100)
+
+    async def test_fee_wallet_failure_does_not_partly_settle_an_exit(self) -> None:
+        account = PaperAccount(
+            ExecutionConfig(
+                paper_cash_usd=1000,
+                paper_bnb_balance=0.001,
+                paper_bnb_price_usd=100,
+            ),
+            RiskConfig(),
+            pays_fees_in_bnb=True,
+        )
+        account.restore(
+            [
+                PaperPositionSeed(
+                    "BTCUSDT", MarketType.SPOT, Side.BUY, Decimal(1), Decimal(100), Decimal(0)
+                ),
+                PaperPositionSeed(
+                    "BTCUSDT",
+                    MarketType.PERPETUAL,
+                    Side.SELL,
+                    Decimal(1),
+                    Decimal(100),
+                    Decimal(0),
+                ),
+            ]
+        )
+        before_cash = account.cash_usd
+
+        with pytest.raises(RuntimeError, match="BNB balance exhausted"):
+            await account.settle_exit(
+                [
+                    ExitSettlement(
+                        SPOT, Side.BUY, Decimal(100), Decimal(1), Decimal(101), Decimal("0.06")
+                    ),
+                    ExitSettlement(
+                        PERP, Side.SELL, Decimal(100), Decimal(1), Decimal(99), Decimal("0.06")
+                    ),
+                ]
+            )
+
+        assert account.cash_usd == before_cash
+        assert account.gross_exposure_usd == Decimal(200)

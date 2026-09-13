@@ -480,7 +480,8 @@ class PortfolioConfig(ConfigSection):
     # they are annualised from this, and from nothing else.
     snapshot_interval_ms: int = Field(default=60_000, ge=1000)
     # A mark older than this cannot value a position. The snapshot then says
-    # DEGRADED (or UNAVAILABLE) rather than reusing the last price it saw.
+    # UNAVAILABLE rather than publishing partial equity or reusing the last
+    # price it saw.
     mark_max_age_ms: int = Field(default=5000, gt=0)
     # Sharpe and Sortino need enough regularly spaced observations to mean
     # anything. Below this they are stored as NULL, never estimated.

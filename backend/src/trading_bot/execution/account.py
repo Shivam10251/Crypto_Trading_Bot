@@ -317,6 +317,11 @@ class PaperAccount:
 
     async def settle(self, reservation: AccountReservation, attempt: ExecutionAttempt) -> None:
         async with self._lock:
+            if reservation.intent_id not in self._reservations:
+                return
+            self._ensure_fee_capacity(
+                sum((outcome.result.fees_usd for outcome in attempt.legs), Decimal(0))
+            )
             if not self._release_locked(reservation):
                 return
             for outcome in attempt.legs:
@@ -363,6 +368,16 @@ class PaperAccount:
         against another - from driving a counter negative.
         """
         async with self._lock:
+            self._ensure_fee_capacity(
+                sum(
+                    (
+                        settlement.fees_usd
+                        for settlement in settlements
+                        if settlement.closed_quantity > 0
+                    ),
+                    Decimal(0),
+                )
+            )
             for settlement in settlements:
                 if settlement.closed_quantity <= 0:
                     continue
@@ -497,6 +512,15 @@ class PaperAccount:
             self._bnb -= quantity
         else:
             self._cash -= fee_usd
+
+    def _ensure_fee_capacity(self, fee_usd: Decimal) -> None:
+        """Fail before mutating the ledger if the configured fee wallet cannot pay."""
+        if not self._pays_fees_in_bnb or fee_usd <= 0:
+            return
+        if self._bnb_price is None:  # guarded by Settings validation
+            raise RuntimeError("BNB fee payment needs a BNB/USD price")
+        if fee_usd / self._bnb_price > self._bnb:
+            raise RuntimeError("paper BNB balance exhausted")
 
 
 def _position_key(ref: MarketRef) -> tuple[str, MarketType]:

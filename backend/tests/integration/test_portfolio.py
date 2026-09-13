@@ -654,7 +654,9 @@ class TestConcurrentClosing:
         )
 
         assert recovered is not None
-        assert recovered.intent_id == close_intent_id("attempt-1", 1)
+        # A claim that never reached submission did not consume an attempt or
+        # its deterministic identity.
+        assert recovered.intent_id == close_intent_id("attempt-1", 0)
 
     async def test_a_claim_refuses_a_stale_open_quantity(
         self, db: AsyncSession, markets: dict[MarketRef, int]

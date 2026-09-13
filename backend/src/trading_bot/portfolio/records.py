@@ -132,6 +132,7 @@ class CloseClaim:
 
     intent_id: str
     claim_id: str
+    sequence: int
     attempt: AttemptRecord
 
 

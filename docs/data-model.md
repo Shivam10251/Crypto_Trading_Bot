@@ -182,7 +182,7 @@ transaction commits is not durable and cannot be recovered from this table.
 | `price_pnl_usd` | Signed price P&L on the closed portion, **before** fees |
 | `fees_usd` / `exit_fees_usd` | Lifetime fees, and the exit's share of them; entry fees are `fees_usd - exit_fees_usd` |
 | `slippage_usd` / `exit_slippage_usd` | Attribution only - already inside the fill prices, never subtracted from P&L a second time |
-| `funding_pnl_usd` / `borrow_cost_usd` | **NULL means not measured**, never zero |
+| `funding_pnl_usd` / `borrow_cost_usd` | **NULL means applicable but not measured**; zero means not applicable or measured zero |
 | `unmeasured_pnl` | Which cash-flow components a realized figure is missing |
 | `mark_price` / `marked_at` | The last honest mark, and when. A stale or missing mark leaves the previous pair alone rather than refreshing it |
 | `close_intent_id` / `close_claim_id` / `close_claimed_at` / `close_attempts` | The durable claim two workers cannot both take; each new claim has a deterministic sequence identity |
@@ -208,7 +208,9 @@ position value or equity is published and the equity curve skips the row).
 `unvalued_positions` says how many marks were missing. `unpaired_positions`
 counts attempts whose hedge is missing or unequal - real naked exposure.
 
-`pnl_snapshots` states its window rather than implying it (`window_start` /
+`pnl_snapshots.unrealized_pnl_usd` is also NULL when any open position in its
+scope cannot be marked; it is never coerced to zero. The table states its
+window rather than implying it (`window_start` /
 `window_end`), names what its realised figure is missing (`unmeasured_pnl`,
 with `funding_pnl_usd` / `borrow_cost_usd` NULL), and records what its Sharpe
 and Sortino were computed from (`return_observations`,

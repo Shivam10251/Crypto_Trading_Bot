@@ -304,6 +304,20 @@ class PositionCloser:
                 refused=verdict.reason,
             )
 
+        try:
+            await self._store.confirm_submission(claimed)
+        except ClaimLost:
+            await self._store.release_claim(
+                [leg.position_id for leg in live], claim_id=claimed.claim_id, now=now
+            )
+            logger.info("portfolio.exit_claim_lost", attempt=fresh.attempt_id)
+            return CloseOutcome(
+                attempt_id=fresh.attempt_id,
+                intent_id=claimed.intent_id,
+                reason=reason,
+                refused="claim changed before submission",
+            )
+
         requests = [
             close_request(leg, claimed.intent_id, index, fresh.strategy, verdict.risk_event_id)
             for index, leg in enumerate(live)

@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.integration.test_portfolio import (
@@ -501,6 +501,18 @@ class TestSnapshots:
 
         assert await writer(db).cash() == Decimal(100000)
 
+    async def test_historical_fee_asset_overrides_current_fee_configuration(
+        self, db: AsyncSession, markets: dict[MarketRef, int]
+    ) -> None:
+        await open_attempt(db, markets, fee="1")
+        await db.execute(update(Fill).values(fee_asset="BNB"))
+        await db.flush()
+
+        cash, bnb_fees = await writer(db).balances()
+
+        assert cash == Decimal(0)
+        assert bnb_fees == Decimal(2)
+
     async def test_closed_perpetual_pnl_settles_into_durable_cash(
         self, db: AsyncSession, markets: dict[MarketRef, int]
     ) -> None:
@@ -729,6 +741,7 @@ class TestServiceSnapshot:
         )
         assert len(rows) == 3
         assert {row.unrealized_pnl_usd for row in rows} == {Decimal(100)}
+        assert {tuple(row.unmeasured_pnl or ()) for row in rows} == {(FUNDING,)}
 
     async def test_a_full_snapshot_writes_both_tables_and_is_idempotent(
         self, db: AsyncSession, markets: dict[MarketRef, int]

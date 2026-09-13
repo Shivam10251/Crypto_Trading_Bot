@@ -1,9 +1,9 @@
 """portfolio exits and P&L accounting
 
 Phase 10. Additive only: every column added here is nullable or carries a
-server default, no existing column changes type, and the two widenings
-(``portfolio_snapshots.position_value_usd`` / ``equity_usd`` becoming
-nullable) accept strictly more than before.
+server default, no existing column changes type, and the three nullability
+widenings (``portfolio_snapshots.position_value_usd`` / ``equity_usd`` and
+``pnl_snapshots.unrealized_pnl_usd``) accept strictly more than before.
 
 Three things the Phase 1 schema could not represent honestly:
 

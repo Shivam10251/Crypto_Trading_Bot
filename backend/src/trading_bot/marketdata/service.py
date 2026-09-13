@@ -707,12 +707,12 @@ async def _restore_paper_account(settings: Settings) -> PaperAccount:
         min_return_observations=settings.portfolio.min_return_observations,
         risk_free_rate_annual_pct=settings.portfolio.risk_free_rate_annual_pct,
     )
-    cash, paid_fees = await balance_writer.balances()
+    cash, bnb_fees_usd = await balance_writer.balances()
     bnb_balance: Decimal | None = None
     if settings.costs.pay_fees_in_bnb:
         if settings.execution.paper_bnb_price_usd is None:  # settings validation guards this
             raise RuntimeError("BNB fee payment needs a BNB/USD price")
-        bnb_balance = Decimal(str(settings.execution.paper_bnb_balance)) - paid_fees / Decimal(
+        bnb_balance = Decimal(str(settings.execution.paper_bnb_balance)) - bnb_fees_usd / Decimal(
             str(settings.execution.paper_bnb_price_usd)
         )
         if bnb_balance < 0:

@@ -17,6 +17,7 @@ import pytest
 
 from tests.unit.test_risk_engine import FakeStore, build_engine
 from trading_bot.db.models.enums import (
+    ExecutionMode,
     MarketType,
     PositionStatus,
     RiskDecision,
@@ -89,6 +90,21 @@ class TestReduceOnly:
 
         assert violation is not None
         assert "already closed" in violation.reason
+
+    def test_a_liquidated_position_cannot_be_closed_again(self) -> None:
+        violation = check_reduce_only([leg(status=PositionStatus.LIQUIDATED)])
+
+        assert violation is not None
+        assert "liquidated" in violation.reason
+
+    def test_a_position_from_another_mode_is_refused(self) -> None:
+        violation = check_reduce_only(
+            [leg()],
+            mode=ExecutionMode.LIVE,
+        )
+
+        assert violation is not None
+        assert "does not match" in violation.reason
 
     def test_a_shadow_probe_is_never_closed(self) -> None:
         """Its exposure is hypothetical; closing it would place a real order."""

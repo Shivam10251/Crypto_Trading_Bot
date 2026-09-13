@@ -1199,7 +1199,9 @@ service.py      two loops, wired by the market-data service
   `UNAVAILABLE` with NULL position value, unrealized P&L and equity. The
   equity curve skips it rather than treating missing exposure as zero.
   `DEGRADED` is a fully valued but explicitly risky state, such as an
-  unpaired book.
+  unpaired book. Portfolio and per-strategy P&L rows also name unmeasured
+  funding or borrow on positions that are still open; incomplete carrying
+  costs do not become invisible merely because the trade has not closed.
 - **Sharpe and Sortino are annualised from one stated interval.** They are
   computed only from equity snapshots at `portfolio.snapshot_interval_ms`,
   only when the spacing is regular and there are at least
@@ -1219,8 +1221,8 @@ service.py      two loops, wired by the market-data service
   `funding_pnl_usd`, `borrow_cost_usd`, `unmeasured_pnl`), the window bounds
   and `scope_key` that snapshot idempotency keys on, and the reduce-only
   CHECK constraints.
-- **Tests**: 52 unit tests on the pure arithmetic against hand-computed
-  numbers (long and short signs, weighted partial fills, fees charged exactly
+- **Tests** cover the pure arithmetic against hand-computed numbers (long and
+  short signs, weighted partial fills, fees charged exactly
   once across successive partial closes, slippage never subtracted twice,
   paired aggregation, statistics, drawdown, return sampling and
   annualisation), the exit policy and the executable-exit pricing; PostgreSQL
@@ -1259,6 +1261,8 @@ service.py      two loops, wired by the market-data service
    cash did not settle it, and restart restoration discarded every closed
    trade. Both now use the signed close-versus-entry cash flow, and restoration
    seeds balances from all durable fills before adding open exposure.
+   Fee replay now follows each fill's recorded asset as well, so changing the
+   current BNB preference does not rewrite historical cash.
 6. **Partial valuation was being published as account equity.** A snapshot
    with one unpriceable position summed the rest and inserted that partial
    number into the return curve. Any unvalued leg now makes aggregate value,

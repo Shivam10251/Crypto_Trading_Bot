@@ -273,11 +273,29 @@ class PortfolioStore:
                 row.close_intent_id = intent_id
                 row.close_claim_id = actual_claim_id
                 row.close_claimed_at = now
-                row.close_attempts = sequence + 1
                 row.exit_reason = reason
             await session.flush()
             claimed_rows = _group(rows, {}, legs[0].ref.venue)[0]
-        return CloseClaim(intent_id, actual_claim_id, claimed_rows)
+        return CloseClaim(intent_id, actual_claim_id, sequence, claimed_rows)
+
+    async def confirm_submission(self, claim: CloseClaim) -> None:
+        """Count a claim only when it is about to reach the adapter."""
+        position_ids = [leg.position_id for leg in claim.attempt.live_legs]
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(PositionRow)
+                .where(
+                    PositionRow.id.in_(position_ids),
+                    PositionRow.mode == self._mode,
+                    PositionRow.status == PositionStatus.CLOSING,
+                    PositionRow.close_claim_id == claim.claim_id,
+                    PositionRow.close_attempts == claim.sequence,
+                )
+                .values(close_attempts=claim.sequence + 1)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != len(position_ids):  # type: ignore[attr-defined]
+                raise _ClaimLost(claim.attempt.attempt_id)
 
     # --- writing --------------------------------------------------------
 
