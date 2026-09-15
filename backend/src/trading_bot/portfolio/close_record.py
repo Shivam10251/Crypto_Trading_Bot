@@ -70,10 +70,12 @@ def order_values(
     attempt: AttemptRecord,
     intent_id: str,
     index: int,
+    backtest_run_id: int | None = None,
 ) -> dict[str, Any]:
     return {
         "market_id": leg.market_id,
         "mode": result.mode,
+        "backtest_run_id": backtest_run_id,
         "opportunity_uid": None,
         "is_shadow": False,
         "risk_event_id": request.risk_event_id,
@@ -116,12 +118,17 @@ def order_values(
 
 
 def fill_values(
-    leg: LegRecord, result: ExecutionResult, order_id: int, mode: ExecutionMode
+    leg: LegRecord,
+    result: ExecutionResult,
+    order_id: int,
+    mode: ExecutionMode,
+    backtest_run_id: int | None = None,
 ) -> list[dict[str, Any]]:
     return [
         {
             "order_id": order_id,
             "mode": mode,
+            "backtest_run_id": backtest_run_id,
             # Linked at write time, which is what lets the position's exit
             # accounting be recomputed from fills alone.
             "position_id": leg.position_id,

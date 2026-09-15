@@ -38,7 +38,11 @@ async def recent_opportunities(since: datetime) -> tuple[int, int, datetime | No
         func.count(Opportunity.id),
         func.count(Opportunity.id).filter(Opportunity.net_edge_bps > 0),
         func.max(Opportunity.detected_at),
-    ).where(Opportunity.detected_at >= since)
+    ).where(
+        Opportunity.detected_at >= since,
+        # A backtest records history, not the running service's output.
+        Opportunity.backtest_run_id.is_(None),
+    )
     async with get_session_factory()() as session:
         total, positive, newest = (await session.execute(statement)).one()
         return int(total or 0), int(positive or 0), newest

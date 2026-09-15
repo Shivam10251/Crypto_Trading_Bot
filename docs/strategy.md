@@ -1,7 +1,8 @@
 # Strategy
 
 Status: **implemented in Phase 5** - the framework and the first strategy.
-Detection only: nothing is executed, and nothing is stored until Phase 7.
+Stored since Phase 7, executed on paper since Phase 8, and replayed against
+recorded history since Phase 11 with no change to the strategy.
 
 ## Interface
 
@@ -128,6 +129,37 @@ binance.com on 2026-09-11 across 50 pairs - see
   majors. It dominates precisely where the basis is widest - IOST paid -7.9 bps
   *per hour*, which is the market pricing the same dislocation.
 
+## The same strategy in replay (Phase 11)
+
+A backtest constructs `SpotPerpBasisStrategy` through the same registry and
+hands it the same `StrategyContext`; nothing about it knows it is replaying.
+What changes is outside it:
+
+- `StrategyRunner` is given the replay clock, so `now`, `detected_at`, signal
+  generation and expiry are virtual.
+- Its `MarketView`s come from `ReplayMarketData`, which publishes the same
+  `MarketSnapshot` contract as the live engine: quote, book and funding ages
+  from their own receipt times, the top `depth_levels` published and every
+  recorded level for execution, liquidity from the recorded book.
+- Funding comes from recorded observations, aged exactly as live ones.
+- A run starting between samples opens with the quote, book and funding
+  observation that were already in force (the newest valid ones received
+  before the start, within their carry limits), so the strategy's first
+  evaluation sees what the live strategy would have held - never anything
+  received after the start.
+
+`tests/unit/test_backtest_paper_parity.py` drives the real market-data engine
+over fake sockets, stores what capture would have stored, replays it, and
+requires identical evaluations: rejection reasons, net edges, sizes, prices,
+liquidity and signals. It also pins the one known divergence: a live
+connection silent for `stale_after_ms` makes the pair `NOT_LIVE`, while replay
+- which cannot observe connection heartbeats in sampled rows - rejects the
+same instant on data age (`STALE_DATA`). Both refuse to trade it.
+
+Episode uids under replay are derived from the configuration hash, the
+episode's legs and its opening instant, so the same history produces the same
+opportunity, intent and order identities every run.
+
 ## Later strategies (Phase 15)
 
 Cross-market arbitrage, triangular arbitrage, futures basis, statistical
@@ -140,11 +172,12 @@ validated end to end.
 - Opportunities are recorded whether or not they were profitable, and every
   rejection carries a reason - `BELOW_MIN_EDGE`, `SPOT_SHORT_UNAVAILABLE`,
   `FUNDING_UNKNOWN`, `STALE_QUOTE`, `STALE_BOOK`, `STALE_FUNDING`,
-  `UNWIND_NOT_FILLABLE`, `BELOW_MIN_QUANTITY` and the rest.
+  `UNWIND_NOT_FILLABLE`, `BELOW_MIN_QUANTITY`, `CLOCK_SKEW` (a negative feed latency: the venue clock ahead of ours, so latency is unmeasured and the latency gate cannot pass) and the rest.
 - A cost that cannot be estimated is refused, not guessed: a perpetual whose
   funding interval the venue does not publish yields no net edge at all, and
   neither does a position the book cannot show us closing. The opportunity is
   still stored - as `UNPRICEABLE`, with no costs on it - because it happened.
 - A strategy never reports profit; `trading_bot.portfolio` computes P&L from
   simulated or real fills.
-- Backtest, paper and live P&L are labelled and never combined.
+- Backtest, paper and live P&L are labelled and never combined; two backtests
+  are never combined with each other either.

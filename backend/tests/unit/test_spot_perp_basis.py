@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from trading_bot.core.config import CostsConfig, SpotPerpBasisConfig
 from trading_bot.db.models.enums import MarketType, Side
 from trading_bot.exchange.models import (
@@ -687,6 +689,32 @@ def test_excess_latency_is_rejected() -> None:
     result = engine.validate_signal(signal)
     assert not result.is_valid
     assert result.reason is RejectionReason.LATENCY_EXCEEDED
+
+
+@pytest.mark.parametrize(("spot_ms", "perp_ms"), [(-3, 20), (20, -1), (-5, -5)])
+def test_a_negative_feed_latency_cannot_pass_the_latency_gate(spot_ms: int, perp_ms: int) -> None:
+    """A venue clock ahead of ours means latency is unmeasured - never "fast".
+
+    Before: the pair reported the larger leg, so ``-3`` beside ``20`` read as
+    20 ms and passed, and ``-5`` on both legs passed a 500 ms limit outright.
+    """
+    engine = strategy()
+    engine.on_market_data(
+        [
+            view(SPOT, "99.99", "100.01", latency_ms=spot_ms),
+            view(PERP, "100.99", "101.01", latency_ms=perp_ms, funding=funding_info()),
+        ],
+        NOW,
+    )
+    (opportunity,) = engine.detect_opportunities()
+    assert opportunity.latency_ms is not None and opportunity.latency_ms < 0
+    edge = engine.calculate_edge(opportunity)
+    assert edge is not None
+    signal = engine.generate_signal(opportunity, edge)
+    assert signal is not None
+    result = engine.validate_signal(signal)
+    assert not result.is_valid
+    assert result.reason is RejectionReason.CLOCK_SKEW
 
 
 def test_a_trade_under_the_venue_minimum_is_rejected() -> None:

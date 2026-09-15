@@ -100,13 +100,21 @@ class BasisPair:
 
     @property
     def latency_ms(self) -> int | None:
-        """The worse of the two legs - a trade is as slow as its slowest side."""
+        """The worse of the two legs - a trade is as slow as its slowest side.
+
+        A negative leg is worse than any positive one: the venue's clock ran
+        ahead of ours, so that leg's latency is not measured at all, and
+        letting the other leg's positive figure stand in for it would pass
+        the latency gate on a number nobody measured.
+        """
         latencies = [
             view.snapshot.latency_ms
             for view in (self.spot, self.perpetual)
             if view.snapshot.latency_ms is not None
         ]
-        return max(latencies) if latencies else None
+        if not latencies:
+            return None
+        return min(latencies) if min(latencies) < 0 else max(latencies)
 
     @property
     def age_ms(self) -> int:
@@ -234,6 +242,12 @@ class SpotPerpBasisStrategy(Strategy):
             return ValidationResult.rejected(
                 RejectionReason.SPOT_SHORT_UNAVAILABLE,
                 f"would sell {opportunity.sell.ref.symbol} spot; no inventory or margin",
+            )
+        if opportunity.latency_ms is not None and opportunity.latency_ms < 0:
+            return ValidationResult.rejected(
+                RejectionReason.CLOCK_SKEW,
+                f"feed latency {opportunity.latency_ms} ms: the venue clock is ahead of ours, "
+                "so latency is unmeasured and cannot pass the latency limit",
             )
         if opportunity.latency_ms is not None and (
             opportunity.latency_ms > self._config.max_latency_ms

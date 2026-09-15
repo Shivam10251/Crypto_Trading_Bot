@@ -6,6 +6,8 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 
+import pytest
+
 from tests.unit.test_execution_coordinator import Adapter, signal
 from trading_bot.db.models.enums import RiskDecision
 from trading_bot.execution.account import AccountRejection
@@ -267,3 +269,96 @@ async def test_queue_overflow_is_explicit_and_bounded() -> None:
     assert dispatcher.overflow == 1
     dispatcher.start()
     await dispatcher.stop()
+
+
+class TestInlineExecution:
+    """Replay's path: the same admission and processing, with no queue."""
+
+    async def test_it_processes_now_and_reports_acceptance_like_enqueue(self) -> None:
+        recorder, adapter = Recorder(), Adapter()
+        approving = FakeRiskEngine(approve=True, risk_event_id=7)
+        dispatcher = _dispatcher(approving, recorder, adapter, queue_size=1)
+        episode = uuid.uuid4()
+        assert await dispatcher.execute_inline(signal(), episode, is_shadow=False)
+        # Done before returning: no worker was started, nothing was queued.
+        assert len(recorder.items) == 1 and dispatcher.attempts
+        assert approving.admitted == approving.evaluated == approving.post_traded
+        # One intent per episode, exactly as enqueue enforces it.
+        assert not await dispatcher.execute_inline(signal(), episode, is_shadow=False)
+        assert dispatcher.duplicates == 1
+
+    async def test_a_risk_refusal_is_still_accepted_work(self) -> None:
+        """Acceptance, not approval: the strategy loop marks the episode either way."""
+        recorder, adapter = Recorder(), Adapter()
+        dispatcher = _dispatcher(FakeRiskEngine(approve=False), recorder, adapter)
+        assert await dispatcher.execute_inline(signal(), uuid.uuid4(), is_shadow=False)
+        assert recorder.items == []
+
+    async def test_halted_work_is_refused_at_the_door(self) -> None:
+        recorder, adapter = Recorder(), Adapter()
+        halted = FakeRiskEngine(approve=True, halted="kill switch engaged")
+        dispatcher = _dispatcher(halted, recorder, adapter)
+        assert not await dispatcher.execute_inline(signal(), uuid.uuid4(), is_shadow=False)
+        assert halted.discarded and halted.evaluated == []
+
+    @pytest.mark.parametrize("stage", ["risk", "execution", "recording", "post_trade"])
+    async def test_an_unexpected_exception_propagates_instead_of_being_swallowed(
+        self, stage: str
+    ) -> None:
+        """Before: logged as ``worker_failed`` and reported as accepted work."""
+        recorder, adapter = Recorder(), Adapter()
+        risk = FakeRiskEngine(approve=True)
+        dispatcher = ExecutionDispatcher(
+            ExecutionCoordinator(adapter, propagate_adapter_errors=True),
+            recorder,  # type: ignore[arg-type]
+            queue_size=4,
+            workers=1,
+            recent_attempts=4,
+            timeout_ms=100,
+            risk_engine=risk,  # type: ignore[arg-type]
+        )
+
+        def boom(*_: object, **__: object) -> None:
+            raise RuntimeError(f"{stage} broke")
+
+        async def async_boom(*_: object, **__: object) -> None:
+            boom()
+
+        if stage == "risk":
+            risk.evaluate = async_boom  # type: ignore[method-assign,assignment]
+        elif stage == "execution":
+            adapter.submit = async_boom  # type: ignore[method-assign,assignment]
+        elif stage == "recording":
+            recorder.record = boom  # type: ignore[method-assign,assignment]
+        else:
+            risk.evaluate_post_trade = async_boom  # type: ignore[method-assign,assignment]
+        with pytest.raises(RuntimeError, match=f"{stage} broke"):
+            await dispatcher.execute_inline(signal(), uuid.uuid4(), is_shadow=False)
+
+    async def test_live_workers_still_survive_the_same_exception(self) -> None:
+        recorder, adapter = Recorder(), Adapter()
+        risk = FakeRiskEngine(approve=True)
+        dispatcher = _dispatcher(risk, recorder, adapter)
+
+        async def async_boom(*_: object, **__: object) -> None:
+            raise RuntimeError("risk broke")
+
+        risk.evaluate = async_boom  # type: ignore[method-assign,assignment]
+        assert dispatcher.enqueue(signal(), uuid.uuid4(), is_shadow=False)
+        dispatcher.start()
+        await dispatcher.stop()
+        assert dispatcher._tasks == []  # drained and stopped, never crashed
+
+    async def test_a_live_coordinator_still_records_an_adapter_error_as_a_failed_leg(
+        self,
+    ) -> None:
+        recorder, adapter = Recorder(), Adapter()
+
+        async def refuse(*_: object, **__: object) -> None:
+            raise ConnectionError("venue unreachable")
+
+        adapter.submit = refuse  # type: ignore[method-assign,assignment]
+        dispatcher = _dispatcher(FakeRiskEngine(approve=True), recorder, adapter)
+        assert await dispatcher.execute_inline(signal(), uuid.uuid4(), is_shadow=False)
+        ((attempt, _),) = recorder.items
+        assert {leg.result.rejection for leg in attempt.legs} == {RejectionCode.ADAPTER_ERROR}

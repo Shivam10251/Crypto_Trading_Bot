@@ -114,8 +114,14 @@ class ExecutionCoordinator:
         clock: Callable[[], datetime] | None = None,
         account: PaperAccount | None = None,
         shadow_account: PaperAccount | None = None,
+        propagate_adapter_errors: bool = False,
     ) -> None:
         self._adapter = adapter
+        # Live, an adapter exception is a venue or network failure and becomes
+        # a FAILED leg the audit trail records. Replay's adapter touches no
+        # network: an exception there is a simulator or replay-invariant bug,
+        # and recording it as an ordinary failed order would hide it.
+        self._propagate_adapter_errors = propagate_adapter_errors
         self._order_type = order_type
         # Needed to round a limit to the venue's tick. Measured live: the
         # strategy's executable price is a VWAP of walking the book, which is
@@ -261,6 +267,12 @@ class ExecutionCoordinator:
         finally:
             for request in requests:
                 self._in_flight.pop(request.client_order_id, None)
+        if self._propagate_adapter_errors:
+            for value in raw:
+                if isinstance(value, BaseException):
+                    if reservation is not None and account is not None:
+                        await account.release(reservation)
+                    raise value
         results = [
             value if isinstance(value, ExecutionResult) else self._failed(request, value)
             for request, value in zip(requests, raw, strict=True)

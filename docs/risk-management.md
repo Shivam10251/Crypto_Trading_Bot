@@ -1,7 +1,7 @@
 # Risk Management
 
 Status: **implemented and reviewed (Phase 9); extended and reviewed in Phase
-10.** The risk engine (`trading_bot.risk`) sits in front of the execution
+10; run unchanged under replay in Phase 11.** The risk engine (`trading_bot.risk`) sits in front of the execution
 adapter. Every signal -
 real or shadow - is evaluated, and every decision is durably stored before
 anything downstream may act on it. The fourteen safety defects found auditing
@@ -351,6 +351,44 @@ Shadow risk events and positions stay queryable separately by
 positions out of every question about what the strategy actually earned.
 Shadow decisions are also left unlinked from `signals`, because a probe's
 signal is one the strategy declined to make.
+
+## Risk under replay (Phase 11)
+
+The backtest builds the same `RiskEngine`, `KillSwitchState`, `PaperAccount`
+and `PortfolioPnlSource`, and every check above runs as written. Three things
+are scoped differently, on purpose:
+
+- **Virtual time everywhere.** Ages, expiry, decision latency, halt windows
+  and the daily-loss day are measured on the replay clock. The UTC day is the
+  *replayed* day: a loss at 23:58 counts against that day, and a signal after
+  the replayed midnight starts from zero (tested across a midnight).
+- **Run-scoped state.** Risk events, the kill switch and its restoration read
+  and write only the run's own rows (`risk_events.backtest_run_id`). A replay
+  that trips its kill switch halts that replay - never the paper service, and
+  never another run - and a halt written by `trading-bot-risk` does not reach a
+  replay. Kill-switch intent ids are sequential per run rather than random.
+- **No queue.** Execution is inline, so queue overload cannot be exercised,
+  and a signal waiting behind another execution in the same tick is re-checked
+  at admission and can expire.
+
+Two live behaviours are deliberately *not* allowed to change a replay's
+result silently. A risk decision that cannot be stored fails closed live - and
+fails the **run** in replay, because the refusal it forced is a decision no
+real run would have made. A kill-switch read or listener failure and an
+unreadable P&L view do the same. The engine checks the counters these
+components already keep (`persist_failures`, `refresh_failures`,
+`listener_failures`, `read_failures`) after every step.
+
+**Negative feed latency is not "fast".** A venue timestamp later than local
+receipt means the clocks disagree and latency is unmeasured. The strategy now
+rejects such a signal with `CLOCK_SKEW` - live and in replay - instead of
+letting a negative number pass `max_latency_ms`; a pair reports its worst leg,
+and a negative leg is worse than any positive one. Replay additionally refuses,
+as corrupt, rows whose venue clock is more than `backtest.max_clock_skew_ms`
+ahead of receipt.
+
+The paper account a replay starts from is a fresh `paper_account_for`
+settings ledger, never restored from durable paper positions.
 
 ## Configured limits
 

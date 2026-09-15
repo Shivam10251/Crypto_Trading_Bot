@@ -28,6 +28,10 @@ EXPECTED_TABLES = {
     "pnl_snapshots",
     "risk_events",
     "system_events",
+    # Phase 11
+    "funding_observations",
+    "backtest_runs",
+    "backtest_funding_payments",
 }
 
 TABLES = Base.metadata.tables
@@ -117,8 +121,13 @@ class TestEnumColumns:
         for table_name, column_name, column_type in enum_columns:
             assert column_type.native_enum is False, f"{table_name}.{column_name}"
 
-    def test_execution_mode_separates_theoretical_paper_and_live(self) -> None:
-        assert [m.value for m in enums.ExecutionMode] == ["THEORETICAL", "PAPER", "LIVE"]
+    def test_execution_mode_separates_theoretical_paper_live_and_backtest(self) -> None:
+        assert [m.value for m in enums.ExecutionMode] == [
+            "THEORETICAL",
+            "PAPER",
+            "LIVE",
+            "BACKTEST",
+        ]
 
     def test_opportunity_statuses_cover_the_full_lifecycle(self) -> None:
         assert {m.value for m in enums.OpportunityStatus} == {
@@ -191,7 +200,8 @@ class TestIndexes:
             for constraint in TABLES["orders"].constraints
             if constraint.__class__.__name__ == "UniqueConstraint"
         }
-        assert ("mode", "client_order_id") in order_uniques
+        # Keyed by run as well: two backtests replay identical client ids.
+        assert ("mode", "backtest_run_id", "client_order_id") in order_uniques
 
         trade_uniques = {
             tuple(c.name for c in constraint.columns)

@@ -11,7 +11,7 @@ quality and realistic execution simulation rank above visuals.
 > order. Phase 17 builds the live-execution path, and it stays off until it is
 > explicitly armed. See [Safety](#safety).
 
-Current state: **Phases 0–10 complete** — foundation, data
+Current state: **Phases 0–11 complete** — foundation, data
 model, the exchange abstraction, a real-time market-data engine, market
 monitoring of the 50 most liquid spot/perpetual pairs, the strategy framework
 with the first spot/perpetual basis strategy, the transaction cost model, and
@@ -26,6 +26,21 @@ fills, and the daily-loss and consecutive-loss limits that Phase 9 reported as
 deferred now operate against measured price P&L and fees. It is off by default
 (`portfolio.enabled`), and nothing it produces has been calibrated against a
 live run.
+
+Phase 11 adds a deterministic backtest: recorded market data
+replayed through the *same* strategy, cost model, risk engine, paper simulator
+and portfolio code in virtual time, every artifact isolated to its own run -
+by the database, not only by the queries. Each run reads one immutable
+snapshot of history, starts from the state already in force at its start
+time, fails rather than publishing a result whose records did not all land,
+and ends with a per-component verdict (dataset, execution model, accounting,
+valuation) that decides whether its performance may be ranked at all. The
+repository's recorded data so far holds no depth or funding, so replaying it
+honestly finds nothing tradeable and says why; opt-in capture
+(`market_data.capture.enabled`) records what a replay needs. Funding that
+settles while a replayed perpetual is open is posted as a durable cash flow,
+so open positions can be accounting-complete to the replay end when every
+crossed settlement was observed.
 
 **The finding so far.** Across 340 recorded opportunities the average gross
 basis was 13.0 bps against 30.0 bps of round-trip taker fees and 16.3 bps of
@@ -80,6 +95,19 @@ Then open <http://localhost:5173>. The shell reports live backend status;
 subsystems that later phases build are shown as `OFFLINE`, never faked.
 Exchange and Market Data turn `HEALTHY` while `make market-data` is running.
 
+Replay recorded history (Phase 11):
+
+```bash
+cd backend
+uv run trading-bot-backtest run --start 2026-09-11T09:00:00Z --end 2026-09-11T10:00:00Z --symbol BTCUSDT
+uv run trading-bot-backtest status <run-uid>    # also: cancel, report [--json], list
+uv run trading-bot-backtest capture             # what replay capture recorded, and its gaps
+```
+
+The run's uid is printed to stderr the moment its row exists, so a long run
+can be inspected or cancelled while it is still reading data. Exit codes: 0
+`COMPLETED` (rankable), 3 `INCOMPLETE`, 1 `FAILED`, 130 `CANCELLED`.
+
 A `Makefile` wraps these commands: `make up`, `make migrate`, `make api`,
 `make web`, `make market-data`, `make recost`, `make test`, `make check`.
 
@@ -100,7 +128,7 @@ open http://127.0.0.1:8000/docs                 # OpenAPI (dev/paper only)
 
 ```bash
 make test                                   # backend + frontend
-cd backend  && uv run pytest                # 723 tests (14 live, opt-in)
+cd backend  && uv run pytest                # 1351 tests (14 live, opt-in)
 cd frontend && pnpm test                    # 10 tests
 make check                                  # lint + types + tests
 ```
@@ -134,7 +162,9 @@ backend/                  FastAPI service, strategy engine, data pipeline
     execution/            dispatcher, paper simulator, account, order/fill record
     risk/                 pre-trade, admission, exit and post-trade decisions
     portfolio/            exit policy, valuation, P&L accounting, snapshots
+    backtest/             replay: virtual clock, history source, engine, runs, report, CLI
   alembic/                database migrations
+  scripts/                measurements (e.g. snapshot cost vs run history)
   tests/                  unit and integration tests
 config/                   base.yaml + per-profile overrides (no secrets)
 docs/                     architecture and design documentation

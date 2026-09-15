@@ -100,4 +100,4 @@ class TestConventions:
         import trading_bot.db.models  # noqa: F401
 
         assert "opportunities" in Base.metadata.tables
-        assert len(Base.metadata.tables) == 13
+        assert len(Base.metadata.tables) == 16

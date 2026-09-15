@@ -1,11 +1,19 @@
 """Shared enum column types.
 
 These are ``VARCHAR`` columns with a ``CHECK`` constraint, not native
-PostgreSQL enum types (``native_enum=False``). The database still rejects an
+PostgreSQL enum types (``native_enum=False``). The database rejects an
 invalid value, but the status sets can grow as later phases add order states,
 risk event types and strategies - adding a value to a native enum requires
 ``ALTER TYPE``, which cannot run inside a transaction and makes migrations
 fragile.
+
+``create_constraint=True`` is what makes the database enforce it. Until
+migration ``b5d9e2c4a7f1`` it was missing, so this docstring described a CHECK
+constraint PostgreSQL did not have: only ``validate_strings`` in the ORM
+refused a bad value, and any raw SQL writer could store one. Each constraint
+is named ``ck_<table>_<enum name>``, which is unique only while no table uses
+the same enum type on two columns - ``tests/unit/test_enum_constraints.py``
+fails if one ever does.
 
 Each type is defined once and reused by every column that needs it, so the
 check-constraint definitions stay identical across tables.
@@ -26,6 +34,9 @@ def _enum(python_enum: type[StrEnum], name: str) -> Enum:
         python_enum,
         name=name,
         native_enum=False,
+        # The database CHECK constraint - the enforcement that matters, since
+        # it binds every writer and not only this ORM.
+        create_constraint=True,
         # Reject unknown strings on the Python side too, not just in the DB.
         validate_strings=True,
         # Store the member value ("BUY"), not the member name.
@@ -47,3 +58,4 @@ VALUATION_STATUS = _enum(enums.ValuationStatus, "valuation_status")
 EXECUTION_MODE = _enum(enums.ExecutionMode, "execution_mode")
 SYSTEM_EVENT_TYPE = _enum(enums.SystemEventType, "system_event_type")
 SEVERITY = _enum(enums.Severity, "severity")
+BACKTEST_RUN_STATUS = _enum(enums.BacktestRunStatus, "backtest_run_status")

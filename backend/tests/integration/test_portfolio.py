@@ -790,7 +790,8 @@ class TestEntryRecorderCannotUndoAClose:
         statement = insert(Position).values([values])
         await db.execute(
             statement.on_conflict_do_update(
-                constraint="mode_attempt_market",
+                index_elements=["mode", "attempt_id", "market_id"],
+                index_where=Position.backtest_run_id.is_(None),
                 set_={
                     key: getattr(statement.excluded, key)
                     for key in values

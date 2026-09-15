@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from trading_bot.core.logging import get_logger
 from trading_bot.db.models import RiskEvent
 from trading_bot.db.models.enums import ExecutionMode, RiskEventType
+from trading_bot.db.scope import RunScope
 from trading_bot.risk.models import RiskEventDraft
 
 logger = get_logger(__name__)
@@ -50,16 +51,25 @@ KILL_SWITCH_ADVISORY_LOCK = 0x5249534B535749
 
 
 class RiskEventStore:
-    """Writes ``risk_events`` rows, synchronously when the caller needs proof."""
+    """Writes ``risk_events`` rows, synchronously when the caller needs proof.
 
-    def __init__(self, session_factory: SessionFactory) -> None:
+    ``backtest_run_id`` stamps every row with the run that decided it. A
+    replayed run's kill switch, loss halts and approvals are its own: they
+    must neither gate the paper service nor another run.
+    """
+
+    def __init__(
+        self, session_factory: SessionFactory, *, backtest_run_id: int | None = None
+    ) -> None:
         self._session_factory = session_factory
+        self._backtest_run_id = backtest_run_id
         self._pending: list[RiskEventDraft] = []
         self.persisted = 0
         self.persist_failures = 0
         self.queued_written = 0
         self.queued_dropped = 0
         self.flush_failures = 0
+        self.last_error: str | None = None
 
     async def persist(self, draft: RiskEventDraft) -> int | None:
         """Insert and commit one row now, returning its id.
@@ -67,7 +77,7 @@ class RiskEventStore:
         ``None`` means the write could not be confirmed - a downed database,
         a lost connection, anything. The caller must fail closed: a decision
         that cannot be proven durable is not a decision an order may act on.
-        Idempotent on ``(mode, intent_id, event_type)``: retrying the same
+        Idempotent on ``(mode, backtest_run_id, intent_id, event_type)``: retrying the same
         evaluation converges on the row already written instead of adding one.
 
         The id is only returned once the session context manager has exited,
@@ -79,6 +89,7 @@ class RiskEventStore:
                 risk_event_id = await self._upsert(session, draft)
         except Exception as exc:
             self.persist_failures += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
             logger.error(
                 "risk.event_persist_failed",
                 intent_id=draft.intent_id,
@@ -106,6 +117,7 @@ class RiskEventStore:
                 risk_event_id = await self._upsert(session, draft)
         except Exception as exc:
             self.persist_failures += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
             logger.error(
                 "risk.kill_switch_persist_failed",
                 intent_id=draft.intent_id,
@@ -118,15 +130,15 @@ class RiskEventStore:
 
     async def _upsert(self, session: AsyncSession, draft: RiskEventDraft) -> int:
         """One upsert. Touches no metric: nothing here has committed yet."""
-        row = draft.as_row()
+        row = draft.as_row() | {"backtest_run_id": self._backtest_run_id}
         insert_statement = insert(RiskEvent).values(**row)
         updatable = {
             key: getattr(insert_statement.excluded, key)
             for key in row
-            if key not in {"mode", "intent_id", "event_type"}
+            if key not in {"mode", "backtest_run_id", "intent_id", "event_type"}
         }
         upsert_statement = insert_statement.on_conflict_do_update(
-            constraint="mode_intent_event_type", set_=updatable
+            constraint="mode_run_intent_event_type", set_=updatable
         ).returning(RiskEvent.id)
         result = await session.execute(upsert_statement)
         risk_event_id: int = result.scalar_one()
@@ -160,8 +172,11 @@ class RiskEventStore:
         except Exception as exc:
             # Oldest first, and bounded: a database that stays down must not
             # grow this queue without limit.
-            self._pending = (batch + self._pending)[-MAX_PENDING_EVENTS:]
+            requeued = batch + self._pending
+            self.queued_dropped += max(0, len(requeued) - MAX_PENDING_EVENTS)
+            self._pending = requeued[-MAX_PENDING_EVENTS:]
             self.flush_failures += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("risk.event_flush_failed", error=str(exc), requeued=len(batch))
             return 0
         self.queued_written += len(batch)
@@ -174,7 +189,9 @@ class RiskEventStore:
 
 
 async def latest_kill_switch_row(
-    session_factory: SessionFactory, mode: ExecutionMode
+    session_factory: SessionFactory,
+    mode: ExecutionMode,
+    backtest_run_id: int | None = None,
 ) -> dict[str, Any] | None:
     """The most recent kill-switch decision, or ``None`` if none was ever made.
 
@@ -185,7 +202,10 @@ async def latest_kill_switch_row(
     async with session_factory() as session:
         result = await session.execute(
             select(RiskEvent)
-            .where(RiskEvent.event_type == RiskEventType.KILL_SWITCH, RiskEvent.mode == mode)
+            .where(
+                RiskEvent.event_type == RiskEventType.KILL_SWITCH,
+                *RunScope(mode, backtest_run_id).filters(RiskEvent.mode, RiskEvent.backtest_run_id),
+            )
             .order_by(RiskEvent.id.desc())
             .limit(1)
         )

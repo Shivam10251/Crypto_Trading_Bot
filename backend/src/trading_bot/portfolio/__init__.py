@@ -36,12 +36,13 @@ from trading_bot.portfolio.accounting import (
     TradeOutcome,
     position_pnl,
 )
+from trading_bot.portfolio.book_value import PortfolioState, value_book
 from trading_bot.portfolio.closer import CloseOutcome, PositionCloser
 from trading_bot.portfolio.exits import BasisView, ExitDecision, ExitReason
 from trading_bot.portfolio.pnl_source import PortfolioPnlSource, utc_day_start
 from trading_bot.portfolio.records import AttemptRecord, LegRecord
 from trading_bot.portfolio.service import PortfolioService
-from trading_bot.portfolio.snapshots import PortfolioState, SnapshotWriter, Window, value_book
+from trading_bot.portfolio.snapshots import SnapshotWriter, Window
 from trading_bot.portfolio.statistics import TradeStatistics, summarise_trades
 from trading_bot.portfolio.store import PortfolioStore
 from trading_bot.portfolio.valuation import ExecutableExit, MarkReader, price_exit

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from trading_bot.core.config import ExecutionConfig, RiskConfig
+from trading_bot.core.config import ExecutionConfig, RiskConfig, Settings
 from trading_bot.db.models.enums import MarketType, Side
 from trading_bot.exchange.models import BPS_SCALE, MarketRef
 from trading_bot.execution.models import RejectionCode
@@ -419,6 +419,16 @@ class PaperAccount:
                     )
                     self._cash += price_pnl
 
+    async def apply_funding(self, amount_usd: Decimal) -> None:
+        """Apply one already-durable funding payment to available collateral.
+
+        Funding is signed from the account's perspective: a receipt is
+        positive and a payment negative. Only replay currently has settlement
+        evidence precise enough to call this method.
+        """
+        async with self._lock:
+            self._cash += amount_usd
+
     async def release(self, reservation: AccountReservation) -> None:
         """Abort a reservation without declaring its intent completed.
 
@@ -468,6 +478,15 @@ class PaperAccount:
     @property
     def cash_usd(self) -> Decimal:
         return self._cash
+
+    @property
+    def bnb_balance(self) -> Decimal:
+        return self._bnb
+
+    @property
+    def position_gross_usd(self) -> dict[tuple[str, MarketType], Decimal]:
+        """Settled gross notional per (symbol, market type); a copy."""
+        return dict(self._position_gross)
 
     async def current_limit_breaches(self) -> tuple[AccountRejection, ...]:
         """Return limits the settled portfolio currently exceeds.
@@ -521,6 +540,19 @@ class PaperAccount:
             raise RuntimeError("BNB fee payment needs a BNB/USD price")
         if fee_usd / self._bnb_price > self._bnb:
             raise RuntimeError("paper BNB balance exhausted")
+
+
+def paper_account_for(settings: Settings) -> PaperAccount:
+    """An empty ledger built from configuration - one definition for the
+    market-data service and for replay, so the two cannot drift apart."""
+    return PaperAccount(
+        settings.execution,
+        settings.risk,
+        pays_fees_in_bnb=settings.costs.pay_fees_in_bnb,
+        max_fee_bps=Decimal(
+            str(max(settings.costs.spot_taker_fee_bps, settings.costs.perp_taker_fee_bps))
+        ),
+    )
 
 
 def _position_key(ref: MarketRef) -> tuple[str, MarketType]:

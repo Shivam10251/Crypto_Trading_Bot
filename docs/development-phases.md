@@ -22,7 +22,7 @@ was never recorded is gone for good.
 | 8 | Paper execution engine | **Complete** |
 | 9 | Risk engine | **Complete** |
 | 10 | Portfolio and P&L | **Complete** |
-| 11 | Backtest / replay engine | Not started |
+| 11 | Backtest / replay engine | **In review** |
 | 12 | Real-time dashboard | Not started |
 | 13 | Dashboard real-time backend | Not started |
 | 14 | Research and strategy analytics | Not started |
@@ -1316,3 +1316,288 @@ service.py      two loops, wired by the market-data service
   transaction that records it leaves the position open, and the next sweep
   simulates the close again. For a simulator that is the correct recovery; a
   live adapter (Phase 17) must reconcile against the venue instead.
+
+## Phase 11 — complete
+
+Built, independently reviewed, hardened against that review (see
+[Hardening after review](#hardening-after-review)), tested and type-checked;
+the repository's recorded data still cannot exercise it end to end (see its
+Limits below). `uv run trading-bot-backtest run` replays recorded market data
+through the real pipeline in virtual time.
+
+```
+HistoricalDataSource (one REPEATABLE READ snapshot) ─▶ EventValidator ─▶ ReplayMarketData ◀── read at virtual T only
+   initial state before the start ─────────────────────────────────────────┘
+ReplayClock ── fixed tick grids ─▶ monitor ─▶ snapshot ─▶ exits ─▶ strategy + execution ─▶ strict flush
+          (same classes as the live service; only the clock, the feed and the run scope differ)
+```
+
+- **One strategy implementation.** `SpotPerpBasisStrategy`, the cost model,
+  `StrategyRunner`, `EpisodeTracker`, `RiskEngine`, `KillSwitchState`,
+  `PaperAccount`, `PaperExecutionAdapter`, `ExecutionCoordinator`,
+  `ExecutionDispatcher`, `PositionCloser`, `PortfolioStore`,
+  `PortfolioPnlSource`, `SnapshotWriter` and `PortfolioService` are the live
+  service's classes, unchanged in behaviour. A parity test drives the real
+  `MarketDataEngine` over fake sockets and shows replay reproduces its
+  strategy decisions exactly from what capture would have stored.
+- **One virtual clock** (`backtest/clock.py`), injected everywhere a clock
+  or a sleep already was. `ReplayEventLoop` wakes a virtual sleeper only when
+  no callback is runnable and no replay database I/O is in flight, so both
+  legs of an order register their latencies before either arrives, and a
+  query in flight never lets time move. Wall-clock timers keep their meaning.
+  Nothing in the replay path calls `datetime.now()` or sleeps for real.
+- **No look-ahead by construction** (`backtest/market_state.py`). Events are
+  ordered by *local receipt* time - never the exchange clock - with a total
+  `(receipt time, kind, row id)` tie-break, and applied only when virtual time
+  reaches them. A read is refused outright unless the buffer provably holds
+  every event up to now. Orders fill against the book recorded by their
+  *arrival*; tests put a spectacular book 50 ms after arrival and a worse one
+  before it, and the fill takes the worse one.
+- **Run isolation** (`db/models/backtest.py`, `db/scope.py`, migrations
+  `c8e1f3a5b9d2`, `d4a7c9e2f6b8` and `e8b1f4c7d2a9`). `backtest_runs` holds
+  each run's identity, dataset, range, markets, configuration snapshot and
+  hash, code revision, dirty-source digest, lifecycle, counts, warnings and
+  completeness verdict. Every result table carries `backtest_run_id` (`ON
+  DELETE CASCADE`) with a CHECK tying it to `mode = 'BACKTEST'`; unique keys
+  include the run; every store filters on mode *and* run; every provenance
+  foreign key includes a run key, so the database refuses cross-run links. Two
+  runs over the same data write identical client order ids, intent ids and
+  snapshot instants side by side.
+- **Real enum constraints first** (migration `b5d9e2c4a7f1`). The
+  documented `VARCHAR` + `CHECK` enforcement never existed; it does now, with
+  existing data validated before installation and a named refusal if any row
+  would violate it.
+- **One immutable dataset per run** (`backtest/postgres_source.py`):
+  coverage, initial state and keyset-paginated pages all read inside one
+  read-only repeatable-read transaction, at most one page per table in memory.
+  The `EventValidator` counts duplicates, regressions, out-of-order, corrupt
+  and temporally invalid rows and gaps, and never repairs any. A sampled book
+  is carried at most `max_book_carry_ms`, funding at most
+  `max_funding_carry_ms`.
+- **Capture** (`marketdata/capture.py`, off by default): one coherent sample
+  per interval - quotes, synchronised depth and funding in one transaction -
+  lost samples recorded as gaps, cadence validated against freshness limits.
+- **Funding attribution and settlement** (`backtest/funding.py`): signed
+  funding for a perpetual leg from recorded settlements, only when every
+  crossed settlement has an observation shortly before it, a consistent
+  interval and an unambiguous size. Each measured settlement is inserted once
+  into `backtest_funding_payments` and posted to the paper account cash before
+  snapshots and risk loss checks. Flat legs still copy their total to
+  `positions.funding_pnl_usd`; open legs can be accounting-complete to the
+  replay end when all due settlements were measured. Otherwise `NULL` plus
+  `unmeasured_pnl`, as before. Spot borrow remains unmeasured.
+- **Lifecycle**: the uid announced as soon as the row exists, a wall-clock
+  heartbeat on its own task, a durable cancel, idempotent terminal
+  transitions, `FAILED` with the exception on error, and orphaned `RUNNING`
+  rows recovered as `FAILED` - a run is not resumable.
+- **Report** (`backtest/report.py`, `report_data.py`, `report_render.py`):
+  total return, realised and unrealised P&L, total execution fees by wallet
+  and completed-trade fees apart, slippage attribution, funding/borrow, an
+  equity reconciliation, full completed-trade statistics and per-strategy
+  results, exposure time, turnover, return on peak gross exposure, worst
+  unhedged entry, drawdown, Sharpe and Sortino with their sampling interval,
+  theoretical opportunity edges kept apart from executed results, rejections
+  by reason, latency and slippage distributions, and every dataset issue. A
+  derived metric of a run that is not rankable carries its caveat in text and
+  JSON alike.
+
+### What checking reality changed
+
+1. **The enum CHECK constraints did not exist.** `enum_types` documented them
+   and `create_constraint=True` was never passed, so PostgreSQL accepted any
+   string. Fixed before `BACKTEST` was added, as the review asked.
+2. **Nothing has ever recorded depth or funding.** `order_books` had no writer
+   and funding was never persisted: `trading_bot_dev` holds 34,218 sampled
+   quotes and nothing a strategy can price. A replay of 2026-09-11 09:00-10:00
+   on a migrated copy of it finishes `INCOMPLETE` (7,152 events, zero
+   opportunities, `depth`/`funding_observations` missing) - honestly, and
+   identically on a second run. Capture had to exist for replay to mean
+   anything.
+3. **Legacy orders all have NULL intent keys.** All 80 dev orders predate
+   `execution_intent_id`, so re-keying that constraint with `NULLS NOT
+   DISTINCT` would have failed on real data. It became partial unique indexes.
+4. **The recorded quotes contain duplicates and regressions.** The same window
+   has 34 duplicate and 5 regressing quote rows around 09:05-09:08 - two
+   market-data processes recording at once. The validator counts and drops
+   them; nothing else had ever noticed.
+5. **A Phase 10 snapshot could fail forever.** The first snapshot after a
+   start writes a P&L row per closed position in one statement; past about a
+   thousand positions it exceeds PostgreSQL's 32,767 bind parameters, and
+   because nothing advances until a snapshot succeeds, every later one fails
+   the same way. Found by the benchmark; inserts are now chunked.
+6. **Snapshots were measured quadratic.** `scripts/bench_snapshot_scaling.py`:
+   one snapshot cost 49 ms with 250 closed trades, 389 ms with 4,000 and 234 ms
+   with 43,200 prior snapshots. Replay folds history in instead
+   (`portfolio/incremental.py`): 18 ms at 1,000 trades whatever the snapshot
+   count, 44 ms at 4,000. The paper service, a concurrent writer, still reads
+   history.
+7. **The exit sweep dominated replay time.** Profiling a replay put about two
+   thirds of the time in the per-second exit sweep's query on a flat book.
+   Skipping the sweep while the run's account holds no exposure took a 2-hour,
+   30-trade replay from 78 s to 9 s (~800x real time) with identical results.
+8. **Replay cannot see a connection go quiet.** The live engine marks a market
+   `NOT_LIVE` after 2 s of connection silence; sampled rows carry no
+   heartbeat, so replay rejects the same instant as `STALE_DATA`. The parity
+   test pins this divergence rather than hiding it.
+
+### Hardening after review
+
+An independent review listed seventeen defects. Each was verified against the
+code before it was changed; the tests named here fail on the pre-hardening code.
+
+1. **Arbitrary start times opened blind.** A run starting between samples had
+   no quote, book or funding until the next row arrived. `initial_state` now
+   offers, per market and stream, the newest rows received before the start
+   within the carry limits; the validator takes the first valid one and the
+   market applies it at the start (`test_backtest_dataset_integrity`,
+   `test_backtest_results::TestInitialization`, including funding polled
+   before the start attributing a settlement 60 s into the run).
+2. **The dataset could change under a run.** Coverage and every page used
+   separate sessions under `READ COMMITTED`; a capture insert or a retention
+   purge mid-run changed what later pages returned. One `REPEATABLE READ READ
+   ONLY` transaction now holds for the run; each query is counted as replay
+   I/O on its own. A negative control under `READ COMMITTED` reads 183 of 242
+   events after a concurrent purge; the snapshot reads all 242
+   (`test_backtest_source::TestImmutableView`).
+3. **Persistence failures were swallowed.** Recorder flushes logged and
+   requeued; a replay could publish a result whose orders never landed. Replay
+   now retries each queue at most `persistence_attempts` times and fails the
+   run on anything unwritten, dropped, unregistered or decided differently
+   because a write failed (risk persist, kill-switch read, P&L view, exit
+   sweep), and reconciles the paper account against durable cash, BNB fees and
+   per-market exposure at the end. Live behaviour is unchanged; the recorders
+   only gained counters (`test_backtest_failures::TestStrictPersistence`:
+   transient failure and lost commit acknowledgement converge on identical
+   rows; persistent failure, failed final flush, unstored risk decision and a
+   divergent ledger each fail with the exact reason).
+4. **`execute_inline` swallowed exceptions.** It applied the worker's survival
+   rule and reported the work as accepted. It now propagates, and the replay
+   coordinator raises adapter exceptions instead of recording `FAILED` legs;
+   the episode is never marked executed. Live workers still survive
+   (`test_execution_dispatcher::TestInlineExecution`).
+5. **No equity baseline.** The first snapshot ran after the first evaluation,
+   so a trade on the first tick was inside the baseline and its cost missing
+   from drawdown. Snapshots now run before exits and evaluation, on the
+   portfolio's epoch grid, with the baseline stamped at its grid floor; the
+   terminal valuation is stamped at the end instant when the end falls between
+   grid points, and left out of return series
+   (`TestEquityBaseline`; incremental and history-read drawdown agree).
+6. **Completeness was one list.** Runs now store a per-component verdict:
+   dataset (INCOMPLETE if a stream is missing in range *and* at the start, or
+   rows were corrupt, out of order, temporally invalid, carried past a limit,
+   or lost by capture), accounting (INCOMPLETE if funding or borrow is
+   unmeasured - an open perpetual leg counts as measured only if no settlement
+   fell while it was held), valuation (INCOMPLETE if the last valuation was not
+   complete or fills followed it), persistence (FAILED otherwise). **Decision:
+   unreproducible venue filters, sampled depth and serialized scheduling are
+   declared execution-model fidelity on every run, not INCOMPLETE** - they are
+   true of every run of this engine, and making them INCOMPLETE would make
+   INCOMPLETE mean nothing. `performance_rankable` is true only for
+   `COMPLETED` (`TestCompleteness`).
+7. **The fingerprint omitted observable fields.** Exchange timestamps, volume,
+   index price, level counts, rejected-row payloads and the request itself were
+   missing, and it covered only events the replay reached. It now covers the
+   requested range and markets, reference data (with each market's version),
+   initialization, every accepted event of the whole range and every rejection,
+   field-delimited; counters are `initialization_events`, `events_accepted`,
+   `events_rejected`, `events_replayed` (`TestFingerprint`, one case per field).
+8. **Fees were understated.** The report summed only completed trades' fees and
+   final equity omitted BNB-paid fees. It now reports every non-shadow fill's
+   fee split by wallet, completed-trade fees apart, slippage as attribution
+   only, subtracts BNB fees from economic equity, and reconciles final equity
+   (`TestReportAccounting`: open at end, one-leg and unequal partial fills,
+   entry fees with no trade, BNB-paid fees).
+9. **Metrics.** Average trade/win/loss, gross profit/loss, win/loss/breakeven
+   counts, per-strategy results, exposure time, turnover, return on peak
+   gross exposure, worst unhedged entry, theoretical edges apart.
+10. **Lifecycle races.** A cancel before start crashed `mark_running`; a late
+    cancel crashed `finish`; a slow run could be recovered as an orphan while
+    alive. Transitions are now conditional and idempotent, the heartbeat has
+    its own wall-clock task, a `LOST` row stops the run without overwriting
+    it, and the CLI announces the uid immediately (`TestLifecycleRaces`,
+    `test_run_announces_its_uid_before_replaying...`).
+11. **Cross-run links were possible.** Migration `d4a7c9e2f6b8` adds `run_key`
+    and composite foreign keys for the provenance links; PostgreSQL refuses a
+    cross-run or paper-to-run link from any writer
+    (`test_backtest_run_links`: 35 cases; linked rows survive upgrade and
+    downgrade in `test_migrations`).
+12. **Capture produced stale, incoherent samples.** Defaults (5 s quotes, 1 s
+    books, 2 s freshness) replayed as stale; quotes and books came from
+    different writers; a failed write was retried later as if captured.
+    Capture now writes one transactional sample, is the only quote writer while
+    on, records lost samples as `DATA_GAP` events that make an overlapping
+    replay INCOMPLETE, and `Settings` refuses a cadence above half the tightest
+    freshness limit. `trading-bot-backtest capture` reports rows and gaps from
+    the database (`test_replay_capture`).
+13. **Timestamps were trusted.** Replay now rejects naive timestamps, venue
+    clocks beyond `max_clock_skew_ms` ahead or `max_exchange_lag_ms` behind,
+    funding intervals no venue runs and next settlements already past or
+    beyond one interval. **Live change:** the strategy rejects a negative feed
+    latency as `CLOCK_SKEW` instead of passing it through `max_latency_ms`.
+14. **Scheduling.** Option B: serialization stays and is declared on every
+    run and report as an execution-model limitation; no parity claim.
+15. **Realism, reconfirmed**: concurrent legs leave at the same virtual instant
+    and fill on their own arrival books; cross-leg skew is recorded without
+    halting; open positions are valued, never force-closed; plus the existing
+    arrival-book, truncated-depth, taker-only, IOC-expiry, signal-expiry and
+    isolation tests.
+16. **Funding timing was unrealistic.** Funding was attributed only when a
+    position closed, so an open perpetual paid nothing until exit and daily
+    loss limits could not see open funding losses. A replay funding ledger now
+    posts each due settlement at virtual settlement time, records it durably in
+    `backtest_funding_payments`, and exposes the cash flow to snapshots and
+    daily P&L. A fill at the exact settlement instant is refused as ambiguous.
+17. **Initialization could hide valid rows behind ten bad rows.** The pre-start
+    query now reads every bounded-lookback candidate per stream; the validator
+    chooses the newest valid row instead of trusting an arbitrary limit.
+18. **Capture could publish a partial sample.** If any market's quote/book
+    snapshot fails during capture, the whole coherent sample is abandoned and
+    a gap names the affected market.
+19. **Dirty provenance was too coarse.** `backtest_runs` now stores a source
+    digest that distinguishes dirty worktrees sharing the same HEAD while
+    ignoring local `.claude-flow` bookkeeping; only the digest is stored.
+
+**Verification** (2026-09-15): ruff, format and mypy clean (128 source
+files); backend pytest passed locally with 1,041 passed and 322 skipped
+(Docker/Postgres-backed tests could not run because the Docker daemon was not
+available); frontend build and 10 tests pass. The skipped integration tests
+cover migration round trips, run isolation and replay persistence against real
+PostgreSQL, so they still need to run in an environment with Docker before a
+release tag. Synthetic datasets cover the trade-producing paths; **no complete
+real dataset exists; no real-data trade result is claimed.**
+
+### Limits
+
+- **No recorded dataset can exercise the pipeline yet.** Until capture has run,
+  every replay of real data is `INCOMPLETE` with no opportunities. All trades
+  in the test suite come from clearly synthetic datasets.
+- **Sampled books cannot show the market moving inside the latency.** With 1 s
+  capture a fill sees the latest sampled book at its arrival, usually the one
+  the decision saw. The report counts fills on a newer book so this is visible,
+  not assumed away. Capturing the diff stream would fix it at far higher cost.
+- **Venue filters are partly unreproducible.** `markets` stores only the
+  latest lot/notional/tick filters; price bounds, percent-price bands, maximum
+  notional and the spot average-price reference are not checked in replay.
+  Declared on every run.
+- **Execution is serialised** (declared on every run). No queue, so
+  `QUEUE_OVERLOAD` cannot occur, and a second signal in the same tick waits one
+  execution's latency (and may expire).
+- **Connection staleness is not modelled**; component ages are.
+- **Spot borrow is never measured.** Funding is measured only when recorded
+  settlement observations exist; a run ending with an open perpetual is
+  accounting-complete only through the settlements observed up to its end.
+- **Runs are not resumable**, and cancellation is observed per heartbeat.
+- **A run holds a database snapshot for its duration**: vacuum cannot reclaim
+  dead history rows meanwhile, and a server `idle_in_transaction_session_timeout`
+  shorter than a run ends it as `FAILED`.
+- **Retention still deletes datasets between runs.** `order_books` are purged
+  after 3 days by default; a later rerun of a purged range gets a different
+  fingerprint. Depth storage at scale is documented, not built
+  ([data-model.md](data-model.md)).
+- **Any recorded capture gap in range makes a run `INCOMPLETE`**, whichever
+  markets it affected.
+- **`execution.timeout_ms` stays wall-clock** in the simulator. The config
+  validator keeps it above the maximum latency, so it cannot fire in replay;
+  it is a hang guard, not a modelled outcome.
+- `core/config.py`, `marketdata/service.py` and `portfolio/store.py` were already over the 500-line
+  guideline before this phase; they grew slightly rather than being split here.

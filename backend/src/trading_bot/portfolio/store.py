@@ -12,6 +12,10 @@ model rewriting history either - the numbers come from the fills' own stored
 fees and prices - and a position already ``CLOSED`` is never revisited, which
 is where that guarantee is enforced rather than promised.
 
+**Every query is scoped to one mode and at most one backtest run** (see
+``db.scope.RunScope``). A paper store sees rows outside every run; a backtest
+store sees its own run and nothing else.
+
 **A position is claimed before it is closed.** ``claim`` row-locks the whole
 attempt, rejects a stale caller, and flips its live legs to ``CLOSING`` in one
 transaction, so two workers cannot both close the same position. The claim
@@ -26,11 +30,13 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Protocol
 
 from sqlalchemy import Row, Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trading_bot.core.logging import get_logger
+from trading_bot.db.models import BacktestFundingPayment
 from trading_bot.db.models import Fill as FillRow
 from trading_bot.db.models import Market as MarketRow
 from trading_bot.db.models import Order as OrderRow
@@ -42,6 +48,7 @@ from trading_bot.db.models.enums import (
     PositionStatus,
     Side,
 )
+from trading_bot.db.scope import RunScope
 from trading_bot.exchange.models import MarketRef
 from trading_bot.execution.models import OrderIntent
 from trading_bot.portfolio.accounting import FillLot, PositionPnl, position_pnl
@@ -57,18 +64,48 @@ logger = get_logger(__name__)
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
+class FundingAttributor(Protocol):
+    """Signed funding a flat perpetual leg paid or received, or ``None``.
+
+    ``None`` means the settlements it crossed could not all be determined
+    from recorded evidence - the position then names funding as unmeasured,
+    exactly as it did before anything could attribute it. Only a backtest
+    has a source today; paper positions stay unmeasured.
+    """
+
+    async def settled_funding(
+        self,
+        session: AsyncSession,
+        *,
+        market_id: int,
+        side: Side,
+        entries: Sequence[FillLot],
+        exits: Sequence[FillLot],
+    ) -> Decimal | None: ...
+
+
 class PortfolioStore:
     """Every durable read and write the portfolio subsystem makes."""
 
     def __init__(
-        self, session_factory: SessionFactory, *, mode: ExecutionMode = ExecutionMode.PAPER
+        self,
+        session_factory: SessionFactory,
+        *,
+        mode: ExecutionMode = ExecutionMode.PAPER,
+        backtest_run_id: int | None = None,
+        funding: FundingAttributor | None = None,
     ) -> None:
         self._session_factory = session_factory
-        self._mode = mode
+        self._scope = RunScope(mode, backtest_run_id)
+        self._funding = funding
 
     @property
     def mode(self) -> ExecutionMode:
-        return self._mode
+        return self._scope.mode
+
+    @property
+    def scope(self) -> RunScope:
+        return self._scope
 
     # --- reading --------------------------------------------------------
 
@@ -77,7 +114,7 @@ class PortfolioStore:
             select(PositionRow, MarketRow.symbol, MarketRow.market_type)
             .join(MarketRow, MarketRow.id == PositionRow.market_id)
             .where(
-                PositionRow.mode == self._mode,
+                *self._scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                 # A probe's exposure is hypothetical. It is never valued,
                 # never closed and never counted in a portfolio total.
                 PositionRow.is_shadow.is_(False),
@@ -136,7 +173,7 @@ class PortfolioStore:
                 await session.execute(
                     select(PositionRow.attempt_id)
                     .where(
-                        PositionRow.mode == self._mode,
+                        *self._scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                         PositionRow.is_shadow.is_(False),
                         PositionRow.attempt_id.is_not(None),
                         PositionRow.status == PositionStatus.CLOSED,
@@ -172,7 +209,7 @@ class PortfolioStore:
                 await session.execute(
                     select(PositionRow.attempt_id)
                     .where(
-                        PositionRow.mode == self._mode,
+                        *self._scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                         PositionRow.is_shadow.is_(False),
                         PositionRow.attempt_id.is_not(None),
                         PositionRow.closed_at < end,
@@ -207,10 +244,27 @@ class PortfolioStore:
         )
         return attempts
 
+    async def funding_cash_flow_between(self, start: datetime, end: datetime) -> Decimal | None:
+        """Replay funding paid in ``[start, end]``; unavailable outside replay.
+
+        Returning ``None`` for PAPER/LIVE keeps their existing P&L semantics:
+        those modes still have no durable funding settlement source.
+        """
+        if self._scope.backtest_run_id is None:
+            return None
+        async with self._session_factory() as session:
+            return await session.scalar(
+                select(func.sum(BacktestFundingPayment.amount_usd)).where(
+                    BacktestFundingPayment.backtest_run_id == self._scope.backtest_run_id,
+                    BacktestFundingPayment.settled_at >= start,
+                    BacktestFundingPayment.settled_at <= end,
+                )
+            ) or Decimal(0)
+
     async def _fill_lots(
         self, session: AsyncSession, position_ids: Sequence[int]
     ) -> dict[tuple[int, str], list[FillLot]]:
-        return await _fill_lots_for(session, self._mode, position_ids)
+        return await _fill_lots_for(session, self._scope, position_ids)
 
     # --- claiming -------------------------------------------------------
 
@@ -286,7 +340,7 @@ class PortfolioStore:
                 update(PositionRow)
                 .where(
                     PositionRow.id.in_(position_ids),
-                    PositionRow.mode == self._mode,
+                    *self._scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                     PositionRow.status == PositionStatus.CLOSING,
                     PositionRow.close_claim_id == claim.claim_id,
                     PositionRow.close_attempts == claim.sequence,
@@ -310,7 +364,13 @@ class PortfolioStore:
         if not position_ids:
             return []
         async with self._session_factory() as session:
-            return await reconcile_within(session, self._mode, position_ids, now=now)
+            return await reconcile_within(
+                session, self._scope, position_ids, now=now, funding=self._funding
+            )
+
+    @property
+    def funding(self) -> FundingAttributor | None:
+        return self._funding
 
     async def release_claim(
         self, position_ids: Sequence[int], *, claim_id: str, now: datetime
@@ -323,7 +383,7 @@ class PortfolioStore:
                 update(PositionRow)
                 .where(
                     PositionRow.id.in_(position_ids),
-                    PositionRow.mode == self._mode,
+                    *self._scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                     PositionRow.status == PositionStatus.CLOSING,
                     PositionRow.close_claim_id == claim_id,
                 )
@@ -346,7 +406,10 @@ class PortfolioStore:
             for position_id, (mark, unrealized) in marks.items():
                 await session.execute(
                     update(PositionRow)
-                    .where(PositionRow.id == position_id, PositionRow.mode == self._mode)
+                    .where(
+                        PositionRow.id == position_id,
+                        *self._scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
+                    )
                     .values(mark_price=mark, marked_at=now, unrealized_pnl_usd=unrealized)
                     .execution_options(synchronize_session=False)
                 )
@@ -354,10 +417,11 @@ class PortfolioStore:
 
 async def reconcile_within(
     session: AsyncSession,
-    mode: ExecutionMode,
+    scope: RunScope,
     position_ids: Sequence[int],
     *,
     now: datetime,
+    funding: FundingAttributor | None = None,
 ) -> list[int]:
     """Recompute positions from their fills **inside a caller's transaction**.
 
@@ -378,19 +442,30 @@ async def reconcile_within(
             .join(MarketRow, MarketRow.id == PositionRow.market_id)
             .where(
                 PositionRow.id.in_(position_ids),
-                PositionRow.mode == mode,
+                *scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                 PositionRow.status.in_(LIVE_POSITION_STATUSES),
             )
             .with_for_update(of=PositionRow)
         )
     ).all()
-    lots = await _fill_lots_for(session, mode, [row.id for row, _ in rows])
+    lots = await _fill_lots_for(session, scope, [row.id for row, _ in rows])
     for row, market_type in rows:
+        entries = tuple(lots.get((row.id, OrderIntent.OPEN.value), ()))
+        exits = tuple(lots.get((row.id, OrderIntent.CLOSE.value), ()))
+        funding_pnl: Decimal | None = Decimal(0) if market_type is MarketType.SPOT else None
+        if funding is not None and market_type is not MarketType.SPOT and _is_flat(entries, exits):
+            # Attributed only once the leg is flat: every settlement it
+            # crossed, and the size it held at each, is then fixed. A
+            # partially closed leg has no honest way to split funding
+            # between its closed and open parts, so it stays unmeasured.
+            funding_pnl = await funding.settled_funding(
+                session, market_id=row.market_id, side=row.side, entries=entries, exits=exits
+            )
         pnl = position_pnl(
             side=row.side,
-            entries=tuple(lots.get((row.id, OrderIntent.OPEN.value), ())),
-            exits=tuple(lots.get((row.id, OrderIntent.CLOSE.value), ())),
-            funding_pnl_usd=(Decimal(0) if market_type is MarketType.SPOT else None),
+            entries=entries,
+            exits=exits,
+            funding_pnl_usd=funding_pnl,
             borrow_cost_usd=None,
             borrows=market_type is MarketType.SPOT and row.side is Side.SELL,
         )
@@ -400,8 +475,14 @@ async def reconcile_within(
     return closed
 
 
+def _is_flat(entries: Sequence[FillLot], exits: Sequence[FillLot]) -> bool:
+    opened = sum((lot.quantity for lot in entries), Decimal(0))
+    closed = sum((lot.quantity for lot in exits), Decimal(0))
+    return opened > 0 and closed >= opened
+
+
 async def _fill_lots_for(
-    session: AsyncSession, mode: ExecutionMode, position_ids: Sequence[int]
+    session: AsyncSession, scope: RunScope, position_ids: Sequence[int]
 ) -> dict[tuple[int, str], list[FillLot]]:
     """Fills keyed by (position, order intent).
 
@@ -422,7 +503,10 @@ async def _fill_lots_for(
             OrderRow.expected_price,
         )
         .join(OrderRow, OrderRow.id == FillRow.order_id)
-        .where(FillRow.position_id.in_(position_ids), FillRow.mode == mode)
+        .where(
+            FillRow.position_id.in_(position_ids),
+            *scope.filters(FillRow.mode, FillRow.backtest_run_id),
+        )
         .order_by(FillRow.filled_at, FillRow.id)
     )
     lots: dict[tuple[int, str], list[FillLot]] = {}
@@ -519,6 +603,11 @@ def _group(
                 close_attempts=row.close_attempts,
                 entries=tuple(lots.get((row.id, OrderIntent.OPEN.value), ())),
                 exits=tuple(lots.get((row.id, OrderIntent.CLOSE.value), ())),
+                # Durable, and only ever set on a flat perpetual leg whose
+                # settlements were all determined; NULL stays unmeasured.
+                funding_pnl_usd=row.funding_pnl_usd
+                if row.status is PositionStatus.CLOSED
+                else None,
             )
         )
     assert mode is not None or not by_attempt

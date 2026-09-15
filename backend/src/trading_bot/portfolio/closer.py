@@ -117,6 +117,7 @@ class PositionCloser:
         venue: str,
         mode: ExecutionMode = ExecutionMode.PAPER,
         clock: Any = None,
+        worker_id: str | None = None,
     ) -> None:
         self._store = store
         self._session_factory = session_factory
@@ -128,10 +129,20 @@ class PositionCloser:
         self._venue = venue
         self._mode = mode
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._worker_id = uuid.uuid4().hex[:32]
+        # The claim id written to ``positions.close_claim_id``. Random for a
+        # service process; a replay names it so reruns write identical rows.
+        self._worker_id = worker_id or uuid.uuid4().hex[:32]
+        if store.mode is not mode:
+            raise ValueError(f"closer mode {mode.value} disagrees with its store's")
+        self._scope = store.scope
         self.closes = 0
         self.refusals = 0
         self.unhedged_closes = 0
+        # Attempts a sweep could not evaluate. The service keeps sweeping; a
+        # backtest fails the run, because a skipped exit is a result no real
+        # run would have had.
+        self.failures = 0
+        self.last_error: str | None = None
 
     async def run(self) -> None:
         while True:
@@ -166,6 +177,8 @@ class PositionCloser:
             except Exception as exc:
                 # One attempt that cannot be closed must not stop the others
                 # from being evaluated - the next one may be the naked leg.
+                self.failures += 1
+                self.last_error = f"{attempt.attempt_id}: {type(exc).__name__}: {exc}"
                 logger.exception(
                     "portfolio.exit_failed", attempt=attempt.attempt_id, error=str(exc)
                 )
@@ -395,8 +408,9 @@ class PositionCloser:
         are what make that convergence a guarantee rather than a hope.
         """
         async with self._session_factory() as session:
+            run_id = self._scope.backtest_run_id
             values = [
-                order_values(leg, request, result, attempt, intent_id, index)
+                order_values(leg, request, result, attempt, intent_id, index, run_id)
                 for index, (leg, request, result) in enumerate(
                     zip(legs, requests, results, strict=True)
                 )
@@ -404,17 +418,17 @@ class PositionCloser:
             statement = insert(OrderRow).values(values)
             await session.execute(
                 statement.on_conflict_do_update(
-                    constraint="mode_client_order_id",
+                    constraint="mode_run_client_order_id",
                     set_={
                         key: getattr(statement.excluded, key)
                         for key in values[0]
-                        if key not in {"mode", "client_order_id"}
+                        if key not in {"mode", "backtest_run_id", "client_order_id"}
                     },
                 )
             )
             stored = await session.execute(
                 select(OrderRow.id, OrderRow.client_order_id).where(
-                    OrderRow.mode == self._mode,
+                    *self._scope.filters(OrderRow.mode, OrderRow.backtest_run_id),
                     OrderRow.client_order_id.in_([row["client_order_id"] for row in values]),
                 )
             )
@@ -422,7 +436,7 @@ class PositionCloser:
             fills: list[dict[str, Any]] = []
             for leg, request, result in zip(legs, requests, results, strict=True):
                 order_id = order_ids[request.client_order_id]
-                fills.extend(fill_values(leg, result, order_id, self._mode))
+                fills.extend(fill_values(leg, result, order_id, self._mode, run_id))
             if fills:
                 fill_statement = insert(FillRow).values(fills)
                 await session.execute(
@@ -436,7 +450,11 @@ class PositionCloser:
                     )
                 )
             return await reconcile_within(
-                session, self._mode, [leg.position_id for leg in legs], now=now
+                session,
+                self._scope,
+                [leg.position_id for leg in legs],
+                now=now,
+                funding=self._store.funding,
             )
 
     async def _settle(self, legs: Sequence[LegRecord], results: Sequence[ExecutionResult]) -> None:

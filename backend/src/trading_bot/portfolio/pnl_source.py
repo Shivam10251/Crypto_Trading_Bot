@@ -110,6 +110,7 @@ class PortfolioPnlSource:
             latest = await self._store.latest_closed_attempts(
                 self._venue, now, limit=self._streak_limit
             )
+            funding = await self._store.funding_cash_flow_between(utc_day_start(now), now)
         except Exception as exc:
             # Keep nothing: a stale view is worse than an unavailable one for
             # a limit whose whole job is to notice a loss. The configured
@@ -120,7 +121,7 @@ class PortfolioPnlSource:
             self._read_at = now
             logger.error("portfolio.pnl_source_unreadable", error=str(exc))
             return
-        self._today = _today(today, now)
+        self._today = _today(today, now, funding_cash_flow_usd=funding)
         self._streak = _consecutive_losses(latest)
         self._read_at = now
 
@@ -132,7 +133,12 @@ class PortfolioPnlSource:
                     await self._refresh_unlocked()
 
 
-def _today(completed: list[AttemptRecord], now: datetime) -> RealizedPnl:
+def _today(
+    completed: list[AttemptRecord],
+    now: datetime,
+    *,
+    funding_cash_flow_usd: Decimal | None = None,
+) -> RealizedPnl:
     """Net realised P&L over the attempts that completed today, UTC."""
     start = utc_day_start(now)
     net = Decimal(0)
@@ -142,11 +148,20 @@ def _today(completed: list[AttemptRecord], now: datetime) -> RealizedPnl:
         trade = attempt.paired()
         if trade.closed_at is None or trade.closed_at < start or not trade.is_complete:
             continue
-        net += trade.realized_pnl_usd
+        value = trade.realized_pnl_usd
+        if funding_cash_flow_usd is not None:
+            # Replay funding is recognized on its settlement day. Remove the
+            # same amount from trades closing today before adding today's
+            # durable payments below, otherwise it would be counted twice and
+            # funding settled on an earlier day would move to the close day.
+            value -= sum((leg.funding_pnl_usd or Decimal(0) for leg in trade.legs), Decimal(0))
+        net += value
         trades += 1
         for component in trade.unmeasured:
             if component not in unmeasured:
                 unmeasured.append(component)
+    if funding_cash_flow_usd is not None:
+        net += funding_cash_flow_usd
     return RealizedPnl(
         net_usd=net,
         trades=trades,

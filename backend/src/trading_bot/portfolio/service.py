@@ -32,17 +32,17 @@ from typing import Any
 
 from trading_bot.core.config import PortfolioConfig
 from trading_bot.core.logging import get_logger
+from trading_bot.portfolio.book_value import PortfolioState, value_book
 from trading_bot.portfolio.closer import PositionCloser
+from trading_bot.portfolio.incremental import CurveFigures, CurveTally, TradeTally, WindowTally
 from trading_bot.portfolio.pnl_source import PortfolioPnlSource, utc_day_start
 from trading_bot.portfolio.snapshots import (
     WINDOW_ALL,
     WINDOW_DAY,
     WINDOW_SESSION,
-    PortfolioState,
     SnapshotWriter,
     Window,
     floor_to,
-    value_book,
 )
 from trading_bot.portfolio.store import PortfolioStore
 from trading_bot.portfolio.valuation import MarkReader
@@ -68,6 +68,7 @@ class PortfolioService:
         config: PortfolioConfig,
         venue: str,
         clock: Callable[[], datetime] = _utcnow,
+        incremental: bool = False,
     ) -> None:
         self._store = store
         self._writer = writer
@@ -84,6 +85,17 @@ class PortfolioService:
         # the life of the process. A retry inside one interval re-emits the
         # same rows and the unique constraint upserts them.
         self._last_position_rows_at: datetime | None = None
+        # Folding trades and equity points in, instead of re-reading history
+        # every snapshot, is only correct for a single writer - see
+        # ``portfolio.incremental``. A replay turns it on; the service does not.
+        self._incremental = incremental
+        self._trades_through: datetime | None = None
+        self._tallies: dict[str, WindowTally] = {}
+        if incremental:
+            self._tallies = {
+                WINDOW_ALL: self._tally(None),
+                WINDOW_SESSION: self._tally(self._session_start),
+            }
         self.snapshots_written = 0
         self.pnl_rows_written = 0
         self.snapshot_failures = 0
@@ -108,15 +120,28 @@ class PortfolioService:
 
     # --- one snapshot ---------------------------------------------------
 
-    async def snapshot(self) -> PortfolioState:
-        """Value the book, persist it, and refresh what risk reads."""
+    async def snapshot(self, *, at_instant: bool = False) -> PortfolioState:
+        """Value the book, persist it, and refresh what risk reads.
+
+        Rows are stamped with the snapshot grid's floor, so retries share a
+        key. ``at_instant`` stamps the exact clock instant instead - only for
+        a replay's terminal valuation at a requested end between two grid
+        points, where the floor would already hold the previous valuation.
+        Such a point is off the grid, so no return series includes it.
+        """
         now = self._clock()
-        captured_at = floor_to(now, self._interval)
+        captured_at = now if at_instant else floor_to(now, self._interval)
         attempts = await self._store.live_attempts(self._venue)
         cash = await self._writer.cash()
-        completed = await self._store.attempts_closed_between(self._venue, None, now)
+        completed = await self._store.attempts_closed_between(
+            self._venue, self._trades_through if self._incremental else None, now
+        )
         trades = [attempt.paired() for attempt in completed]
-        realized = sum((trade.realized_pnl_usd for trade in trades), Decimal(0))
+        if self._incremental:
+            self._fold_trades(trades, now)
+            realized = self._tallies[WINDOW_ALL].trades.net
+        else:
+            realized = sum((trade.realized_pnl_usd for trade in trades), Decimal(0))
         state = value_book(
             attempts,
             self._marks,
@@ -125,6 +150,9 @@ class PortfolioService:
             captured_at=captured_at,
         )
         await self._writer.write_portfolio(state)
+        if self._incremental and state.equity_usd is not None:
+            for tally in self._tallies.values():
+                tally.add_point(captured_at, state.equity_usd)
         # The per-position mark is written after the snapshot, so a position's
         # own row can never claim a mark the portfolio total did not use.
         await self._store.record_marks(state.marks, now=captured_at)
@@ -147,6 +175,29 @@ class PortfolioService:
         )
         return state
 
+    def _tally(self, start: datetime | None) -> WindowTally:
+        return WindowTally(
+            start=start,
+            curve=CurveTally(
+                interval=self._writer.interval,
+                risk_free_per_period=self._writer.risk_free_per_period,
+            ),
+        )
+
+    def _fold_trades(self, trades: list[Any], now: datetime) -> None:
+        """Fold in trades completed since the last snapshot; roll the UTC day."""
+        day_start = utc_day_start(now)
+        current = self._tallies.get(WINDOW_DAY)
+        if current is None or current.start != day_start:
+            # Everything folded before closed before this day began.
+            self._tallies[WINDOW_DAY] = self._tally(day_start)
+        for trade in trades:
+            for tally in self._tallies.values():
+                tally.add_trade(trade)
+        # Advanced before anything is written: a snapshot that fails after
+        # this must not fold the same trades in twice when it is retried.
+        self._trades_through = now
+
     async def _write_pnl(
         self,
         state: PortfolioState,
@@ -155,6 +206,8 @@ class PortfolioService:
         now: datetime,
         captured_at: datetime,
     ) -> int:
+        if self._incremental:
+            return await self._write_folded_pnl(state, completed, now, captured_at)
         windows = (
             Window(WINDOW_DAY, utc_day_start(now), now),
             Window(WINDOW_SESSION, self._session_start, now),
@@ -193,6 +246,45 @@ class PortfolioService:
                         # an account-level figure, so the ratios that need one
                         # stay NULL here rather than borrowing the portfolio's.
                         curve=(),
+                        strategy=strategy,
+                        unrealized_pnl_usd=state.strategy_unrealized_pnl_usd.get(
+                            strategy, Decimal(0)
+                        ),
+                        additional_unmeasured=state.strategy_unmeasured_pnl.get(strategy, ()),
+                    )
+                )
+        rows.extend(self._position_rows(completed))
+        return await self._writer.write_pnl(rows)
+
+    async def _write_folded_pnl(
+        self, state: PortfolioState, completed: list[Any], now: datetime, captured_at: datetime
+    ) -> int:
+        """The same rows as ``_write_pnl``, from the folded tallies."""
+        minimum = self._writer.minimum_observations
+        empty_curve = CurveFigures(None, None, 0, None, None)
+        rows: list[dict[str, Any]] = []
+        for name in (WINDOW_DAY, WINDOW_SESSION, WINDOW_ALL):
+            tally = self._tallies[name]
+            window = Window(name, tally.start, now)
+            rows.append(
+                self._writer.row(
+                    window=window,
+                    captured_at=captured_at,
+                    trades=tally.trades.figures(),
+                    curve=tally.curve.figures(minimum=minimum),
+                    unrealized_pnl_usd=state.unrealized_pnl_usd,
+                    equity_usd=state.equity_usd,
+                    additional_unmeasured=state.unmeasured_pnl,
+                )
+            )
+            strategies = set(tally.strategies) | set(state.strategy_unrealized_pnl_usd)
+            for strategy in sorted(strategies):
+                rows.append(
+                    self._writer.row(
+                        window=window,
+                        captured_at=captured_at,
+                        trades=tally.strategies.get(strategy, TradeTally()).figures(),
+                        curve=empty_curve,
                         strategy=strategy,
                         unrealized_pnl_usd=state.strategy_unrealized_pnl_usd.get(
                             strategy, Decimal(0)

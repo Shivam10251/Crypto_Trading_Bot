@@ -31,6 +31,14 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_bot.db.base import Base, RecordMixin
+from trading_bot.db.models.backtest import (
+    BACKTEST_MODE_HAS_RUN,
+    RUN_KEY_MATCHES_RUN,
+    backtest_run_fk,
+    run_key_column,
+    run_key_target,
+    run_scoped_fk,
+)
 from trading_bot.db.models.enum_types import (
     EXECUTION_MODE,
     OPPORTUNITY_STATUS,
@@ -69,7 +77,11 @@ class Opportunity(Base, RecordMixin):
     samples: Mapped[int | None] = mapped_column(Integer)
     strategy: Mapped[str] = mapped_column(String(STRATEGY_NAME_LENGTH), nullable=False)
     # THEORETICAL here: detection is independent of how it would be executed.
+    # BACKTEST for an opportunity found while replaying history, which is
+    # never research evidence about the live market.
     mode: Mapped[ExecutionMode] = mapped_column(EXECUTION_MODE, nullable=False)
+    backtest_run_id: Mapped[int | None] = backtest_run_fk()
+    run_key: Mapped[int] = run_key_column()
 
     # --- legs -------------------------------------------------------------
     market_id: Mapped[int] = mapped_column(
@@ -164,11 +176,29 @@ class Opportunity(Base, RecordMixin):
         foreign_keys=[market_data_id], lazy="raise"
     )
     signals: Mapped[list[Signal]] = relationship(
-        back_populates="opportunity", lazy="raise", cascade="all, delete-orphan"
+        back_populates="opportunity",
+        primaryjoin="Opportunity.id == Signal.opportunity_id",
+        foreign_keys="[Signal.opportunity_id]",
+        lazy="raise",
+        cascade="all, delete-orphan",
     )
 
     __table_args__ = (
-        Index("ix_opportunities_uid", "uid", unique=True),
+        # Links within one run only (``backtest.run_key_column``).
+        CheckConstraint(RUN_KEY_MATCHES_RUN, name="run_key_matches_run"),
+        run_key_target(),
+        # Episode uids are deterministic under replay, so the same uid can
+        # legitimately appear once per run. NULLS NOT DISTINCT keeps uids
+        # outside any run globally unique, exactly as before.
+        UniqueConstraint(
+            "backtest_run_id",
+            "uid",
+            name="run_opportunity_uid",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_opportunities_uid", "uid"),
+        Index("ix_opportunities_run_detected", "backtest_run_id", "detected_at"),
+        CheckConstraint(BACKTEST_MODE_HAS_RUN, name="backtest_mode_has_run"),
         # Research queries: by time, by strategy, by outcome.
         Index("ix_opportunities_detected_at", "detected_at"),
         Index("ix_opportunities_strategy_detected", "strategy", "detected_at"),
@@ -218,9 +248,11 @@ class Signal(Base, RecordMixin):
 
     __tablename__ = "signals"
 
-    opportunity_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("opportunities.id", ondelete="CASCADE"), nullable=False
-    )
+    opportunity_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Always the parent opportunity's run. Carried so a query over signals is
+    # scoped by a column of its own rather than by remembering to join.
+    backtest_run_id: Mapped[int | None] = backtest_run_fk()
+    run_key: Mapped[int] = run_key_column()
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     strategy: Mapped[str] = mapped_column(String(STRATEGY_NAME_LENGTH), nullable=False)
     market_id: Mapped[int] = mapped_column(
@@ -243,14 +275,24 @@ class Signal(Base, RecordMixin):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reason: Mapped[str | None] = mapped_column(Text)
 
-    opportunity: Mapped[Opportunity] = relationship(back_populates="signals", lazy="raise")
+    opportunity: Mapped[Opportunity] = relationship(
+        back_populates="signals",
+        primaryjoin="Opportunity.id == Signal.opportunity_id",
+        foreign_keys=[opportunity_id],
+        lazy="raise",
+    )
     market: Mapped[Market] = relationship(lazy="raise")
 
     __table_args__ = (
+        # Links within one run only (``backtest.run_key_column``).
+        CheckConstraint(RUN_KEY_MATCHES_RUN, name="run_key_matches_run"),
+        run_key_target(),
+        run_scoped_fk("opportunity_id", "opportunities", ondelete="CASCADE"),
         UniqueConstraint("opportunity_id", "market_id", "side", name="opportunity_market_side"),
         Index("ix_signals_generated_at", "generated_at"),
         Index("ix_signals_opportunity", "opportunity_id"),
         Index("ix_signals_status_generated", "status", "generated_at"),
+        Index("ix_signals_run_generated", "backtest_run_id", "generated_at"),
         CheckConstraint("quantity > 0", name="quantity_positive"),
         CheckConstraint("target_entry_price > 0", name="entry_price_positive"),
     )

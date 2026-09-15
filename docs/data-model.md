@@ -1,6 +1,6 @@
 # Data Model
 
-Status: **implemented.** 13 tables, nine migrations. Phase 1 built the
+Status: **implemented.** 16 tables, thirteen migrations. Phase 1 built the
 schema; Phase 2 corrected the exchange-timestamp assumption after checking the
 live Binance API; Phase 3's market-data service is the first writer of
 `markets`, `market_data` and `system_events`; Phase 4 added
@@ -21,6 +21,13 @@ existed since Phase 1 but had never had a writer until Phase 9. The ninth
 (`e4f70b2c8d13`, Phase 10) adds the **exit** half of `positions` and the
 honesty columns both snapshot tables needed - see
 [What a position records after Phase 10](#what-a-position-records-after-phase-10).
+The tenth (`b5d9e2c4a7f1`, Phase 11) installs the enum CHECK constraints this
+document had always claimed existed, and the eleventh (`c8e1f3a5b9d2`) adds
+`backtest_runs`, run isolation on every result table, `funding_observations`
+and book completeness flags. The twelfth (`d4a7c9e2f6b8`, Phase 11 hardening)
+makes every provenance link run-scoped in the database, and the thirteenth
+(`e8b1f4c7d2a9`) adds replay funding cash flows plus a dirty-worktree source
+digest - see [Backtest runs](#backtest-runs-and-run-isolation).
 
 ## Traceability requirement
 
@@ -58,6 +65,9 @@ records the limit, the observed value and the reason.
 | `portfolio_snapshots` | Cash, exposure, equity over time | `equity_usd`, `valuation_status` |
 | `pnl_snapshots` | Performance metrics per window | Sharpe, Sortino, drawdown, `scope_key` |
 | `system_events` | Connects, gaps, errors, reconciliation | JSONB `context` |
+| `funding_observations` | Each perpetual funding poll, as received (Phase 11 capture) | `next_funding_time`, `local_timestamp` |
+| `backtest_runs` | One historical replay: identity, dataset, configuration, lifecycle | `run_uid`, `status`, `config_hash` |
+| `backtest_funding_payments` | Settled funding cash flows posted during a replay | `position_id`, `settled_at`, `amount_usd` |
 
 Two legs are first-class on `opportunities` (`market_id` +
 `secondary_market_id`) because the first strategy trades spot against
@@ -130,10 +140,16 @@ win rate, profit factor) are `double precision`, where precision loss is
 harmless. A unit test walks every table and fails if money lands in a float
 column.
 
-**Enums are `VARCHAR` + `CHECK`, not native PostgreSQL enums.** The database
-still rejects invalid values, but later phases will add order states, risk event
-types and strategies. Extending a native enum needs `ALTER TYPE`, which cannot
-run inside a transaction and makes migrations fragile.
+**Enums are `VARCHAR` + `CHECK`, not native PostgreSQL enums.** Later phases
+add order states, risk event types and strategies, and extending a native enum
+needs `ALTER TYPE`, which cannot run inside a transaction. Until Phase 11 the
+CHECK half did not exist: `create_constraint=True` had never been passed, so
+only the ORM refused a bad value and any raw writer could store one. Migration
+`b5d9e2c4a7f1` installs one constraint per enum column
+(`ck_<table>_<enum>`), after scanning existing rows and refusing - with the
+offending values and counts - if any would violate it. Adding an enum member
+now needs a migration that recreates those constraints; a unit test and the
+catalog parity test fail until it has one.
 
 **Both clocks are stored, when the venue provides one.**
 `local_timestamp` is always present; `exchange_timestamp` is nullable because
@@ -150,14 +166,16 @@ research dataset. A locked book (`bid == ask`) is unusual but real, so it is
 allowed.
 
 **Duplicate protection is a constraint, not a code path.** `orders` is unique
-on `(mode, client_order_id)`, so a retry after a timeout cannot create a second
-order. `trades_market` is unique on `(market_id, exchange_trade_id)` and
+on `(mode, backtest_run_id, client_order_id)` `NULLS NOT DISTINCT`, so a retry
+after a timeout cannot create a second order, in or out of a run. `trades_market` is unique on `(market_id, exchange_trade_id)` and
 `fills` on `(order_id, exchange_fill_id)`, so a replayed WebSocket message
 cannot double-count.
 
-**`mode` is on every result row.** `THEORETICAL`, `PAPER` and `LIVE` are stored
-separately in orders, fills, positions and both snapshot tables. Aggregates must
-filter on it; mixing the three produces a number that describes nothing.
+**`mode` is on every result row.** `THEORETICAL`, `PAPER`, `LIVE` and
+`BACKTEST` are stored separately in opportunities, orders, fills, positions,
+risk events and both snapshot tables. Aggregates must filter on it; mixing
+them produces a number that describes nothing. `BACKTEST` rows additionally
+carry their run, and aggregates filter on that too.
 
 **Realized P&L is stored, not derived on read.** It depends on the fee and
 slippage assumptions in force at the time; recomputing it later against changed
@@ -219,6 +237,124 @@ state its sampling interval. `scope_key` is the non-null rendering of
 (`strategy`, `position_id`) that idempotency keys on, because a unique
 constraint over NULLs does not deduplicate in PostgreSQL and snapshot
 idempotency has to be a constraint rather than a convention.
+
+## Backtest runs and run isolation
+
+A replay writes the same kinds of rows paper execution does, through the same
+stores - and, being deterministic, the *same identities*: two runs over one
+week produce identical client order ids, intent ids and snapshot instants.
+`mode` cannot keep them apart, so every result table carries
+`backtest_run_id`:
+
+| Rule | Enforced by |
+| --- | --- |
+| `BACKTEST` rows have a run, and only they do | `ck_<table>_backtest_mode_has_run` on every table with `mode` |
+| a run's rows go when the run does | `ON DELETE CASCADE` from `backtest_runs` |
+| uniqueness per run, unchanged outside one | keys below |
+| every read is scoped to one mode and at most one run | `db.scope.RunScope` in every store; `IS NULL` outside a run, never "any run" |
+
+| Old key | Now |
+| --- | --- |
+| `orders (mode, client_order_id)` | `(mode, backtest_run_id, client_order_id)` NULLS NOT DISTINCT |
+| `orders (mode, execution_intent_id, signal_leg)` | partial unique indexes: `(mode, ...) WHERE backtest_run_id IS NULL` and `(backtest_run_id, ...) WHERE backtest_run_id IS NOT NULL` |
+| `positions (mode, attempt_id, market_id)` | the same pair of partial indexes |
+| `risk_events (mode, intent_id, event_type)` | `(mode, backtest_run_id, intent_id, event_type)` NULLS NOT DISTINCT |
+| `portfolio_snapshots (mode, captured_at)` | `(mode, backtest_run_id, captured_at)` NULLS NOT DISTINCT |
+| `pnl_snapshots (mode, captured_at, window, scope_key)` | with `backtest_run_id`, NULLS NOT DISTINCT |
+| `opportunities (uid)` unique index | `(backtest_run_id, uid)` NULLS NOT DISTINCT |
+
+`NULLS NOT DISTINCT` (PostgreSQL 15+) is used only where every other key column
+is `NOT NULL`, so rows outside a run deduplicate exactly as before. The two
+keys with nullable columns became partial indexes instead: all 80 orders in
+the development database predate `execution_intent_id`, and `NULLS NOT
+DISTINCT` would have made them collide.
+
+**Links cannot cross a run** (`d4a7c9e2f6b8`). Filtering every read by run
+protects the stores; it did not stop *a writer* linking a paper fill to a
+backtest order. `opportunities`, `signals`, `risk_events`, `orders`,
+`positions`, `fills` and `pnl_snapshots` carry `run_key BIGINT NOT NULL` =
+`COALESCE(backtest_run_id, 0)` - set by a `BEFORE INSERT OR UPDATE` trigger
+for every writer and pinned by `ck_<table>_run_key_matches_run` - and each
+referenced table has `UNIQUE (id, run_key)`. Every provenance foreign key is
+composite:
+
+| Link | Foreign key | On delete |
+| --- | --- | --- |
+| signal → opportunity | `(opportunity_id, run_key)` | CASCADE |
+| risk event → signal | `(signal_id, run_key)` | SET NULL (`signal_id`) |
+| order → signal | `(signal_id, run_key)` | SET NULL (`signal_id`) |
+| order → risk event | `(risk_event_id, run_key)` | SET NULL (`risk_event_id`) |
+| fill → order | `(order_id, run_key)` | CASCADE |
+| fill → position | `(position_id, run_key)` | SET NULL (`position_id`) |
+| position → opportunity | `(opportunity_id, run_key)` | SET NULL (`opportunity_id`) |
+| P&L snapshot → position | `(position_id, run_key)` | SET NULL (`position_id`) |
+
+`run_key` is 0 outside a run, so - unlike `backtest_run_id` - it joins a key
+that is always checked (a NULL column would make `MATCH SIMPLE` skip it). A NULL
+link is still allowed; deletion behaves exactly as before, nulling only the
+link column (PostgreSQL 15+ column lists). It is an ordinary column, not a
+generated one, because PostgreSQL refuses `SET NULL` on a key containing a
+generated column. Existing rows validate unchanged; the migration upgrades and
+downgrades without touching data.
+
+`backtest_runs` records a stable `run_uid`, `status` (`PENDING`, `RUNNING`,
+`COMPLETED`, `INCOMPLETE`, `FAILED`, `CANCELLED`), the data source, the
+requested and actually replayed range, markets, the configuration snapshot and
+its SHA-256, the git revision, whether source files were dirty and a source
+digest for the dirty tree, wall-clock lifecycle timestamps (created, started,
+heartbeat, cancel requested,
+completed), a failure reason, counts (`initialization_events`,
+`events_accepted`, `events_rejected`, `events_replayed`, evaluations,
+opportunities, orders, fills, completed trades - defined in
+`backtest.runs.RunProgress`), warnings, dataset issues, a dataset fingerprint
+over the complete validated input, and `completeness`: the per-component
+verdict (dataset, execution model, accounting, valuation, persistence) and
+whether performance is rankable. CHECKs require a
+terminal run to have `completed_at`, a started run `started_at`, and a failed
+run its reason.
+
+**Downgrading `c8e1f3a5b9d2` refuses while any run exists**; `alembic -x
+purge_backtests=true downgrade ...` deletes them deliberately.
+
+### What replay reads
+
+`order_books` gained `bids_complete` / `asks_complete`: a capped snapshot's
+last level means "unknown beyond", so a replayed walk past it is
+`DEPTH_TRUNCATED`, not "no liquidity". `funding_observations` keeps every
+funding poll with its receipt time, unique per `(market_id, local_timestamp)`;
+only an observation shortly before a settlement can say what that settlement
+charged. Both are written only by opt-in capture, in one transaction per
+sample with the quotes of the same instant; a sample that could not be written
+is recorded as a `DATA_GAP` system event (component `replay_capture`) and
+makes an overlapping replay `INCOMPLETE`. A running replay reads one snapshot,
+so retention cannot remove pages it has not read yet; `order_books` retention
+(3 days) still deletes a dataset before a long-delayed *rerun*, whose
+fingerprint then differs. `funding_observations` is not purged.
+
+**Depth storage at scale.** The upper bound quoted for capture - about 17 GB a
+day for 50 markets × 2 sides × 50 levels at 1 s - is JSON text arithmetic
+(~40 bytes a level); JSONB and TOAST compression make the stored size smaller
+by an amount this repository has **not measured**. Beyond short research
+windows, one `order_books` table with row-by-row retention deletes will not
+scale. In order of effort: raise `retention.order_books_days` only for windows
+you intend to replay and run `trading-bot-backtest capture` to confirm what
+landed; partition `order_books` by day on `local_timestamp` so retention drops
+partitions instead of deleting rows; store levels as parallel `numeric[]`
+price/size arrays (or fixed-point integers) instead of JSONB text pairs;
+export closed days to columnar files (Parquet) and give replay a file-backed
+`HistoricalDataSource`. None is implemented.
+
+`backtest_funding_payments` is the replay ledger of actual settled funding:
+one row per run, position and settlement, idempotent on
+`(run_key, position_id, settled_at)`, with the observed rate, mark, quantity
+and signed USD cash flow. It is linked to `positions` by the same run key the
+rest of the replay provenance uses, so a funding payment cannot point across
+runs. The paper account applies the same signed amount before snapshots and
+risk loss limits read cash. `positions.funding_pnl_usd` is still set, in a
+backtest, for a flat perpetual leg whose every crossed settlement was
+determinable; otherwise it stays NULL and named in `unmeasured_pnl`. Open
+perpetual legs are complete to date when every settlement up to the replay end
+was observed. Spot borrow remains unmeasured.
 
 **Deletes protect the audit trail.** Raw market data cascades with its market,
 but `positions`, `orders` and `signals` use `RESTRICT` or `SET NULL` — a market

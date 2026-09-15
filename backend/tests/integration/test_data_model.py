@@ -105,7 +105,7 @@ class TestDuplicateProtection:
         db.add(make_order(market, client_order_id="dup-1"))
         await db.flush()
         db.add(make_order(market, client_order_id="dup-1"))
-        with pytest.raises(IntegrityError, match="mode_client_order_id"):
+        with pytest.raises(IntegrityError, match="mode_run_client_order_id"):
             await db.flush()
 
     async def test_same_id_in_a_different_mode_is_allowed(self, db: AsyncSession) -> None:

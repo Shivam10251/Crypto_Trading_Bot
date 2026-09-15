@@ -35,12 +35,13 @@ from trading_bot.exchange.base import ExchangeAdapter
 from trading_bot.exchange.binance import BinanceExchangeAdapter
 from trading_bot.exchange.errors import ExchangeError
 from trading_bot.exchange.models import MarketDataSubscription, MarketRef, MarketSpec
-from trading_bot.execution.account import PaperAccount, PaperPositionSeed
+from trading_bot.execution.account import PaperAccount, PaperPositionSeed, paper_account_for
 from trading_bot.execution.coordinator import ExecutionAttempt, ExecutionCoordinator
 from trading_bot.execution.dispatcher import ExecutionDispatcher
 from trading_bot.execution.paper import PaperExecutionAdapter
 from trading_bot.execution.recorder import ExecutionRecorder
 from trading_bot.execution.shadow import choose_probe, probe_signal
+from trading_bot.marketdata.capture import ReplayCaptureRecorder
 from trading_bot.marketdata.engine import MarketDataEngine
 from trading_bot.marketdata.funding import FundingTracker
 from trading_bot.marketdata.models import MarketDataEvent
@@ -123,11 +124,18 @@ async def run_service(
         )
         wants_database = (
             config.persist
+            or config.capture.enabled
             or (settings.opportunities.persist and strategies is not None)
             or wants_execution
         )
         opened = await _open_recorders(settings, list(universe.specs)) if wants_database else None
         recorder, market_ids = opened if opened is not None else (None, {})
+        # Phase 11: depth and funding for replay, only when asked for.
+        capture = (
+            ReplayCaptureRecorder(market_ids, session_scope, config.capture)
+            if market_ids and config.capture.enabled
+            else None
+        )
         opportunities = (
             OpportunityRecorder(
                 market_ids,
@@ -249,7 +257,11 @@ async def run_service(
             recorder.record_event(
                 _service_event(SystemEventType.STARTUP, f"started: {universe.describe()}")
             )
-            persistence = f"market_data every {config.persist_interval_ms} ms"
+            persistence = (
+                f"replay capture every {config.capture.interval_ms} ms"
+                if capture is not None
+                else f"market_data every {config.persist_interval_ms} ms"
+            )
             if opportunities is not None:
                 persistence += (
                     f" + opportunities every {settings.opportunities.flush_interval_ms} ms"
@@ -276,6 +288,17 @@ async def run_service(
                 tasks.append(asyncio.create_task(monitor.run(), name="market-monitor"))
                 if recorder is not None:
                     tasks.append(asyncio.create_task(recorder.run(engine.snapshots)))
+                if capture is not None:
+                    tasks.append(
+                        asyncio.create_task(
+                            capture.run(
+                                engine,
+                                universe.refs,
+                                lambda: funding.rates if funding is not None else {},
+                            ),
+                            name="replay-capture",
+                        )
+                    )
                 if strategies is not None and funding is not None:
                     runner, cost_summary = strategies
                     tasks.append(asyncio.create_task(funding.run(), name="funding-tracker"))
@@ -467,6 +490,7 @@ async def _open_recorders(
             market_ids,
             session_scope,
             interval_seconds=settings.market_data.persist_interval_ms / 1000,
+            quotes=not settings.market_data.capture.enabled,
         )
         if settings.market_data.persist
         else None
@@ -678,14 +702,7 @@ def _build_portfolio(
 
 def _paper_account(settings: Settings) -> PaperAccount:
     """An empty paper ledger built from configuration."""
-    return PaperAccount(
-        settings.execution,
-        settings.risk,
-        pays_fees_in_bnb=settings.costs.pay_fees_in_bnb,
-        max_fee_bps=Decimal(
-            str(max(settings.costs.spot_taker_fee_bps, settings.costs.perp_taker_fee_bps))
-        ),
-    )
+    return paper_account_for(settings)
 
 
 async def _restore_paper_account(settings: Settings) -> PaperAccount:

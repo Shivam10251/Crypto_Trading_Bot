@@ -29,6 +29,7 @@ from trading_bot.db.models import Fill as FillRow
 from trading_bot.db.models import Order as OrderRow
 from trading_bot.db.models import Position as PositionRow
 from trading_bot.db.models.enums import ExecutionMode, OrderStatus, PositionStatus
+from trading_bot.db.scope import RunScope
 from trading_bot.exchange.models import MarketRef
 from trading_bot.execution.coordinator import ExecutionAttempt, LegOutcome
 from trading_bot.execution.models import ExecutionResult, OrderIntent
@@ -48,6 +49,7 @@ def order_row(
     *,
     opportunity_uid: uuid.UUID | None,
     is_shadow: bool,
+    backtest_run_id: int | None = None,
 ) -> dict[str, Any] | None:
     """One leg as an ``orders`` row, or ``None`` if its market is unknown."""
     result = outcome.result
@@ -58,6 +60,7 @@ def order_row(
     return {
         "market_id": market_id,
         "mode": result.mode,
+        "backtest_run_id": backtest_run_id,
         "opportunity_uid": opportunity_uid,
         "is_shadow": is_shadow,
         "risk_event_id": request.risk_event_id,
@@ -125,12 +128,14 @@ def fill_rows(
     mode: ExecutionMode,
     *,
     position_id: int | None = None,
+    backtest_run_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """One row per simulated execution; a partial fill produces fewer, not none."""
     return [
         {
             "order_id": order_id,
             "mode": mode,
+            "backtest_run_id": backtest_run_id,
             "position_id": position_id,
             # NULL: no venue produced this, and inventing an id would make a
             # simulated fill indistinguishable from a real one.
@@ -166,21 +171,36 @@ class ExecutionRecorder:
         session_factory: SessionFactory,
         *,
         interval_seconds: float,
+        backtest_run_id: int | None = None,
     ) -> None:
         self._market_ids = market_ids
         self._session_factory = session_factory
         self._interval = interval_seconds
+        # Rows are stamped with the run and every read-back is filtered by it:
+        # a replay's deterministic client ids repeat across runs by design.
+        self._backtest_run_id = backtest_run_id
         self._pending: list[tuple[ExecutionAttempt, uuid.UUID | None]] = []
         self.orders_written = 0
         self.fills_written = 0
         self.unhedged = 0
         self.failures = 0
+        # Attempts lost for good: pushed out of a full queue, or naming a
+        # market with no ``markets`` row. The service logs and carries on; a
+        # backtest treats either as a failed run.
+        self.dropped = 0
+        self.unregistered = 0
+        self.last_error: str | None = None
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
 
     def record(self, attempt: ExecutionAttempt, opportunity_uid: uuid.UUID | None = None) -> None:
         """Queue one attempt; written with the next flush."""
         if len(self._pending) >= MAX_PENDING_ATTEMPTS:
             logger.warning("execution.attempt_dropped", attempt=attempt.attempt_id)
             self._pending.pop(0)
+            self.dropped += 1
         self._pending.append((attempt, opportunity_uid))
         if not attempt.is_hedged and not attempt.is_empty:
             self.unhedged += 1
@@ -205,9 +225,11 @@ class ExecutionRecorder:
                     self._market_ids,
                     opportunity_uid=opportunity_uid,
                     is_shadow=attempt.is_shadow,
+                    backtest_run_id=self._backtest_run_id,
                 )
                 if row is None:
                     logger.warning("execution.market_not_registered", market=str(outcome.leg.ref))
+                    self.unregistered += 1
                     continue
                 rows.append((outcome, row))
         if not rows:
@@ -217,8 +239,11 @@ class ExecutionRecorder:
             async with self._session_factory() as session:
                 written = await self._write(session, rows)
         except Exception as exc:
-            self._pending = (batch + self._pending)[-MAX_PENDING_ATTEMPTS:]
+            requeued = batch + self._pending
+            self.dropped += max(0, len(requeued) - MAX_PENDING_ATTEMPTS)
+            self._pending = requeued[-MAX_PENDING_ATTEMPTS:]
             self.failures += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("execution.write_failed", error=str(exc), pending=len(batch))
             return 0
 
@@ -234,6 +259,7 @@ class ExecutionRecorder:
         # needs it: without it PostgreSQL may return the generated ids in any
         # order and every fill would attach to the wrong order, silently.
         values = [row for _, row in rows]
+        scope = RunScope(values[0]["mode"], self._backtest_run_id)
         statement = insert(OrderRow).values(values)
         # A commit acknowledgement can be lost after PostgreSQL committed.
         # Retrying must converge on the existing rows, not fail forever on the
@@ -241,18 +267,18 @@ class ExecutionRecorder:
         updatable = {
             key: getattr(statement.excluded, key)
             for key in values[0]
-            if key not in {"mode", "client_order_id"}
+            if key not in {"mode", "backtest_run_id", "client_order_id"}
         }
         await session.execute(
             statement.on_conflict_do_update(
-                constraint="mode_client_order_id",
+                constraint="mode_run_client_order_id",
                 set_=updatable,
             )
         )
         client_ids = [row["client_order_id"] for row in values]
         result = await session.execute(
             select(OrderRow.id, OrderRow.client_order_id).where(
-                OrderRow.mode == values[0]["mode"],
+                *scope.filters(OrderRow.mode, OrderRow.backtest_run_id),
                 OrderRow.client_order_id.in_(client_ids),
             )
         )
@@ -291,6 +317,7 @@ class ExecutionRecorder:
                     "attempt_id": request.attempt_id,
                     "is_shadow": row["is_shadow"],
                     "mode": row["mode"],
+                    "backtest_run_id": self._backtest_run_id,
                     "strategy": request.strategy or "unknown",
                     "side": request.side,
                     "status": PositionStatus.OPEN,
@@ -307,13 +334,26 @@ class ExecutionRecorder:
         position_ids: dict[tuple[str, int], int] = {}
         if position_values:
             position_statement = insert(PositionRow).values(position_values)
+            # One position per leg per scope is a pair of partial unique
+            # indexes (``attempt_id`` is nullable), so the conflict target is
+            # inferred from the index matching this scope.
+            conflict = (
+                ["backtest_run_id", "attempt_id", "market_id"]
+                if scope.is_backtest
+                else ["mode", "attempt_id", "market_id"]
+            )
             await session.execute(
                 position_statement.on_conflict_do_update(
-                    constraint="mode_attempt_market",
+                    index_elements=conflict,
+                    index_where=(
+                        PositionRow.backtest_run_id.is_not(None)
+                        if scope.is_backtest
+                        else PositionRow.backtest_run_id.is_(None)
+                    ),
                     set_={
                         key: getattr(position_statement.excluded, key)
                         for key in position_values[0]
-                        if key not in {"mode", "attempt_id", "market_id"}
+                        if key not in {"mode", "backtest_run_id", "attempt_id", "market_id"}
                     },
                     # A retried entry flush must not resurrect a position an
                     # exit has already touched. Without this the upsert would
@@ -326,7 +366,7 @@ class ExecutionRecorder:
             )
             stored_positions = await session.execute(
                 select(PositionRow.id, PositionRow.attempt_id, PositionRow.market_id).where(
-                    PositionRow.mode == position_values[0]["mode"],
+                    *scope.filters(PositionRow.mode, PositionRow.backtest_run_id),
                     PositionRow.attempt_id.in_([value["attempt_id"] for value in position_values]),
                 )
             )
@@ -349,6 +389,7 @@ class ExecutionRecorder:
                     ids[row["client_order_id"]],
                     row["mode"],
                     position_id=position_id,
+                    backtest_run_id=self._backtest_run_id,
                 )
             )
         if fills:

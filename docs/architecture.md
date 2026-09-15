@@ -54,6 +54,11 @@ Binance WebSocket / REST        (Phase 3)
    API + WebSocket  →  Dashboard (Phases 12-13)
 ```
 
+A backtest (Phase 11) runs the same pipeline from the market-data engine down,
+with recorded history in place of the WebSocket feed and a virtual clock in
+place of the wall clock - see
+[The replay boundary](#the-replay-boundary).
+
 Phase 8's paper account gate - cash, inventory, margin, exposure - is no
 longer a separate stage between the opportunity engine and the adapter.
 Phase 9 sits in front of the adapter and reserves against that same account
@@ -71,7 +76,7 @@ did. See [risk-management.md](risk-management.md) for the full account.
 | --- | --- | --- |
 | `trading_bot.core.config` | Layered settings, live-trading guards | nothing |
 | `trading_bot.core.logging` | Structured logs, credential redaction | config |
-| `trading_bot.db` | Engine, sessions, ORM models, retention | config, logging |
+| `trading_bot.db` | Engine, sessions, ORM models, run scope, retention | config, logging |
 | `trading_bot.exchange` | Venue boundary: adapter interface + normalized models | config, logging |
 | `trading_bot.exchange.streaming` | Streaming boundary: stream endpoints + parser contract | exchange |
 | `trading_bot.exchange.binance` | binance.com spot + USDⓈ-M market data and streams | exchange, config |
@@ -81,7 +86,8 @@ did. See [risk-management.md](risk-management.md) for the full account.
 | `trading_bot.opportunities` | Episode tracking and the research record | strategy, db |
 | `trading_bot.execution` | Bounded dispatcher, account reservations, adapter contract, paper simulator, leg coordination, order/fill/position record | strategy + marketdata models, db |
 | `trading_bot.risk` | Pre-trade, admission, exit and post-trade decisions; durable kill switch | execution, config, db |
-| `trading_bot.portfolio` | Exit policy, executable valuation, P&L accounting, snapshots, the realised P&L risk reads | execution, risk, marketdata models, db |
+| `trading_bot.portfolio` | Exit policy, executable valuation, P&L accounting, snapshots (history-read or folded), the realised P&L risk reads | execution, risk, marketdata models, db |
+| `trading_bot.backtest` | Virtual clock and replay loop, historical data source, replay market view, funding attribution, run lifecycle, engine, report, CLI | every layer above; nothing depends on it |
 | `trading_bot.api` | HTTP contract for the dashboard | config, db |
 | `trading_bot.main` | Composition root: wires everything | all of the above |
 
@@ -138,6 +144,12 @@ Daily-loss and consecutive-loss limits now operate: Phase 10 supplies the
 realised P&L they were waiting for, measured over completed paired trades and
 a documented UTC day boundary. When the portfolio service is switched off they
 report as unavailable exactly as they did before, never as zero.
+
+Phase 11 adds deterministic historical replay through that same pipeline - one
+immutable dataset per run, initial state at any start, run isolation enforced
+by the database, strict persistence, settled replay funding cash flows, a
+per-component completeness verdict - and opt-in capture of the coherent quote,
+depth and funding samples a replay needs.
 
 Not built: the dashboard. The system-status endpoint reports every subsystem
 by the durable evidence it wrote, and a not-yet-built one as `OFFLINE` with
@@ -324,9 +336,9 @@ live books        ──▶ valuation.py      what flattening would really fetch
 Three rules run through it. **Actual fills, never estimates** - a strategy's
 expected price survives only as slippage attribution. **PAPER, LIVE and
 THEORETICAL never mix**, and `is_shadow` rows are excluded from every
-actionable total. **Unmeasured is not zero** - funding and spot borrow are
-real costs nothing here can measure yet, so they are NULL and named, and no
-total that omits them is called complete.
+actionable total. **Unmeasured is not zero** - spot borrow, and funding that a
+replay cannot observe at settlement, are NULL and named, and no total that
+omits them is called complete.
 
 Aggregate equity is all-or-nothing: if one open leg cannot be valued, position
 value, unrealized P&L and equity are NULL for that snapshot. `DEGRADED` never
@@ -346,3 +358,72 @@ query asking what survived costs. Each row carries the quotes, books, fills,
 filters, rates and assumptions behind it, because the raw tables it came from
 are purged in days and opportunities never are. Opportunities and signals are
 never purged - unlike raw market data, they are the point of the exercise.
+
+### The replay boundary
+
+`trading_bot.backtest` does not contain a strategy, a cost model, a simulator,
+a risk engine or a portfolio. It contains what replaces the *live inputs* of
+the ones that already exist:
+
+| Live service | Backtest |
+| --- | --- |
+| `MarketDataEngine` fed by WebSockets | `ReplayMarketData` fed by `HistoricalDataSource` - the same `snapshot` / `execution_snapshot` API |
+| wall clock and `asyncio.sleep` | one `ReplayClock` and its virtual `sleep`, injected into every clock parameter |
+| concurrent loops (strategy, workers, exits, snapshots) | one driver running the same steps in a fixed order per virtual instant |
+| `ExecutionMode.PAPER`, rows outside any run | `ExecutionMode.BACKTEST` and `backtest_run_id` on every row |
+| random episode, claim and kill-switch identities | identities derived from the configuration hash |
+| funding polled over REST | recorded funding observations |
+
+```
+HistoricalDataSource ── one REPEATABLE READ snapshot ──▶ EventValidator ──▶ ReplayMarketData
+   (postgres: market_data, order_books,     (dup / regression / gap /       │ applies an event only
+    funding_observations, capture gaps)      corrupt / temporal)            │ once virtual time reaches
+   initial state before the start ─────────────────────────────────────────▶ its local receipt time
+ReplayClock ◀─ advance_to ── BacktestEngine: monitor ─▶ portfolio snapshot ─▶ exits ─▶ strategy
+     ▲                        ─▶ risk ─▶ paper execution ─▶ strict flush ─▶ integrity check
+     └── wake_next ── ReplayEventLoop (only when nothing is runnable and no DB I/O is in flight)
+HeartbeatTask (wall clock, own task) ── liveness, cancel, lost-row detection
+```
+
+**Time.** Components already took injected clocks; the replay gives them all
+one. The only concurrency left is inside an execution, where both legs sleep
+their own simulated latency - and `ReplayEventLoop` advances virtual time only
+at quiescence, so a second leg can never measure its latency from the first
+leg's arrival, and a query in flight never lets time move. The rest is
+serialized, which is a declared execution-model limitation of every run, not a
+parity claim.
+
+**Look-ahead.** Events are available at their local receipt time, never the
+exchange's, and a read is refused unless every event up to now is provably
+buffered; the refusal is recorded, so a reader that swallows it cannot hide it.
+The paper adapter reads the book at arrival, so fills price on the book
+recorded by then and never a later one. A run starting between samples opens
+with the newest valid quote, book and funding observation received *before* the
+start, within their carry limits.
+
+**One dataset per run.** Coverage, initial state and every page are read inside
+one read-only repeatable-read transaction, so rows inserted or purged while a
+run streams are invisible to it. The fingerprint covers reference data,
+initial state, every accepted event of the whole range and every rejection.
+
+**Isolation.** Every result row a run writes carries its run, a CHECK ties that
+to `mode = 'BACKTEST'`, uniqueness keys include the run, and every store and
+report filters on it (`db.scope.RunScope`). Provenance links - signal,
+risk event, order, fill, position, P&L row - are foreign keys on
+`(parent id, run_key)`, so the database refuses a link across runs or between
+a run and paper rows from any writer. Live status and research queries exclude
+replayed rows. Deleting a run deletes its artifacts.
+
+**Strictness.** The live components keep their survival behaviour; replay
+checks the counters they report it through. A record that cannot be written
+after bounded retries, a dropped record, a risk decision that could not be
+stored, an exit sweep failure, an unexpected exception inside execution, or a
+paper account that disagrees with the durable fills fails the run (`FAILED`,
+no fingerprint, no verdict). `INCOMPLETE` means the data or the accounting
+could not support the result; the per-component verdict says which.
+
+**Determinism.** Same dataset and configuration produce identical results and
+identifiers, because virtual time moves only at quiescence, database work is
+serialised, ties break on a total key, and every identity that was random is
+derived instead. The dataset fingerprint and configuration hash on the run make
+"same inputs" checkable.

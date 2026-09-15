@@ -1,6 +1,8 @@
 """Portfolio and P&L snapshots.
 
-Both tables carry ``mode``, and every aggregate query must filter on it.
+Both tables carry ``mode`` and ``backtest_run_id``, and every aggregate query
+must filter on both: two backtests over the same period write snapshots at
+the same ``captured_at``.
 Theoretical edge, paper results and live results answer different questions:
 mixing them produces a number that describes nothing.
 
@@ -27,7 +29,6 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Float,
-    ForeignKey,
     Index,
     Integer,
     String,
@@ -38,6 +39,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_bot.db.base import Base, RecordMixin
+from trading_bot.db.models.backtest import (
+    BACKTEST_MODE_HAS_RUN,
+    RUN_KEY_MATCHES_RUN,
+    backtest_run_fk,
+    run_key_column,
+    run_scoped_fk,
+)
 from trading_bot.db.models.enum_types import EXECUTION_MODE, VALUATION_STATUS
 from trading_bot.db.models.enums import ExecutionMode, ValuationStatus
 from trading_bot.db.models.execution import Position
@@ -60,6 +68,7 @@ class PortfolioSnapshot(Base, RecordMixin):
     # inside the same interval converges on this row rather than adding one.
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     mode: Mapped[ExecutionMode] = mapped_column(EXECUTION_MODE, nullable=False)
+    backtest_run_id: Mapped[int | None] = backtest_run_fk()
 
     cash_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     # Sum of absolute position notionals - what the risk engine limits.
@@ -100,9 +109,18 @@ class PortfolioSnapshot(Base, RecordMixin):
     )
 
     __table_args__ = (
-        # One snapshot per mode per instant.
-        UniqueConstraint("mode", "captured_at", name="mode_captured_at"),
+        # One snapshot per mode, run and instant. NULLS NOT DISTINCT so rows
+        # outside any run still deduplicate against each other.
+        UniqueConstraint(
+            "mode",
+            "backtest_run_id",
+            "captured_at",
+            name="mode_run_captured_at",
+            postgresql_nulls_not_distinct=True,
+        ),
         Index("ix_portfolio_snapshots_mode_captured", "mode", "captured_at"),
+        Index("ix_portfolio_snapshots_run_captured", "backtest_run_id", "captured_at"),
+        CheckConstraint(BACKTEST_MODE_HAS_RUN, name="backtest_mode_has_run"),
         CheckConstraint("open_positions >= 0", name="open_positions_non_negative"),
         CheckConstraint("gross_exposure_usd >= 0", name="gross_exposure_non_negative"),
         CheckConstraint("unvalued_positions >= 0", name="unvalued_positions_non_negative"),
@@ -135,12 +153,12 @@ class PnlSnapshot(Base, RecordMixin):
 
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     mode: Mapped[ExecutionMode] = mapped_column(EXECUTION_MODE, nullable=False)
+    backtest_run_id: Mapped[int | None] = backtest_run_fk()
+    run_key: Mapped[int] = run_key_column()
     # NULL = whole portfolio; set = one strategy's contribution.
     strategy: Mapped[str | None] = mapped_column(String(STRATEGY_NAME_LENGTH))
     # NULL = aggregate; set = a single position's P&L.
-    position_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("positions.id", ondelete="SET NULL")
-    )
+    position_id: Mapped[int | None] = mapped_column(BigInteger)
     # The non-null rendering of (strategy, position_id) that idempotency keys
     # on: "portfolio", "strategy:<name>" or "position:<id>".
     scope_key: Mapped[str] = mapped_column(
@@ -194,16 +212,31 @@ class PnlSnapshot(Base, RecordMixin):
     )
     return_interval_seconds: Mapped[int | None] = mapped_column(Integer)
 
-    position: Mapped[Position | None] = relationship(lazy="raise")
+    position: Mapped[Position | None] = relationship(
+        primaryjoin="PnlSnapshot.position_id == Position.id",
+        foreign_keys=[position_id],
+        lazy="raise",
+    )
 
     __table_args__ = (
+        # Links within one run only (``backtest.run_key_column``).
+        CheckConstraint(RUN_KEY_MATCHES_RUN, name="run_key_matches_run"),
+        run_scoped_fk("position_id", "positions", ondelete="SET NULL"),
         # Snapshot idempotency: one row per scope per window per instant, so a
         # retried flush or a restarted service converges instead of
         # double-counting the same window.
         UniqueConstraint(
-            "mode", "captured_at", "window", "scope_key", name="mode_captured_window_scope"
+            "mode",
+            "backtest_run_id",
+            "captured_at",
+            "window",
+            "scope_key",
+            name="mode_run_captured_window_scope",
+            postgresql_nulls_not_distinct=True,
         ),
         Index("ix_pnl_snapshots_mode_captured", "mode", "captured_at"),
+        Index("ix_pnl_snapshots_run_captured", "backtest_run_id", "captured_at"),
+        CheckConstraint(BACKTEST_MODE_HAS_RUN, name="backtest_mode_has_run"),
         Index("ix_pnl_snapshots_strategy_captured", "strategy", "captured_at"),
         CheckConstraint("trade_count >= 0", name="trade_count_non_negative"),
         CheckConstraint(

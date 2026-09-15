@@ -260,6 +260,9 @@ class RejectionReason(StrEnum):
     STALE_FUNDING = "STALE_FUNDING"
     BOOK_NOT_SYNCED = "BOOK_NOT_SYNCED"
     LATENCY_EXCEEDED = "LATENCY_EXCEEDED"
+    # A negative feed latency: exchange time after local receipt. The latency
+    # is then unmeasured, never "fast enough".
+    CLOCK_SKEW = "CLOCK_SKEW"
     INSUFFICIENT_LIQUIDITY = "INSUFFICIENT_LIQUIDITY"
     BELOW_MIN_NOTIONAL = "BELOW_MIN_NOTIONAL"
     # Rounding to a valid lot left less than the venue's minimum order size.

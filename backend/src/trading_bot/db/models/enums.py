@@ -1,8 +1,14 @@
 """Enumerations shared by the data model.
 
-These are stored as native PostgreSQL enum types: the database rejects an
-invalid value outright, which matters for columns like order status where a
-typo would silently corrupt the audit trail.
+Stored as ``VARCHAR`` columns with a database ``CHECK`` constraint listing the
+allowed values (see ``enum_types``), not as native PostgreSQL enum types: the
+database still rejects an invalid value outright, which matters for columns
+like order status where a typo would silently corrupt the audit trail.
+
+Adding a member here is a schema change. The CHECK constraints list the
+values explicitly, so a new member needs a migration that recreates every
+constraint on a column of that type - ``tests/unit/test_enum_constraints.py``
+and the migration parity test fail until it has one.
 """
 
 from __future__ import annotations
@@ -143,12 +149,45 @@ class ExecutionMode(StrEnum):
     """Which engine produced a row.
 
     THEORETICAL (what the strategy thought was available), PAPER (simulated
-    execution) and LIVE (real money) must never be aggregated together.
+    execution against the live book), LIVE (real money) and BACKTEST
+    (simulated execution against recorded history) must never be aggregated
+    together.
+
+    BACKTEST alone is not isolation: two backtests over the same period share
+    this value. Every BACKTEST row also carries ``backtest_run_id``, and a
+    CHECK constraint ties the two together - see ``db.scope.RunScope``.
     """
 
     THEORETICAL = "THEORETICAL"
     PAPER = "PAPER"
     LIVE = "LIVE"
+    BACKTEST = "BACKTEST"
+
+
+class BacktestRunStatus(StrEnum):
+    """Lifecycle of one backtest run.
+
+    ``INCOMPLETE`` is a finished run whose dataset could not support
+    everything asked of it - a selected market with no depth, a perpetual with
+    no funding observations, or gaps the replay refused to carry a book
+    across. Its numbers exist, and they describe less than was requested.
+    """
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    INCOMPLETE = "INCOMPLETE"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+#: A run in one of these states will never change again.
+TERMINAL_BACKTEST_STATUSES = (
+    BacktestRunStatus.COMPLETED,
+    BacktestRunStatus.INCOMPLETE,
+    BacktestRunStatus.FAILED,
+    BacktestRunStatus.CANCELLED,
+)
 
 
 class SystemEventType(StrEnum):

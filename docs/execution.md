@@ -1,8 +1,9 @@
 # Execution
 
 Status: **paper execution implemented in Phase 8; gated by the risk engine
-since Phase 9; exits added and reviewed in Phase 10.** Phase 17 builds the live
-path and leaves it disabled.
+since Phase 9; exits added and reviewed in Phase 10; replayed against recorded
+history in Phase 11.** Phase 17 builds the live path and leaves it
+disabled.
 
 ## Adapter boundary
 
@@ -166,6 +167,34 @@ that an exchange has already filled.
 `positions.is_shadow` keeps hypothetical probes out of account restoration,
 portfolio reporting and the exit path entirely - a probe's exposure is
 hypothetical, and closing it would place a real order.
+
+## Execution under replay (Phase 11)
+
+A backtest executes with the same `PaperExecutionAdapter`, coordinator,
+dispatcher and closer - labelled `BACKTEST` and stamped with the run - against
+`ReplayMarketData` instead of the live engine. What that means precisely:
+
+| Behaviour | Under replay |
+| --- | --- |
+| Latency | the configured latency and jitter, slept on the **virtual** clock; both legs register before either arrives |
+| Book used for a fill | the latest book **recorded by the arrival instant**; never the decision's if a newer one arrived, never a later one |
+| Depth, partial fills | walked over every recorded level; running past a capped side is `DEPTH_TRUNCATED` |
+| Market / IOC orders | taker fills at the book's prices, taker fees; IOC remainder cancelled; an IOC whose price the book left expires unfilled |
+| Maker fills, GTC | never inferred - GTC is refused as it is live |
+| Signal expiry, staleness | re-checked at admission against virtual time |
+| Venue filters | tick, step, lot and minimum notional from `markets`; perpetual MARKET notional against the **recorded** mark. Price bounds, percent-price bands, maximum notional and the spot average-price reference were never stored and are **not checked** - reported on every run |
+| Exits | the same closer, MARKET, both legs at once, on a virtual-time sweep; skipped only while the run's account holds no exposure |
+| Unhedged outcomes | the same post-trade review, the same pause, the same `UNPAIRED_RESIDUAL` close |
+| Queueing | none: `ExecutionDispatcher.execute_inline` admits and processes one signal at a time, so `QUEUE_OVERLOAD` cannot occur and a later signal in one tick waits an execution's latency. Declared on every run as the `serialized_scheduling` execution-model limitation - replay makes no claim of scheduling parity with the live workers |
+| Unexpected exceptions | propagate: `execute_inline` does not apply a worker's survival rule, and the replay coordinator (`propagate_adapter_errors=True`) does not turn a simulator exception into a `FAILED` leg - the run fails with the exception instead. Live, both behave as before |
+| Persistence | orders, fills and positions are flushed after every attempt and retried at most `backtest.persistence_attempts` times; anything left unwritten or dropped fails the run, and the paper account is reconciled against the durable fills and positions at the end |
+| `exchange_order_id` | derived from the client order id (live paper too, since Phase 11), so reruns match |
+
+A run that ends with positions open leaves them open and values them; it never
+closes them at the last book. There is no fill-probability setting in replay either. What sampled data
+cannot show - the market moving *within* the latency when capture wrote one
+book a second - is reported (fills on a book newer than the signal versus not),
+not simulated.
 
 ## Live execution (Phase 17, disabled)
 

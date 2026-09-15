@@ -99,6 +99,21 @@ market_data:
   persist_interval_ms: 5000
   # The API calls a market live when its newest stored quote is this recent.
   status_fresh_within_ms: 15000
+  # Phase 11: record what a backtest needs - one coherent sample per interval
+  # of quotes, synchronised depth and funding, written in one transaction.
+  # While on, capture is the only quote writer (persist_interval_ms no longer
+  # applies to quotes). Settings refuse an interval above half the tightest
+  # freshness limit (2000 ms by default), since replay would read it as stale.
+  # A lost sample is recorded as a DATA_GAP system event, never retried, and a
+  # replay overlapping it is INCOMPLETE. Check with
+  # `uv run trading-bot-backtest capture`. Off by default; an upper-bound
+  # estimate is ~17 GB/day of JSON text at 50 markets x 50 levels x 1 s before
+  # compression - unmeasured - so raise retention.order_books_days for any
+  # window you intend to replay (see docs/data-model.md).
+  capture:
+    enabled: false
+    interval_ms: 1000
+    depth_levels: 50
 
 monitoring:
   # Phase 4: every market sampled on this cadence...
@@ -305,3 +320,37 @@ execution:
   # strategy would have earned.
   shadow: false
   shadow_interval_ms: 60000
+
+backtest:
+  # Phase 11: replay recorded history through the real pipeline, in virtual
+  # time. `uv run trading-bot-backtest run --start ... --end ... --symbol ...`
+  # Rows per page read from each history table (bounds memory, not length).
+  batch_size: 5000
+  # A market stream silent longer than this is recorded as a dataset gap.
+  gap_warning_ms: 10000
+  # Never publish a sampled book, or a funding observation, older than these.
+  max_book_carry_ms: 30000
+  max_funding_carry_ms: 600000
+  # Funding is attributed to a settlement only from an observation received
+  # this close before it; otherwise it stays unmeasured (NULL), never zero.
+  funding_settlement_max_age_ms: 120000
+  # Temporal validation: a venue clock this far ahead of receipt, or this far
+  # behind it, makes a row corrupt; a funding observation's next settlement
+  # may be this far past, or one interval plus this far ahead.
+  max_clock_skew_ms: 1000
+  max_exchange_lag_ms: 300000
+  funding_schedule_tolerance_ms: 60000
+  # Immediate flush attempts before an unwritten record fails the run. A
+  # backtest never publishes a result whose records did not all land.
+  persistence_attempts: 3
+  # A backtest measures execution and exits, so both are on here even though
+  # the live service defaults them off.
+  execution_enabled: true
+  exits_enabled: true
+  # Virtual time between opportunity flushes; orders flush after each attempt.
+  flush_interval_ms: 60000
+  # Wall-clock heartbeat and cancel poll, on its own task so slow work still
+  # beats; a RUNNING row silent this long counts as interrupted.
+  heartbeat_seconds: 2.0
+  orphan_after_seconds: 120.0
+  max_warnings: 100

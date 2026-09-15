@@ -51,6 +51,10 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _random_intent_id() -> str:
+    return f"kill_switch:{uuid.uuid4().hex}"
+
+
 def parse_halted_until(context: dict[str, object] | None) -> datetime | None:
     """A halt that declared its own expiry, e.g. a daily-loss cool-off."""
     if not context:
@@ -75,11 +79,17 @@ class KillSwitchState:
         *,
         mode: ExecutionMode = ExecutionMode.PAPER,
         clock: Callable[[], datetime] = _utcnow,
+        backtest_run_id: int | None = None,
+        intent_ids: Callable[[], str] = _random_intent_id,
     ) -> None:
         self._store = store
         self._session_factory = session_factory
         self._mode = mode
         self._clock = clock
+        # A replayed run reads and writes only its own transitions, and names
+        # them deterministically so a rerun produces the same audit rows.
+        self._backtest_run_id = backtest_run_id
+        self._intent_ids = intent_ids
         self._lock = asyncio.Lock()
         # Fail closed until ``load`` proves otherwise: a process that has not
         # yet checked durable state must not wave signals through on a guess.
@@ -97,6 +107,7 @@ class KillSwitchState:
         self._listeners: list[HaltListener] = []
         self.refreshes = 0
         self.refresh_failures = 0
+        self.listener_failures = 0
 
     # --- observation ----------------------------------------------------
 
@@ -124,7 +135,9 @@ class KillSwitchState:
 
     async def _read(self, *, initial: bool) -> None:
         try:
-            row = await latest_kill_switch_row(self._session_factory, self._mode)
+            row = await latest_kill_switch_row(
+                self._session_factory, self._mode, self._backtest_run_id
+            )
         except Exception as exc:
             self.refresh_failures += 1
             if initial:
@@ -177,6 +190,7 @@ class KillSwitchState:
             try:
                 listener(reason)
             except Exception as exc:  # a bad listener must not unhalt anything
+                self.listener_failures += 1
                 logger.exception("risk.kill_switch_listener_failed", error=str(exc))
 
     # --- reading --------------------------------------------------------
@@ -248,7 +262,7 @@ class KillSwitchState:
                 event_type=RiskEventType.KILL_SWITCH,
                 decision=RiskDecision.PAUSED,
                 mode=self._mode,
-                intent_id=f"kill_switch:{uuid.uuid4().hex}",
+                intent_id=self._intent_ids(),
                 reason=reason,
                 context=context,
             )
@@ -274,7 +288,7 @@ class KillSwitchState:
                 event_type=RiskEventType.KILL_SWITCH,
                 decision=RiskDecision.APPROVED,
                 mode=self._mode,
-                intent_id=f"kill_switch:{uuid.uuid4().hex}",
+                intent_id=self._intent_ids(),
                 reason=reason,
                 context={"action": "rearmed", "who": who},
             )

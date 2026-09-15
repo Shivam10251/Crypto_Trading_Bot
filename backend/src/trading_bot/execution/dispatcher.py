@@ -85,11 +85,70 @@ class ExecutionDispatcher:
         *,
         is_shadow: bool,
     ) -> bool:
+        work = self._admit(signal, opportunity_uid, is_shadow=is_shadow)
+        if work is None:
+            return False
+        try:
+            self._queue.put_nowait(work)
+        except asyncio.QueueFull:
+            self.overflow += 1
+            logger.error(
+                "execution.queue_full",
+                intent_id=work.intent_id,
+                queue_size=self._queue.maxsize,
+            )
+            # Best-effort, not durable-before-return: nothing was ever queued
+            # for this intent, so there is no order for the audit trail to
+            # gate - unlike an approval, a late or lost write here risks
+            # nothing except an incomplete research record.
+            self._risk_engine.record_queue_overload(
+                intent_id=work.intent_id,
+                opportunity_uid=opportunity_uid,
+                is_shadow=is_shadow,
+                strategy=signal.strategy,
+                queue_size=self._queue.maxsize,
+            )
+            return False
+        self._claim(work)
+        return True
+
+    async def execute_inline(
+        self,
+        signal: Signal,
+        opportunity_uid: uuid.UUID,
+        *,
+        is_shadow: bool,
+    ) -> bool:
+        """Admit and process one signal now, without the queue or a worker.
+
+        For a deterministic replay, which must finish one decision before
+        virtual time moves on. The admission rules - one intent per episode,
+        refused while halted - and the processing are exactly ``enqueue`` and
+        a worker's; only the queue, and so queue overload, does not exist.
+        Returns what ``enqueue`` returns: whether the work was accepted, not
+        whether risk approved it or anything filled.
+
+        **An unexpected exception propagates.** A worker swallows one so the
+        live process survives a malformed signal; a replay that did the same
+        would carry on from a state no real run could reach - an approval
+        without its order, a fill without its post-trade check - and publish
+        the result as if nothing happened. The caller fails the run instead.
+        """
+        work = self._admit(signal, opportunity_uid, is_shadow=is_shadow)
+        if work is None:
+            return False
+        self._claim(work)
+        await self._process(work)
+        return True
+
+    def _admit(
+        self, signal: Signal, opportunity_uid: uuid.UUID, *, is_shadow: bool
+    ) -> ExecutionWork | None:
         kind = "shadow" if is_shadow else "signal"
         intent_id = f"{kind}:{opportunity_uid}"
         if intent_id in self._claimed:
             self.duplicates += 1
-            return False
+            return None
         # Refuse actionable work outright while trading is halted, rather than
         # queueing something a worker would only reject. Probes are research
         # and are governed separately.
@@ -104,33 +163,13 @@ class ExecutionDispatcher:
                     strategy=signal.strategy,
                     reason=f"not accepted while trading is halted: {halted}",
                 )
-                return False
-        work = ExecutionWork(signal, opportunity_uid, intent_id, is_shadow)
-        try:
-            self._queue.put_nowait(work)
-        except asyncio.QueueFull:
-            self.overflow += 1
-            logger.error(
-                "execution.queue_full",
-                intent_id=intent_id,
-                queue_size=self._queue.maxsize,
-            )
-            # Best-effort, not durable-before-return: nothing was ever queued
-            # for this intent, so there is no order for the audit trail to
-            # gate - unlike an approval, a late or lost write here risks
-            # nothing except an incomplete research record.
-            self._risk_engine.record_queue_overload(
-                intent_id=intent_id,
-                opportunity_uid=opportunity_uid,
-                is_shadow=is_shadow,
-                strategy=signal.strategy,
-                queue_size=self._queue.maxsize,
-            )
-            return False
-        self._claimed.add(intent_id)
-        self._episode_intents.setdefault(opportunity_uid, set()).add(intent_id)
+                return None
+        return ExecutionWork(signal, opportunity_uid, intent_id, is_shadow)
+
+    def _claim(self, work: ExecutionWork) -> None:
+        self._claimed.add(work.intent_id)
+        self._episode_intents.setdefault(work.opportunity_uid, set()).add(work.intent_id)
         self.enqueued += 1
-        return True
 
     def release(self, opportunity_uids: set[uuid.UUID]) -> None:
         """Forget claims only once those episodes have definitely ended."""

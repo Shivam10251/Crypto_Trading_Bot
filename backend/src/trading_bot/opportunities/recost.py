@@ -202,6 +202,9 @@ async def recost(
     statement = (
         select(Opportunity, primary.c.symbol, primary.c.market_type)
         .join(primary, primary.c.id == Opportunity.market_id)
+        # Research on the live record only: a backtest's opportunities are a
+        # replay of history under that run's configuration, and belong to it.
+        .where(Opportunity.backtest_run_id.is_(None))
         .order_by(Opportunity.detected_at.desc())
     )
     if limit is not None:

@@ -50,9 +50,10 @@ from trading_bot.exchange.models import MarketRef
 from trading_bot.execution.account import PaperAccount
 from trading_bot.execution.models import OrderIntent
 from trading_bot.portfolio.accounting import FUNDING
+from trading_bot.portfolio.book_value import value_book
 from trading_bot.portfolio.pnl_source import PortfolioPnlSource, utc_day_start
 from trading_bot.portfolio.service import PortfolioService
-from trading_bot.portfolio.snapshots import SnapshotWriter, Window, value_book
+from trading_bot.portfolio.snapshots import SnapshotWriter, Window
 from trading_bot.portfolio.store import PortfolioStore
 from trading_bot.risk.engine import RiskEngine
 from trading_bot.risk.kill_switch import KillSwitchState

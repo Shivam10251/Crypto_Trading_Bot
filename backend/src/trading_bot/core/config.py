@@ -208,6 +208,73 @@ class MarketsConfig(ConfigSection):
         return self
 
 
+class CaptureConfig(ConfigSection):
+    """Recording what a backtest needs to replay (Phase 11). Off by default.
+
+    ``market_data`` alone cannot be replayed: its quotes are sampled every
+    ``persist_interval_ms`` and it holds no depth or funding, and the strategy
+    refuses a pair without a synchronised book and a funding observation. This
+    records one coherent sample per ``interval_ms`` - quotes, depth and funding
+    in one transaction - and while it runs it is the only quote writer.
+    ``Settings`` refuses an interval replay would read as stale.
+    """
+
+    enabled: bool = False
+    # Book snapshots per market, written only when the book's update id moved.
+    interval_ms: int = Field(default=1000, ge=100)
+    # Levels per side stored. Fewer than the synchronised book knows makes the
+    # stored side incomplete, and a replayed walk past it DEPTH_TRUNCATED.
+    # Roughly 40 bytes a level: 50 markets x 2 sides x 50 levels at 1 s is
+    # about 17 GB a day before order_books retention (3 days by default).
+    depth_levels: int = Field(default=50, ge=1, le=1000)
+
+
+class BacktestConfig(ConfigSection):
+    """Historical replay (Phase 11)."""
+
+    # Rows per page read from each history table; also the most events held
+    # in one batch. Bounds memory, not the length of a run.
+    batch_size: int = Field(default=5_000, ge=100, le=100_000)
+    # A market stream silent for longer than this is recorded as a gap.
+    gap_warning_ms: int = Field(default=10_000, gt=0)
+    # A sampled book is published until the next sample, and never past this:
+    # beyond it the market has no book rather than a book from long ago.
+    max_book_carry_ms: int = Field(default=30_000, gt=0)
+    # The same bound for a funding observation.
+    max_funding_carry_ms: int = Field(default=600_000, gt=0)
+    # Funding is attributed to a settlement only from an observation received
+    # this close before it; the venue's rate is an estimate until then.
+    funding_settlement_max_age_ms: int = Field(default=120_000, gt=0)
+    # Temporal validation. A venue clock further ahead of the receipt time
+    # than this is a corrupt row, not a negative latency to trade on.
+    max_clock_skew_ms: int = Field(default=1_000, ge=0)
+    # A venue clock further behind the receipt time than this is corrupt too.
+    max_exchange_lag_ms: int = Field(default=300_000, gt=0)
+    # Slack around a funding observation's own settlement schedule: its next
+    # settlement may be this far past, or one interval plus this far ahead.
+    funding_schedule_tolerance_ms: int = Field(default=60_000, ge=0)
+    # Immediate flush attempts before an unwritten record fails the run.
+    persistence_attempts: int = Field(default=3, ge=1, le=20)
+    # Execution and exits are part of what a backtest measures, so they are
+    # on here even though the live service defaults them off.
+    execution_enabled: bool = True
+    exits_enabled: bool = True
+    # Virtual time between opportunity flushes. Orders and positions are
+    # flushed after every attempt, because exits and snapshots read them.
+    flush_interval_ms: int = Field(default=60_000, ge=1_000)
+    # Wall-clock cadence of the run's heartbeat, progress log and cancel poll.
+    heartbeat_seconds: float = Field(default=2.0, gt=0)
+    # A RUNNING row with no heartbeat for this long was interrupted.
+    orphan_after_seconds: float = Field(default=120.0, gt=0)
+    max_warnings: int = Field(default=100, ge=1, le=10_000)
+
+    @model_validator(mode="after")
+    def _check_consistency(self) -> BacktestConfig:
+        if self.orphan_after_seconds <= self.heartbeat_seconds * 2:
+            raise ValueError("orphan_after_seconds must exceed two heartbeat intervals")
+        return self
+
+
 class MarketDataConfig(ConfigSection):
     """Live market-data engine and service (Phase 3)."""
 
@@ -253,6 +320,7 @@ class MarketDataConfig(ConfigSection):
     status_fresh_within_ms: int = Field(default=15000, gt=0)
     display: bool = True
     display_interval_ms: int = Field(default=1000, ge=100)
+    capture: CaptureConfig = Field(default_factory=CaptureConfig)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> MarketDataConfig:
@@ -610,6 +678,7 @@ class Settings(BaseSettings):
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 
     @classmethod
     def settings_customise_sources(
@@ -659,8 +728,11 @@ class Settings(BaseSettings):
             )
         if self.is_live_execution_armed and not self.exchange.has_credentials:
             raise ValueError("live execution armed but exchange API credentials are missing")
+        simulating = (
+            self.execution.enabled or self.execution.shadow or self.backtest.execution_enabled
+        )
         if (
-            (self.execution.enabled or self.execution.shadow)
+            simulating
             and self.execution.mode is ExecutionMode.PAPER
             and self.costs.pay_fees_in_bnb
             and self.execution.paper_bnb_balance <= 0
@@ -669,14 +741,14 @@ class Settings(BaseSettings):
                 "paper execution with BNB fee discounts requires paper_bnb_balance > 0"
             )
         if (
-            (self.execution.enabled or self.execution.shadow)
+            simulating
             and self.execution.mode is ExecutionMode.PAPER
             and self.costs.pay_fees_in_bnb
             and self.execution.paper_bnb_price_usd is None
         ):
             raise ValueError("paper execution with BNB fee discounts requires paper_bnb_price_usd")
         if (
-            (self.execution.enabled or self.execution.shadow)
+            simulating
             and self.execution.mode is ExecutionMode.PAPER
             and self.costs.pay_fees_in_bnb
             and self.execution.paper_bnb_price_usd is not None
@@ -688,6 +760,43 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "paper BNB balance is too small for maximum configured exposure fees"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _capture_cadence_is_replayable(self) -> Settings:
+        """Capture that replays as stale is worse than none: it looks like data.
+
+        A replayed sample is carried until the next one, so its age cycles
+        from zero to the capture interval. At more than half the tightest
+        freshness limit a consumer applies, most of every interval would be
+        refused as stale in replay although live it was fresh. Funding polled
+        less often than the settlement evidence window can never be
+        attributed.
+        """
+        capture = self.market_data.capture
+        if not capture.enabled:
+            return self
+        basis = self.strategy.spot_perp_basis
+        limits = {
+            "strategy.spot_perp_basis.max_quote_age_ms": basis.max_quote_age_ms,
+            "strategy.spot_perp_basis.max_book_age_ms": basis.max_book_age_ms,
+            "strategy.spot_perp_basis.max_data_age_ms": basis.max_data_age_ms,
+            "execution.max_book_age_ms": self.execution.max_book_age_ms,
+            "portfolio.exits.max_book_age_ms": self.portfolio.exits.max_book_age_ms,
+            "risk.max_stale_data_ms": self.risk.max_stale_data_ms,
+        }
+        name, tightest = min(limits.items(), key=lambda item: item[1])
+        if capture.interval_ms * 2 > tightest:
+            raise ValueError(
+                f"market_data.capture.interval_ms={capture.interval_ms} is more than half of "
+                f"{name}={tightest}: replayed samples would be refused as stale"
+            )
+        if basis.funding_refresh_seconds * 1000 > self.backtest.funding_settlement_max_age_ms:
+            raise ValueError(
+                "strategy.spot_perp_basis.funding_refresh_seconds exceeds "
+                "backtest.funding_settlement_max_age_ms: captured funding could never be "
+                "attributed to a settlement"
+            )
         return self
 
 

@@ -16,8 +16,8 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
-    ForeignKey,
     Index,
     String,
     Text,
@@ -28,6 +28,14 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_bot.db.base import Base, RecordMixin
+from trading_bot.db.models.backtest import (
+    BACKTEST_MODE_HAS_RUN,
+    RUN_KEY_MATCHES_RUN,
+    backtest_run_fk,
+    run_key_column,
+    run_key_target,
+    run_scoped_fk,
+)
 from trading_bot.db.models.enum_types import (
     EXECUTION_MODE,
     RISK_DECISION,
@@ -60,12 +68,14 @@ class RiskEvent(Base, RecordMixin):
     event_type: Mapped[RiskEventType] = mapped_column(RISK_EVENT_TYPE, nullable=False)
     decision: Mapped[RiskDecision] = mapped_column(RISK_DECISION, nullable=False)
     mode: Mapped[ExecutionMode] = mapped_column(EXECUTION_MODE, nullable=False)
+    # The owning backtest run, so a replayed kill switch or loss halt governs
+    # that run alone and never the paper service - or another run.
+    backtest_run_id: Mapped[int | None] = backtest_run_fk()
+    run_key: Mapped[int] = run_key_column()
 
     # The signal under evaluation; NULL for portfolio-level events such as a
     # daily loss limit or a kill switch.
-    signal_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("signals.id", ondelete="SET NULL")
-    )
+    signal_id: Mapped[int | None] = mapped_column(BigInteger)
     # The opportunity this decision concerned, carried directly rather than by
     # foreign key: a signal/opportunity row may not exist yet when the
     # decision is made, the same reason ``orders.opportunity_uid`` exists.
@@ -90,9 +100,15 @@ class RiskEvent(Base, RecordMixin):
     # Full input snapshot: exposure, position sizes, data age at decision time.
     context: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
-    signal: Mapped[Signal | None] = relationship(lazy="raise")
+    signal: Mapped[Signal | None] = relationship(
+        primaryjoin="RiskEvent.signal_id == Signal.id", foreign_keys=[signal_id], lazy="raise"
+    )
 
     __table_args__ = (
+        # Links within one run only (``backtest.run_key_column``).
+        CheckConstraint(RUN_KEY_MATCHES_RUN, name="run_key_matches_run"),
+        run_key_target(),
+        run_scoped_fk("signal_id", "signals", ondelete="SET NULL"),
         Index("ix_risk_events_occurred_at", "occurred_at"),
         Index("ix_risk_events_decision_occurred", "decision", "occurred_at"),
         Index("ix_risk_events_type_occurred", "event_type", "occurred_at"),
@@ -100,7 +116,16 @@ class RiskEvent(Base, RecordMixin):
         Index("ix_risk_events_opportunity_uid", "opportunity_uid"),
         # A retried evaluation of the same intent converges on one row per
         # gate rather than writing a duplicate every time it is retried.
-        UniqueConstraint("mode", "intent_id", "event_type", name="mode_intent_event_type"),
+        UniqueConstraint(
+            "mode",
+            "backtest_run_id",
+            "intent_id",
+            "event_type",
+            name="mode_run_intent_event_type",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_risk_events_run_occurred", "backtest_run_id", "occurred_at"),
+        CheckConstraint(BACKTEST_MODE_HAS_RUN, name="backtest_mode_has_run"),
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

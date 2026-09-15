@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -72,8 +71,6 @@ class PaperExecutionAdapter:
     return the original result instead of executing twice.
     """
 
-    mode = ExecutionMode.PAPER
-
     def __init__(
         self,
         feed: MarketFeed,
@@ -85,7 +82,13 @@ class PaperExecutionAdapter:
         average_prices: AveragePriceSource | None = None,
         clock: Callable[[], datetime] = _utcnow,
         sleep: Sleeper = asyncio.sleep,
+        mode: ExecutionMode = ExecutionMode.PAPER,
     ) -> None:
+        # PAPER against the live book, BACKTEST against recorded history. The
+        # simulation is identical; only what its rows are labelled differs.
+        if mode not in (ExecutionMode.PAPER, ExecutionMode.BACKTEST):
+            raise ValueError(f"a simulator cannot produce {mode.value} results")
+        self.mode = mode
         self._feed = feed
         self._config = config
         self._fees = fees
@@ -600,8 +603,12 @@ class PaperExecutionAdapter:
             terminal_latency_ms=int((closed_at - submitted_at).total_seconds() * 1000),
             mode=self.mode,
             # Simulated orders get an id so a stored row looks like any other;
-            # it is prefixed so nobody mistakes it for a venue's.
-            exchange_order_id=f"paper-{uuid.uuid4().hex[:16]}",
+            # it is prefixed so nobody mistakes it for a venue's. Derived from
+            # the client id rather than random, so a replay is reproducible
+            # and a retried submission reports the same id.
+            exchange_order_id=(
+                "paper-" + hashlib.sha256(request.client_order_id.encode("utf-8")).hexdigest()[:16]
+            ),
             rejection=rejection,
             detail=detail,
             book_sequence=book.sequence if book else None,

@@ -43,6 +43,10 @@ class LegRecord:
     close_attempts: int
     entries: tuple[FillLot, ...]
     exits: tuple[FillLot, ...]
+    #: Signed funding attributed to a flat perpetual leg from recorded
+    #: settlements (Phase 11 replay). ``None`` - every paper leg today - means
+    #: unmeasured, never zero.
+    funding_pnl_usd: Decimal | None = None
 
     @property
     def open_quantity(self) -> Decimal:
@@ -59,9 +63,12 @@ class LegRecord:
             entries=self.entries,
             exits=self.exits,
             mark_price=mark_price,
-            # Funding does not apply to spot. Perpetual funding settlements
-            # are not attributed yet, so only that leg names it as missing.
-            funding_pnl_usd=(Decimal(0) if self.market_type is MarketType.SPOT else None),
+            # Funding does not apply to spot. A perpetual leg carries it only
+            # when its settlements were attributed; otherwise it is named as
+            # missing rather than treated as zero.
+            funding_pnl_usd=(
+                Decimal(0) if self.market_type is MarketType.SPOT else self.funding_pnl_usd
+            ),
             borrow_cost_usd=None,
             borrows=self.borrows,
         )

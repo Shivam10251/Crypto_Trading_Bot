@@ -153,7 +153,9 @@ class _SwitchRows:
         self.reads = 0
         self.fail = False
 
-    async def read(self, _factory: Any, _mode: ExecutionMode) -> dict[str, Any] | None:
+    async def read(
+        self, _factory: Any, _mode: ExecutionMode, _run: int | None = None
+    ) -> dict[str, Any] | None:
         self.reads += 1
         if self.fail:
             raise RuntimeError("database unreachable")

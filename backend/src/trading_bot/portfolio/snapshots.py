@@ -3,10 +3,10 @@
 ``equity = cash + position value``, and each half is derived rather than
 remembered:
 
-- **cash** is replayed from the durable fills - starting cash, plus every spot
-  sale, minus every spot purchase, minus every fee that was paid in cash. It
-  is not read out of the in-memory ``PaperAccount``, so a restarted process
-  reproduces the same number instead of inheriting one.
+- **cash-equivalent equity** is replayed from durable fills and carrying cash
+  flows - starting cash, spot flows, perpetual realized P&L and funding, minus
+  every fee regardless of which wallet paid it. Actual cash and BNB-wallet
+  consumption remain separate in ``balances()`` for account restoration.
 - **position value** walks the current books for what flattening each open leg
   would actually fetch. A spot leg contributes its executable proceeds (or the
   cost of buying back a borrowed one); a perpetual leg contributes only its
@@ -19,14 +19,15 @@ NULL equity, and the equity curve skips it. A partial total is not equity.
 
 **Idempotent by key.** ``captured_at`` is floored to the snapshot interval, so
 a retry or a restart inside the same interval upserts the row it already
-wrote. P&L rows key on ``(mode, captured_at, window, scope_key)`` for the same
-reason.
+wrote. P&L rows key on ``(mode, backtest_run_id, captured_at, window,
+scope_key)`` for the same reason; the run is in both keys because two
+backtests over one period snapshot the same instants.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -35,19 +36,32 @@ from sqlalchemy import Select, case, func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from trading_bot.core.logging import get_logger
+from trading_bot.db.models import BacktestFundingPayment
 from trading_bot.db.models import Fill as FillRow
 from trading_bot.db.models import Market as MarketRow
 from trading_bot.db.models import Order as OrderRow
 from trading_bot.db.models import PnlSnapshot as PnlSnapshotRow
 from trading_bot.db.models import PortfolioSnapshot as PortfolioSnapshotRow
 from trading_bot.db.models import Position as PositionRow
-from trading_bot.db.models.enums import ExecutionMode, MarketType, Side, ValuationStatus
+from trading_bot.db.models.enums import (
+    ExecutionMode,
+    MarketType,
+    Side,
+)
+from trading_bot.db.scope import RunScope
 from trading_bot.execution.models import OrderIntent
-from trading_bot.portfolio import accounting
-from trading_bot.portfolio.accounting import FUNDING, SPOT_BORROW, PairedTrade
-from trading_bot.portfolio.records import AttemptRecord
+from trading_bot.portfolio.accounting import FUNDING, PairedTrade
+
+# Re-exported: valuation moved to ``book_value`` in Phase 11, and callers that
+# import both halves of a snapshot from here keep working.
+from trading_bot.portfolio.book_value import PortfolioState
+from trading_bot.portfolio.incremental import (
+    CurveFigures,
+    TradeFigures,
+    curve_figures,
+    trade_figures,
+)
 from trading_bot.portfolio.store import PortfolioStore, SessionFactory
-from trading_bot.portfolio.valuation import ExecutableExit, MarkReader, position_value_usd
 
 logger = get_logger(__name__)
 
@@ -57,6 +71,9 @@ WINDOW_SESSION = "session"
 WINDOW_ALL = "all"
 
 PORTFOLIO_SCOPE = "portfolio"
+
+#: 500 rows x 32 columns stays far inside PostgreSQL's 32,767 parameters.
+_PNL_ROWS_PER_STATEMENT = 500
 
 
 def scope_key(strategy: str | None = None, position_id: int | None = None) -> str:
@@ -73,135 +90,6 @@ def floor_to(moment: datetime, interval: timedelta) -> datetime:
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     elapsed = int((moment.astimezone(UTC) - epoch).total_seconds())
     return epoch + timedelta(seconds=elapsed - elapsed % max(1, seconds))
-
-
-@dataclass(slots=True)
-class PortfolioState:
-    """The book, valued at one instant."""
-
-    captured_at: datetime
-    cash_usd: Decimal
-    gross_exposure_usd: Decimal = Decimal(0)
-    net_exposure_usd: Decimal = Decimal(0)
-    position_value_usd: Decimal | None = None
-    unrealized_pnl_usd: Decimal | None = None
-    realized_pnl_usd: Decimal = Decimal(0)
-    open_positions: int = 0
-    unvalued_positions: int = 0
-    unpaired_positions: int = 0
-    valuation_status: ValuationStatus = ValuationStatus.COMPLETE
-    #: Mark and unrealized P&L per position, for ``positions.mark_price``.
-    marks: dict[int, tuple[Decimal, Decimal]] = field(default_factory=dict)
-    #: Per-strategy open P&L. ``None`` means at least one leg in that strategy
-    #: could not be marked, so its aggregate must not be invented as zero.
-    strategy_unrealized_pnl_usd: dict[str, Decimal | None] = field(default_factory=dict)
-    #: Carry costs omitted from open-position value.
-    unmeasured_pnl: tuple[str, ...] = ()
-    strategy_unmeasured_pnl: dict[str, tuple[str, ...]] = field(default_factory=dict)
-
-    @property
-    def equity_usd(self) -> Decimal | None:
-        if self.position_value_usd is None:
-            return None
-        return self.cash_usd + self.position_value_usd
-
-    def as_row(self, mode: ExecutionMode) -> dict[str, Any]:
-        return {
-            "captured_at": self.captured_at,
-            "mode": mode,
-            "cash_usd": self.cash_usd,
-            "gross_exposure_usd": self.gross_exposure_usd,
-            "net_exposure_usd": self.net_exposure_usd,
-            "position_value_usd": self.position_value_usd,
-            "equity_usd": self.equity_usd,
-            "open_positions": self.open_positions,
-            "realized_pnl_usd": self.realized_pnl_usd,
-            "unrealized_pnl_usd": self.unrealized_pnl_usd,
-            "valuation_status": self.valuation_status,
-            "unvalued_positions": self.unvalued_positions,
-            "unpaired_positions": self.unpaired_positions,
-        }
-
-
-def value_book(
-    attempts: Sequence[AttemptRecord],
-    marks: MarkReader,
-    *,
-    cash_usd: Decimal,
-    realized_pnl_usd: Decimal,
-    captured_at: datetime,
-) -> PortfolioState:
-    """Value every open leg from the books as they are now."""
-    state = PortfolioState(
-        captured_at=captured_at, cash_usd=cash_usd, realized_pnl_usd=realized_pnl_usd
-    )
-    value = Decimal(0)
-    unrealized = Decimal(0)
-    for attempt in attempts:
-        state.strategy_unrealized_pnl_usd.setdefault(attempt.strategy, Decimal(0))
-        state.strategy_unmeasured_pnl.setdefault(attempt.strategy, ())
-        if attempt.is_unpaired:
-            state.unpaired_positions += 1
-        for leg in attempt.live_legs:
-            missing = (
-                SPOT_BORROW
-                if leg.market_type is MarketType.SPOT and leg.side is Side.SELL
-                else FUNDING
-                if leg.market_type is MarketType.PERPETUAL
-                else None
-            )
-            if missing is not None:
-                if missing not in state.unmeasured_pnl:
-                    state.unmeasured_pnl = (*state.unmeasured_pnl, missing)
-                strategy_missing = state.strategy_unmeasured_pnl[attempt.strategy]
-                if missing not in strategy_missing:
-                    state.strategy_unmeasured_pnl[attempt.strategy] = (
-                        *strategy_missing,
-                        missing,
-                    )
-            state.open_positions += 1
-            state.gross_exposure_usd += leg.entry_price * leg.open_quantity
-            sign = Decimal(1) if leg.side is Side.BUY else Decimal(-1)
-            state.net_exposure_usd += sign * leg.entry_price * leg.open_quantity
-            priced: ExecutableExit = marks.executable_exit(
-                leg.ref, entry_side=leg.side, quantity=leg.open_quantity
-            )
-            if not priced.is_priced or priced.price is None:
-                # No honest mark. Counted, never guessed at.
-                state.unvalued_positions += 1
-                state.strategy_unrealized_pnl_usd[attempt.strategy] = None
-                continue
-            value += position_value_usd(
-                leg.market_type,
-                entry_side=leg.side,
-                entry_price=leg.entry_price,
-                quantity=leg.open_quantity,
-                executable_price=priced.price,
-            )
-            leg_unrealized = sign * (priced.price - leg.entry_price) * leg.open_quantity
-            unrealized += leg_unrealized
-            strategy_unrealized = state.strategy_unrealized_pnl_usd[attempt.strategy]
-            if strategy_unrealized is not None:
-                state.strategy_unrealized_pnl_usd[attempt.strategy] = (
-                    strategy_unrealized + leg_unrealized
-                )
-            state.marks[leg.position_id] = (priced.price, leg_unrealized)
-    if state.open_positions == 0:
-        state.position_value_usd = Decimal(0)
-        state.unrealized_pnl_usd = Decimal(0)
-        return state
-    if state.unvalued_positions:
-        # Equity is an account-wide total. If even one position cannot be
-        # priced, publishing the sum of the others would silently understate
-        # exposure and manufacture a point in the return series.
-        state.valuation_status = ValuationStatus.UNAVAILABLE
-        return state
-    state.position_value_usd = value
-    state.unrealized_pnl_usd = unrealized
-    state.valuation_status = (
-        ValuationStatus.DEGRADED if state.unpaired_positions else ValuationStatus.COMPLETE
-    )
-    return state
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +126,10 @@ class SnapshotWriter:
     @property
     def mode(self) -> ExecutionMode:
         return self._store.mode
+
+    @property
+    def scope(self) -> RunScope:
+        return self._store.scope
 
     # --- cash -----------------------------------------------------------
 
@@ -292,7 +184,7 @@ class SnapshotWriter:
             .join(MarketRow, MarketRow.id == OrderRow.market_id)
             .outerjoin(PositionRow, PositionRow.id == FillRow.position_id)
             .where(
-                FillRow.mode == self.mode,
+                *self.scope.filters(FillRow.mode, FillRow.backtest_run_id),
                 # Probes never moved this account's money.
                 OrderRow.is_shadow.is_(False),
             )
@@ -311,27 +203,37 @@ class SnapshotWriter:
             spot_flow, perpetual_realized, cash_fees, bnb_fees = (
                 await session.execute(self._cash_query())
             ).one()
+            funding = Decimal(0)
+            if self.scope.backtest_run_id is not None:
+                funding = await session.scalar(
+                    select(func.sum(BacktestFundingPayment.amount_usd)).where(
+                        BacktestFundingPayment.backtest_run_id == self.scope.backtest_run_id
+                    )
+                ) or Decimal(0)
         cash = self._initial_cash + (spot_flow or Decimal(0)) + (perpetual_realized or Decimal(0))
+        cash += funding or Decimal(0)
         cash -= cash_fees or Decimal(0)
         return cash, bnb_fees or Decimal(0)
 
     async def cash(self) -> Decimal:
-        cash, _ = await self.balances()
-        return cash
+        cash, bnb_fees = await self.balances()
+        # BNB is a separate fee wallet, but consuming it is still an economic
+        # expense. Excluding it would overstate equity, returns and ratios.
+        return cash - bnb_fees
 
     # --- writing --------------------------------------------------------
 
     async def write_portfolio(self, state: PortfolioState) -> None:
-        values = state.as_row(self.mode)
+        values = state.as_row(self.scope)
         async with self._session_factory() as session:
             statement = insert(PortfolioSnapshotRow).values(values)
             await session.execute(
                 statement.on_conflict_do_update(
-                    constraint="mode_captured_at",
+                    constraint="mode_run_captured_at",
                     set_={
                         key: getattr(statement.excluded, key)
                         for key in values
-                        if key not in {"mode", "captured_at"}
+                        if key not in {"mode", "backtest_run_id", "captured_at"}
                     },
                 )
             )
@@ -344,7 +246,7 @@ class SnapshotWriter:
         filling it would invent a period the system never measured.
         """
         conditions = [
-            PortfolioSnapshotRow.mode == self.mode,
+            *self.scope.filters(PortfolioSnapshotRow.mode, PortfolioSnapshotRow.backtest_run_id),
             PortfolioSnapshotRow.equity_usd.is_not(None),
             PortfolioSnapshotRow.captured_at <= window.end,
         ]
@@ -357,6 +259,18 @@ class SnapshotWriter:
                 .order_by(PortfolioSnapshotRow.captured_at)
             )
             return [(at, equity) for at, equity in rows if equity is not None]
+
+    @property
+    def interval(self) -> timedelta:
+        return self._interval
+
+    @property
+    def minimum_observations(self) -> int:
+        return self._minimum
+
+    @property
+    def risk_free_per_period(self) -> float:
+        return _per_period_risk_free(self._risk_free, self._interval)
 
     def pnl_row(
         self,
@@ -372,32 +286,45 @@ class SnapshotWriter:
         additional_unmeasured: Sequence[str] = (),
     ) -> dict[str, Any]:
         """One ``pnl_snapshots`` row from completed paired trades."""
-        results = [trade.realized_pnl_usd for trade in trades]
-        statistics = accounting.summarise_trades(results)
-        unmeasured: list[str] = []
-        for trade in trades:
-            for component in trade.unmeasured:
-                if component not in unmeasured:
-                    unmeasured.append(component)
+        return self.row(
+            window=window,
+            captured_at=captured_at,
+            trades=trade_figures(trades),
+            curve=curve_figures(
+                curve,
+                interval=self._interval,
+                risk_free_per_period=self.risk_free_per_period,
+                minimum=self._minimum,
+            ),
+            strategy=strategy,
+            position_id=position_id,
+            unrealized_pnl_usd=unrealized_pnl_usd,
+            equity_usd=equity_usd,
+            additional_unmeasured=additional_unmeasured,
+        )
+
+    def row(
+        self,
+        *,
+        window: Window,
+        captured_at: datetime,
+        trades: TradeFigures,
+        curve: CurveFigures,
+        strategy: str | None = None,
+        position_id: int | None = None,
+        unrealized_pnl_usd: Decimal | None = Decimal(0),
+        equity_usd: Decimal | None = None,
+        additional_unmeasured: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """The same row from figures - computed from history or folded in."""
+        statistics = trades.statistics
+        unmeasured = list(trades.unmeasured)
         for component in additional_unmeasured:
             if component not in unmeasured:
                 unmeasured.append(component)
-        equity = [value for _, value in curve]
-        sample = accounting.sample_returns(list(curve), interval=self._interval)
-        risk_free = _per_period_risk_free(self._risk_free, self._interval)
-        sharpe = (
-            accounting.sharpe_ratio(sample, risk_free_per_period=risk_free, minimum=self._minimum)
-            if sample is not None
-            else None
-        )
-        sortino = (
-            accounting.sortino_ratio(sample, risk_free_per_period=risk_free, minimum=self._minimum)
-            if sample is not None
-            else None
-        )
         return {
             "captured_at": captured_at,
-            "mode": self.mode,
+            **self.scope.values(),
             "strategy": strategy,
             "position_id": position_id,
             "scope_key": scope_key(strategy, position_id),
@@ -406,10 +333,11 @@ class SnapshotWriter:
             "window_end": window.end,
             "realized_pnl_usd": statistics.net_pnl_usd,
             "unrealized_pnl_usd": unrealized_pnl_usd,
-            "fees_usd": sum((trade.fees_usd for trade in trades), Decimal(0)),
-            "slippage_usd": sum((trade.slippage_usd for trade in trades), Decimal(0)),
-            # NULL, not zero: nothing here measures either yet.
-            "funding_pnl_usd": None,
+            "fees_usd": trades.fees_usd,
+            "slippage_usd": trades.slippage_usd,
+            # NULL, not zero, unless every trade and open position here
+            # measured it. Nothing measures spot borrow, so that is always NULL.
+            "funding_pnl_usd": trades.funding_usd if FUNDING not in unmeasured else None,
             "borrow_cost_usd": None,
             "unmeasured_pnl": unmeasured or None,
             "equity_usd": equity_usd,
@@ -419,36 +347,47 @@ class SnapshotWriter:
             "average_trade_usd": statistics.average_trade_usd,
             "average_win_usd": statistics.average_win_usd,
             "average_loss_usd": statistics.average_loss_usd,
-            "max_drawdown_usd": accounting.max_drawdown(equity),
+            "max_drawdown_usd": curve.max_drawdown_usd,
             "win_rate": statistics.win_rate,
             "profit_factor": statistics.profit_factor,
             "expectancy_usd": (
                 float(statistics.expectancy_usd) if statistics.expectancy_usd is not None else None
             ),
-            "sharpe_ratio": sharpe,
-            "sortino_ratio": sortino,
-            "total_return_pct": accounting.total_return_pct(equity),
-            "return_observations": len(sample.returns) if sample is not None else 0,
+            "sharpe_ratio": curve.sharpe_ratio,
+            "sortino_ratio": curve.sortino_ratio,
+            "total_return_pct": curve.total_return_pct,
+            "return_observations": curve.return_observations,
             # Always stated, even when both ratios are NULL: a reader has to
             # be able to see what sampling *would* have been annualised.
             "return_interval_seconds": int(self._interval.total_seconds()),
         }
 
     async def write_pnl(self, rows: Sequence[dict[str, Any]]) -> int:
+        """Upsert P&L rows in one transaction, in bounded statements.
+
+        Bounded because PostgreSQL's protocol allows 32,767 bind parameters
+        per statement and a row carries 32: the first snapshot after a start
+        emits a row for every position ever closed, and past ~1,000 of them a
+        single statement fails - on every later snapshot too, since nothing
+        advances until one succeeds.
+        """
         if not rows:
             return 0
         async with self._session_factory() as session:
-            statement = insert(PnlSnapshotRow).values(list(rows))
-            await session.execute(
-                statement.on_conflict_do_update(
-                    constraint="mode_captured_window_scope",
-                    set_={
-                        key: getattr(statement.excluded, key)
-                        for key in rows[0]
-                        if key not in {"mode", "captured_at", "window", "scope_key"}
-                    },
+            for start in range(0, len(rows), _PNL_ROWS_PER_STATEMENT):
+                chunk = list(rows[start : start + _PNL_ROWS_PER_STATEMENT])
+                statement = insert(PnlSnapshotRow).values(chunk)
+                await session.execute(
+                    statement.on_conflict_do_update(
+                        constraint="mode_run_captured_window_scope",
+                        set_={
+                            key: getattr(statement.excluded, key)
+                            for key in chunk[0]
+                            if key
+                            not in {"mode", "backtest_run_id", "captured_at", "window", "scope_key"}
+                        },
+                    )
                 )
-            )
         return len(rows)
 
 

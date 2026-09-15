@@ -41,6 +41,7 @@ from trading_bot.db.models import Position as PositionRow
 from trading_bot.db.models import RiskEvent as RiskEventRow
 from trading_bot.db.models import Signal as SignalRow
 from trading_bot.db.models.enums import ExecutionMode, OpportunityStatus, SignalStatus
+from trading_bot.db.scope import RunScope
 from trading_bot.exchange.models import MarketRef
 from trading_bot.opportunities.episodes import OpportunityEpisode
 from trading_bot.strategy.models import RejectionReason
@@ -120,7 +121,9 @@ def _evidence(episode: OpportunityEpisode) -> dict[str, Any] | None:
 
 
 def opportunity_row(
-    episode: OpportunityEpisode, market_ids: dict[MarketRef, int]
+    episode: OpportunityEpisode,
+    market_ids: dict[MarketRef, int],
+    scope: RunScope | None = None,
 ) -> dict[str, Any] | None:
     """The episode as a row, or ``None`` when its legs are not registered.
 
@@ -138,6 +141,10 @@ def opportunity_row(
     if buy_id is None or sell_id is None:
         return None
     costs = edge.costs if edge is not None else None
+    # Detection is independent of how it would be executed, so a live
+    # opportunity is THEORETICAL. A replayed one is BACKTEST and belongs to
+    # its run: it describes history, never the market as it is now.
+    scope = scope or RunScope(ExecutionMode.THEORETICAL)
     return {
         # Fixed when the episode opened, so a retried flush presents the same
         # row rather than a second observation of the same moment.
@@ -148,8 +155,7 @@ def opportunity_row(
         "last_seen_at": episode.last_seen_at,
         "samples": episode.samples,
         "strategy": episode.strategy,
-        # Detection is independent of how it would be executed.
-        "mode": ExecutionMode.THEORETICAL,
+        **scope.values(),
         "market_id": buy_id,
         "secondary_market_id": sell_id,
         "direction": opportunity.direction,
@@ -183,7 +189,10 @@ def opportunity_row(
 
 
 def signal_rows(
-    episode: OpportunityEpisode, opportunity_id: int, market_ids: dict[MarketRef, int]
+    episode: OpportunityEpisode,
+    opportunity_id: int,
+    market_ids: dict[MarketRef, int],
+    backtest_run_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """One row per leg - the signals table describes a single market each."""
     signal = episode.executed_signal
@@ -199,6 +208,7 @@ def signal_rows(
         rows.append(
             {
                 "opportunity_id": opportunity_id,
+                "backtest_run_id": backtest_run_id,
                 "generated_at": signal.generated_at,
                 "strategy": signal.strategy,
                 "market_id": market_id,
@@ -228,7 +238,11 @@ class OpportunityRecorder:
         *,
         interval_seconds: float,
         min_duration_ms: int = 0,
+        scope: RunScope | None = None,
     ) -> None:
+        # Back-links to orders, positions and risk events are filtered by the
+        # same run: replayed episode uids repeat across runs by design.
+        self._scope = scope or RunScope(ExecutionMode.THEORETICAL)
         self._market_ids = market_ids
         self._session_factory = session_factory
         self._interval = interval_seconds
@@ -238,6 +252,14 @@ class OpportunityRecorder:
         self.signals_written = 0
         self.unpriced = 0
         self.failures = 0
+        # Episodes lost for good (see ``ExecutionRecorder.dropped``).
+        self.dropped = 0
+        self.unregistered = 0
+        self.last_error: str | None = None
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
 
     def record(self, episodes: Sequence[OpportunityEpisode]) -> None:
         """Queue closed episodes; written with the next flush.
@@ -256,6 +278,7 @@ class OpportunityRecorder:
             if len(self._pending) >= MAX_PENDING_EPISODES:
                 logger.warning("opportunities.episode_dropped", strategy=episode.strategy)
                 self._pending.pop(0)
+                self.dropped += 1
             self._pending.append(episode)
             queued.add(episode.uid)
 
@@ -273,10 +296,11 @@ class OpportunityRecorder:
         unregistered = 0
         unpriced = 0
         for episode in batch:
-            row = opportunity_row(episode, self._market_ids)
+            row = opportunity_row(episode, self._market_ids, self._scope)
             if row is None:
                 # Neither leg is in ``markets``; nothing can reference it.
                 unregistered += 1
+                self.unregistered += 1
                 continue
             if row["net_edge_bps"] is None:
                 unpriced += 1
@@ -288,8 +312,11 @@ class OpportunityRecorder:
             async with self._session_factory() as session:
                 written = await self._write(session, rows)
         except Exception as exc:
-            self._pending = (batch + self._pending)[-MAX_PENDING_EPISODES:]
+            requeued = batch + self._pending
+            self.dropped += max(0, len(requeued) - MAX_PENDING_EPISODES)
+            self._pending = requeued[-MAX_PENDING_EPISODES:]
             self.failures += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("opportunities.write_failed", error=str(exc), pending=len(batch))
             return 0
 
@@ -312,20 +339,26 @@ class OpportunityRecorder:
         statement = insert(OpportunityRow).values(values)
         await session.execute(
             statement.on_conflict_do_update(
-                index_elements=[OpportunityRow.uid],
-                set_={key: getattr(statement.excluded, key) for key in values[0] if key != "uid"},
+                constraint="run_opportunity_uid",
+                set_={
+                    key: getattr(statement.excluded, key)
+                    for key in values[0]
+                    if key not in {"uid", "backtest_run_id"}
+                },
             )
         )
+        run_id = self._scope.backtest_run_id
         result = await session.execute(
             select(OpportunityRow.id, OpportunityRow.uid).where(
-                OpportunityRow.uid.in_([episode.uid for episode, _ in rows])
+                self._scope.run_filter(OpportunityRow.backtest_run_id),
+                OpportunityRow.uid.in_([episode.uid for episode, _ in rows]),
             )
         )
         ids = {uid: row_id for row_id, uid in result}
         signals: list[dict[str, Any]] = []
         signal_episodes: list[tuple[OpportunityEpisode, dict[str, Any]]] = []
         for episode, _ in rows:
-            for signal in signal_rows(episode, ids[episode.uid], self._market_ids):
+            for signal in signal_rows(episode, ids[episode.uid], self._market_ids, run_id):
                 signals.append(signal)
                 signal_episodes.append((episode, signal))
         if signals:
@@ -336,7 +369,7 @@ class OpportunityRecorder:
                     set_={
                         key: getattr(signal_statement.excluded, key)
                         for key in signals[0]
-                        if key not in {"opportunity_id", "market_id", "side"}
+                        if key not in {"opportunity_id", "market_id", "side", "backtest_run_id"}
                     },
                 )
             )
@@ -363,6 +396,7 @@ class OpportunityRecorder:
                         OrderRow.opportunity_uid == episode.uid,
                         OrderRow.market_id == signal["market_id"],
                         OrderRow.is_shadow.is_(False),
+                        self._scope.run_filter(OrderRow.backtest_run_id),
                     )
                     .values(signal_id=signal_id)
                 )
@@ -372,6 +406,7 @@ class OpportunityRecorder:
                     .where(
                         PositionRow.opportunity_uid == episode.uid,
                         PositionRow.market_id == signal["market_id"],
+                        self._scope.run_filter(PositionRow.backtest_run_id),
                     )
                     .values(opportunity_id=signal["opportunity_id"])
                 )
@@ -397,6 +432,7 @@ class OpportunityRecorder:
                     RiskEventRow.opportunity_uid == uid,
                     RiskEventRow.is_shadow.is_(False),
                     RiskEventRow.signal_id.is_(None),
+                    self._scope.run_filter(RiskEventRow.backtest_run_id),
                 )
                 .values(signal_id=signal_id)
             )

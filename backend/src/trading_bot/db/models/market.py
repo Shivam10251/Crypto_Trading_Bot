@@ -163,6 +163,12 @@ class OrderBookSnapshot(Base, RecordMixin):
     Depth is sampled rather than streamed to storage: full continuous depth for
     50+ markets would dominate the database while adding little research value
     beyond the levels that affect fills.
+
+    Written only from a book the engine had SYNCED (Phase 11's capture), so a
+    row is depth the engine vouched for at ``local_timestamp``. Sampling has a
+    cost the replay reports rather than hides: between two rows the book is
+    unknown, so a replayed fill can only see the latest sampled book at its
+    arrival time - never the book the venue actually held then.
     """
 
     __tablename__ = "order_books"
@@ -175,6 +181,15 @@ class OrderBookSnapshot(Base, RecordMixin):
     bids: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     asks: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     depth_levels: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Whether each side is ALL the depth the venue had. Always false for a
+    # capped Binance snapshot: exhausting it means "more is unknown", not "no
+    # more liquidity", and a replayed walk past it is DEPTH_TRUNCATED.
+    bids_complete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    asks_complete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     # NULL for venues that omit an event time (Binance spot depth).
     exchange_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -187,6 +202,46 @@ class OrderBookSnapshot(Base, RecordMixin):
         Index("ix_order_books_market_exch_ts", "market_id", "exchange_timestamp"),
         Index("ix_order_books_local_ts", "local_timestamp"),
         CheckConstraint("depth_levels > 0", name="depth_positive"),
+    )
+
+
+class FundingObservation(Base, RecordMixin):
+    """One poll of a perpetual's funding state, as the venue reported it.
+
+    ``funding_rate`` is the venue's rate for the settlement at
+    ``next_funding_time`` *as known at* ``local_timestamp``: until that
+    settlement it is a moving estimate, so only an observation taken shortly
+    before a settlement says what that settlement actually charged. That is
+    the rule replay uses to attribute funding, and why an observation long
+    before a settlement leaves funding unmeasured rather than guessed.
+    """
+
+    __tablename__ = "funding_observations"
+
+    market_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("markets.id", ondelete="CASCADE"), nullable=False
+    )
+    mark_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
+    index_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)
+    funding_rate: Mapped[Decimal] = mapped_column(QUANTITY, nullable=False)
+    next_funding_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # NULL when the venue does not publish the interval; replay then cannot
+    # place settlements and funding stays unmeasured.
+    funding_interval_hours: Mapped[int | None] = mapped_column(Integer)
+    # When we received it - the moment it became knowable, and the clock
+    # replay orders it by.
+    local_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    market: Mapped[Market] = relationship(lazy="raise")
+
+    __table_args__ = (
+        UniqueConstraint("market_id", "local_timestamp", name="market_observed_at"),
+        Index("ix_funding_observations_local_ts", "local_timestamp"),
+        CheckConstraint("mark_price > 0 AND index_price > 0", name="prices_positive"),
+        CheckConstraint(
+            "funding_interval_hours IS NULL OR funding_interval_hours > 0",
+            name="interval_positive",
+        ),
     )
 
 

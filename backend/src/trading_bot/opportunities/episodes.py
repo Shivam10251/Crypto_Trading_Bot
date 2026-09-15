@@ -20,7 +20,7 @@ when it happened. Nothing is filtered - unprofitable episodes are the dataset.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -32,6 +32,25 @@ from trading_bot.strategy.runner import EvaluatedOpportunity, StrategyEvaluation
 # (strategy, bought market, sold market). A basis that flips sign swaps the two
 # refs, which is a different trade and so a different episode.
 EpisodeKey = tuple[str, MarketRef, MarketRef]
+
+#: Mints an episode's uid when it opens. Random in the live service; a replay
+#: derives it from the episode's key and opening instant, so the same history
+#: produces the same opportunity, intent and order identities every run.
+UidFactory = Callable[[EpisodeKey, datetime], uuid.UUID]
+
+
+def random_uid(_key: EpisodeKey, _opened_at: datetime) -> uuid.UUID:
+    return uuid.uuid4()
+
+
+def deterministic_uid(namespace: uuid.UUID) -> UidFactory:
+    """Uids that depend only on ``namespace``, the episode key and its opening."""
+
+    def mint(key: EpisodeKey, opened_at: datetime) -> uuid.UUID:
+        strategy, bought, sold = key
+        return uuid.uuid5(namespace, f"{strategy}|{bought}|{sold}|{opened_at.isoformat()}")
+
+    return mint
 
 
 def episode_key(strategy: str, item: EvaluatedOpportunity) -> EpisodeKey:
@@ -110,7 +129,8 @@ def _is_better(candidate: EvaluatedOpportunity, incumbent: EvaluatedOpportunity)
 class EpisodeTracker:
     """Keeps the open episodes and hands back the ones that just ended."""
 
-    def __init__(self) -> None:
+    def __init__(self, uid_factory: UidFactory = random_uid) -> None:
+        self._uid_factory = uid_factory
         self._open: dict[EpisodeKey, OpportunityEpisode] = {}
         self.opened = 0
         self.closed = 0
@@ -146,7 +166,9 @@ class EpisodeTracker:
                 seen.add(key)
                 episode = self._open.get(key)
                 if episode is None:
-                    self._open[key] = _start(key, evaluation.strategy, item, now)
+                    self._open[key] = _start(
+                        key, evaluation.strategy, item, now, self._uid_factory(key, now)
+                    )
                     self.opened += 1
                 else:
                     episode.absorb(item, now)
@@ -165,9 +187,14 @@ class EpisodeTracker:
 
 
 def _start(
-    key: EpisodeKey, strategy: str, item: EvaluatedOpportunity, now: datetime
+    key: EpisodeKey,
+    strategy: str,
+    item: EvaluatedOpportunity,
+    now: datetime,
+    uid: uuid.UUID,
 ) -> OpportunityEpisode:
     return OpportunityEpisode(
+        uid=uid,
         key=key,
         strategy=strategy,
         opened_at=now,

@@ -151,8 +151,12 @@ class MarketDataRecorder:
         session_factory: SessionFactory,
         *,
         interval_seconds: float,
+        quotes: bool = True,
     ) -> None:
         self._market_ids = market_ids
+        # False while replay capture runs: it writes quotes on its own cadence,
+        # in the same transaction as the depth they must agree with.
+        self._quotes = quotes
         self._session_factory = session_factory
         self._interval = interval_seconds
         self._last_written: dict[MarketRef, Quote] = {}
@@ -173,7 +177,7 @@ class MarketDataRecorder:
         stop the feed that the rest of the platform depends on.
         """
         changed: list[tuple[MarketRef, int, MarketSnapshot, Quote]] = []
-        for snapshot in snapshots:
+        for snapshot in snapshots if self._quotes else ():
             quote = snapshot.quote
             market_id = self._market_ids.get(snapshot.ref)
             # Identity, not equality: the engine replaces the quote object on
