@@ -1558,13 +1558,11 @@ code before it was changed; the tests named here fail on the pre-hardening code.
     ignoring local `.claude-flow` bookkeeping; only the digest is stored.
 
 **Verification** (2026-09-15): ruff, format and mypy clean (128 source
-files); backend pytest passed locally with 1,041 passed and 322 skipped
-(Docker/Postgres-backed tests could not run because the Docker daemon was not
-available); frontend build and 10 tests pass. The skipped integration tests
-cover migration round trips, run isolation and replay persistence against real
-PostgreSQL, so they still need to run in an environment with Docker before a
-release tag. Synthetic datasets cover the trade-producing paths; **no complete
-real dataset exists; no real-data trade result is claimed.**
+files); the full Docker/PostgreSQL-backed backend suite passed with 1,349
+passed and 14 skipped; frontend build and 10 tests pass. Migration parity,
+catalog parity, run isolation and replay persistence therefore ran against
+real PostgreSQL. Synthetic datasets cover the trade-producing paths; **no
+complete real dataset exists; no real-data trade result is claimed.**
 
 ### Limits
 
