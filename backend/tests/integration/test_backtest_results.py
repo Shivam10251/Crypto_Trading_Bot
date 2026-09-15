@@ -116,10 +116,14 @@ class TestEquityBaseline:
         self,
     ) -> None:
         start = START + timedelta(seconds=30)  # between two snapshot grid points
-        seed(basis_path([(300, 20)]))
+        # Enter immediately on a profitable basis, then let it widen before
+        # the first post-entry grid snapshot.  With the test suite's zero fee
+        # schedule, a permanently favourable basis would never draw down.
+        seed(basis_path([(40, 20), (260, 60)]))
         outcome = run(backtest_settings(portfolio=NO_EXITS), seconds=150, start=start)
         orders = fetch(Order, Order.backtest_run_id == outcome.run.id)
-        assert {order.submitted_at for order in orders} == {start}, "traded on the first tick"
+        entries = [order for order in orders if not order.execution_intent_id.startswith("close:")]
+        assert {order.submitted_at for order in entries} == {start}, "traded on the first tick"
         snapshots = sorted(
             fetch(PortfolioSnapshot, PortfolioSnapshot.backtest_run_id == outcome.run.id),
             key=lambda row: row.captured_at,
@@ -132,7 +136,7 @@ class TestEquityBaseline:
         grid = stamps[:-1]
         assert all(b - a == timedelta(minutes=1) for a, b in pairwise(grid))
         assert stamps[-1] == start + timedelta(seconds=150), "terminal valuation at the end"
-        # Crossing both spreads cost money at once; the drawdown includes it.
+        # The adverse revaluation is not hidden in the pre-trade baseline.
         worst = min(row.equity_usd for row in snapshots if row.equity_usd is not None)
         assert worst < Decimal(100_000)
         report = report_for(outcome)

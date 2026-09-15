@@ -288,6 +288,7 @@ class BacktestFundingPayment(Base, RecordMixin):
 
     __table_args__ = (
         CheckConstraint(RUN_KEY_MATCHES_RUN, name="run_key_matches_run"),
+        run_key_target(),
         run_scoped_fk("position_id", "positions", ondelete="CASCADE"),
         UniqueConstraint(
             "backtest_run_id",
