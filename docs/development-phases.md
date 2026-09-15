@@ -22,7 +22,7 @@ was never recorded is gone for good.
 | 8 | Paper execution engine | **Complete** |
 | 9 | Risk engine | **Complete** |
 | 10 | Portfolio and P&L | **Complete** |
-| 11 | Backtest / replay engine | **In review** |
+| 11 | Backtest / replay engine | **Complete** |
 | 12 | Real-time dashboard | Not started |
 | 13 | Dashboard real-time backend | Not started |
 | 14 | Research and strategy analytics | Not started |
